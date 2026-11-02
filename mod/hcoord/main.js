@@ -1,24 +1,27 @@
 // Projects: hcoord's projects as a sidebar section, beside Spaces and Agents.
-// Each project shows its coordinator's status and, opened, its tasks by state.
-// Click a project to go to its coordinator (started if it isn't running), a task
-// to peek at its worker, + to make a project from a git folder. Data comes from
-// `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes;
-// workers' terminals changing makes hcoord check them (`hcoord sync`).
+// A project is a repo; under it, its worktrees (the main checkout and Herdr's worktree
+// spaces), each with a coordinator agent; under each worktree, its tasks by state.
+// Click a worktree to go to its coordinator (started if it isn't running), a task to peek
+// at its worker or read its log. Going to a project's worktree space starts its coordinator.
+// The same mod with props { log } is a pane showing one agent's log (its transcript).
+// Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
+// terminals changing makes hcoord check them (`hcoord sync`).
 // Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, TextView } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home,
+  pickFolder, watchFolder, layout, home, props, openOverlay,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
 const ICON = (name) => `mods/workspace-chrome/${name}.svg`;
-// How long after one try a project's coordinator isn't started again by itself.
+// How long after one try a worktree's coordinator isn't started again by itself.
 const RETRY_MS = 60000;
-// Changes the folder watch can't see (Claude's trust list): looked for this often.
-const FALLBACK_MS = 60000;
+// Changes the folder watch can't see (Claude's trust list, new git worktrees): looked for this often.
+const FALLBACK_MS = 30000;
+const ACTIVE = ["starting", "working", "needs_you"];
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -41,6 +44,11 @@ const load = (key, fallback) => {
     return fallback;
   }
 };
+const save = (key, value) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+};
 
 // Task sections, in the order they show.
 const GROUPS = [
@@ -49,30 +57,37 @@ const GROUPS = [
   { id: "queued", label: "Queued", states: ["queued"] },
   { id: "todo", label: "To do", states: ["todo"] },
   { id: "failed", label: "Failed", states: ["failed"], tone: "blocked" },
-  { id: "done", label: "Done", states: ["done", "cancelled"], folded: true },
+  { id: "unmerged", label: "Not merged", states: ["done"], tone: "blocked" },
+  { id: "merged", label: "Merged", states: ["merged", "cancelled"], folded: true },
 ];
 
-/** hcoord's reasons end in "; hc read t7": the person has the click for that. */
-const plain = (s) => (s ?? "").replace(/;\s*hc read \S+\s*$/, "");
+/** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
+const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
+
+async function hcoord(args) {
+  const r = await exec(HCOORD[0], [...HCOORD.slice(1), ...args]);
+  return { ok: r.code === 0, text: (r.stdout + r.stderr).trim(), stdout: r.stdout };
+}
 
 export default class Projects extends View {
   init(_props, cx) {
+    if (props()?.log) return this.initLog(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.loading = false;
     this.again = false;
     this.syncing = false;
     this.syncAgain = false;
-    this.signature = null; // the workers' terminals at the last sync
-    this.open = load("open", {}); // slug -> shown open (a click); else open when it's here or needs you
-    this.doneOpen = new Set(); // slugs whose Done group is open
-    this.tried = {}; // slug -> when its coordinator was last started by itself
-    this.busy = new Set(); // slugs being opened
+    this.signature = null; // the agents' terminals at the last sync
+    this.open = load("open", {}); // "p:<slug>" / "w:<path>" -> shown open (a click); else a default
+    this.mergedOpen = new Set(); // worktree paths whose Merged group is open
+    this.tried = {}; // worktree path -> when its coordinator was last started by itself
+    this.busy = new Set(); // worktree paths being opened
     this.space = focused()?.space ?? null;
     this.seenSpaces = new Set(spaces().map((s) => s.id));
+    this.born = {}; // space -> when this copy first saw it
     this.dismissed = new Set(load("dismissed", []));
     this.offer = null; // { repo } the last "make it a project?" toast is about
-    this.born = {}; // space -> when this copy first saw it
     this.refresh(cx);
     cx.timer.every(FALLBACK_MS, (cx) => this.refresh(cx));
     // New spaces settle (their first terminal's folder) for a moment before they're asked about.
@@ -87,13 +102,7 @@ export default class Projects extends View {
     });
   }
 
-  // ------------------------------------------------------------- hcoord
-
-  async hcoord(args) {
-    const r = await exec(HCOORD[0], [...HCOORD.slice(1), ...args]);
-    const text = (r.stdout + r.stderr).trim();
-    return { ok: r.code === 0, text, stdout: r.stdout };
-  }
+  // ------------------------------------------------------------- data
 
   refresh(cx) {
     if (this.loading) {
@@ -105,7 +114,7 @@ export default class Projects extends View {
       do {
         this.again = false;
         try {
-          const r = await this.hcoord(["board", "--json"]);
+          const r = await hcoord(["board", "--json"]);
           if (!r.ok) throw new Error(r.text || "hcoord board failed");
           this.data = JSON.parse(r.stdout);
           this.error = null;
@@ -141,8 +150,8 @@ export default class Projects extends View {
     if (!this.data) return;
     const watched = new Set();
     for (const p of this.data.projects) {
-      if (p.coordinator) watched.add(p.coordinator.address);
-      for (const t of p.tasks) if (t.terminal && ["starting", "working", "needs_you"].includes(t.state)) watched.add(t.terminal);
+      for (const l of p.lanes) if (l.coordinator) watched.add(l.coordinator.address);
+      for (const t of p.tasks) if (t.terminal && ACTIVE.includes(t.state)) watched.add(t.terminal);
     }
     const sig = all
       .filter((t) => watched.has(t.address))
@@ -152,7 +161,7 @@ export default class Projects extends View {
     if (sig === this.signature) return;
     const first = this.signature === null;
     this.signature = sig;
-    if (first) return; // nothing changed yet, it's only the first look
+    if (first) return;
     if (this.syncing) {
       this.syncAgain = true;
       return;
@@ -161,85 +170,112 @@ export default class Projects extends View {
     cx.spawn(async (cx) => {
       do {
         this.syncAgain = false;
-        await this.hcoord(["sync"]).catch(() => null);
+        await hcoord(["sync"]).catch(() => null);
       } while (this.syncAgain);
       this.syncing = false;
       this.refresh(cx);
     });
   }
 
-  // ------------------------------------------------------------- spaces and projects
+  // ------------------------------------------------------------- spaces, projects, worktrees
 
   /** Where a space is: its first terminal's live folder, else the folder it was made in. */
   placeOf(s, ps) {
     const tabs = new Set((s.tabs ?? []).map((c) => c.id));
-    return ps.find((p) => tabs.has(p.tab) && p.cwd && !within(p.cwd, this.data?.root))?.cwd || s.folder;
+    return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
   }
 
-  /** The project a space belongs to: it holds the coordinator, or it's in one of the repos. */
-  projectOfSpace(s, ps, ags) {
-    if (!this.data || s.machine) return null;
-    for (const p of this.data.projects) {
-      if (p.coordinator && ags.some((a) => a.address === p.coordinator.address && a.space === s.id)) return p;
+  /** A project's worktrees: every checkout git knows, plus registered ones that are gone but still have work. */
+  worktrees(p) {
+    const list = p.checkouts.map((c) => {
+      const lane = p.lanes.find((l) => l.path === c.path) ?? null;
+      return { path: c.path, branch: c.branch ?? lane?.branch ?? null, lane, main: c.path === p.repo };
+    });
+    for (const l of p.lanes) {
+      if (list.some((w) => w.path === l.path)) continue;
+      if (p.tasks.some((t) => t.lane === l.key && ACTIVE.includes(t.state))) list.push({ path: l.path, branch: l.branch, lane: l, main: false, gone: !l.present });
     }
-    const at = this.placeOf(s, ps);
-    if (within(at, this.data.worktreeRoot)) return null; // a worker's worktree
-    return this.data.projects.find((p) => p.repos.some((r) => within(at, r))) ?? null;
+    return list.sort((a, b) => (a.main ? -1 : b.main ? 1 : (a.branch ?? a.path).localeCompare(b.branch ?? b.path)));
   }
 
-  spaceOfProject(p, ps, ags) {
-    return spaces().find((s) => this.projectOfSpace(s, ps, ags)?.slug === p.slug) ?? null;
+  /** The project and worktree a folder is in (the deepest checkout containing it). */
+  worktreeAt(path) {
+    if (!this.data || !path || within(path, this.data.worktreeRoot)) return null;
+    let best = null;
+    for (const p of this.data.projects) {
+      for (const w of this.worktrees(p)) {
+        if (within(path, w.path) && (!best || w.path.length > best.w.path.length)) best = { p, w };
+      }
+    }
+    return best;
   }
 
-  coordinatorOf(p, all, ags) {
-    if (!p.coordinator) return { live: false };
-    const t = all.find((x) => x.address === p.coordinator.address && x.name === p.coordinator.name && x.state === "live");
-    if (!t) return { live: false };
+  /** The space showing a worktree: the one holding its coordinator, else one whose folder is in it. */
+  spaceOf(w, ps, ags) {
+    const c = w.lane?.coordinator;
+    const holder = c && ags.find((a) => a.address === c.address);
+    if (holder) return spaces().find((s) => s.id === holder.space) ?? null;
+    return spaces().find((s) => !s.machine && this.worktreeAt(this.placeOf(s, ps))?.w.path === w.path) ?? null;
+  }
+
+  coordinatorOf(w, all, ags) {
+    const c = w.lane?.coordinator;
+    if (!c) return { live: false };
+    const t = all.find((x) => x.address === c.address && x.name === c.name && x.state === "live");
+    if (!t) return { live: false, session: c.session };
     const a = ags.find((x) => x.address === t.address);
-    return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null };
+    return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session };
   }
 
-  /** Go to the project: its coordinator if it runs, else its space and a new coordinator there. */
-  async go(p, cx, { auto = false, space = null } = {}) {
-    const all = terminals();
+  /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there. */
+  async go(p, w, cx, { auto = false, space = null, restart = false } = {}) {
     const ags = agents();
-    const c = this.coordinatorOf(p, all, ags);
-    if (c.live && c.agent) {
+    const c = this.coordinatorOf(w, terminals(), ags);
+    if (c.live && c.agent && !restart) {
       if (!auto) run("agent.focus", { terminal: c.address });
       return;
     }
-    if (this.busy.has(p.slug)) return;
-    const ps = panes();
-    let s = space ? { id: space } : this.spaceOfProject(p, ps, ags);
+    if (this.busy.has(w.path)) return;
+    let s = space ? { id: space } : this.spaceOf(w, panes(), ags);
     if (!auto) {
       if (s) run("space.select", { id: s.id });
-      else {
-        run("space.new", { name: p.name, folder: p.repos[0] });
-        s = null; // hcoord finds it by its folder
-      }
+      else run("space.new", { name: w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`, folder: w.path });
     }
-    this.busy.add(p.slug);
+    this.busy.add(w.path);
     cx.notify();
-    const args = ["project", "open", p.slug];
+    const args = ["lane", "open", w.path];
     if (s) args.push("--space", s.id);
-    const r = await this.hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
-    this.busy.delete(p.slug);
-    if (!r.ok) notify({ title: `Couldn't open ${p.name}`, body: r.text, level: "error", timeout: 12000 });
+    if (restart) args.push("--restart");
+    const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+    this.busy.delete(w.path);
+    if (!r.ok) notify({ title: `Couldn't open ${p.name} · ${w.branch ?? base(w.path)}`, body: r.text, level: "error", timeout: 12000 });
     this.refresh(cx);
   }
 
-  /** Switching to a project's space starts its coordinator when it isn't running (once a minute at most). */
+  /** Switching to a project's worktree space starts its coordinator when it isn't running (once a minute at most). */
   followSpace(cx) {
     const now = focused()?.space ?? null;
     if (now === this.space) return;
     this.space = now;
     if (!now || !this.data) return;
     const s = spaces().find((x) => x.id === now);
-    const p = s && this.projectOfSpace(s, panes(), agents());
-    if (!p || this.coordinatorOf(p, terminals(), agents()).live) return;
-    if (Date.now() - (this.tried[p.slug] ?? 0) < RETRY_MS) return;
-    this.tried[p.slug] = Date.now();
-    cx.spawn(async (cx) => this.go(p, cx, { auto: true, space: now }));
+    if (!s || s.machine) return;
+    const hit = this.worktreeAt(this.placeOf(s, panes()));
+    if (!hit || hit.w.gone) return;
+    if (this.coordinatorOf(hit.w, terminals(), agents()).live) return;
+    if (Date.now() - (this.tried[hit.w.path] ?? 0) < RETRY_MS) return;
+    this.tried[hit.w.path] = Date.now();
+    cx.spawn(async (cx) => this.go(hit.p, hit.w, cx, { auto: true, space: now }));
+  }
+
+  newWorktree(p) {
+    const s = this.spaceOf({ path: p.repo, lane: p.lanes.find((l) => l.key === "root") }, panes(), agents());
+    // Herdr's own dialog: it makes the checkout and a space for it; going there starts its coordinator.
+    openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: s?.id, folder: p.repo, action: "new" } });
+  }
+
+  openLog(args) {
+    run("pane.split", { direction: "right", mod: "hcoord", props: { log: args } });
   }
 
   // ------------------------------------------------------------- new projects
@@ -250,29 +286,31 @@ export default class Projects extends View {
     await this.adopt(folder, cx);
   }
 
-  /** Makes a project of a git folder (its repo root), unless one has it, then goes there. */
+  /** Makes a project of a git folder's repo, unless one has it, then goes to that checkout. */
   async adopt(folder, cx) {
     this.offer = null;
-    const known = this.data?.projects.find((p) => p.repos.some((r) => within(folder, r)));
-    if (known) return this.go(known, cx);
+    const known = this.worktreeAt(folder);
+    if (known) return this.go(known.p, known.w, cx);
     const name = base(folder);
-    const r = await this.hcoord(["project", "new", name, "--repo", folder, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+    const r = await hcoord(["project", "new", name, "--repo", folder, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
     if (!r.ok) {
       notify({ title: `Couldn't make ${name} a project`, body: r.text, level: "error", timeout: 12000 });
       return;
     }
-    let meta;
-    try {
-      meta = JSON.parse(r.stdout);
-    } catch {
-      meta = null;
-    }
     const warning = r.text.split("\n").find((l) => l.startsWith("warning:"));
     if (warning) notify({ title: `${name}: Claude doesn't trust this repo yet`, body: warning.replace(/^warning:\s*/, ""), level: "warning", timeout: 15000 });
-    this.open[meta?.slug ?? name] = true;
-    localStorage.setItem("open", JSON.stringify(this.open));
+    let slug = null;
+    try {
+      slug = JSON.parse(r.stdout).slug;
+    } catch {}
+    if (slug) {
+      this.open[`p:${slug}`] = true;
+      save("open", this.open);
+    }
+    // Open the checkout that was picked (a worktree or the main one).
+    const lr = await hcoord(["lane", "open", folder]).catch((e) => ({ ok: false, text: String(e) }));
+    if (!lr.ok) notify({ title: `Couldn't start ${name}'s coordinator`, body: lr.text, level: "error", timeout: 12000 });
     this.refresh(cx);
-    if (meta) await this.go({ ...meta, tasks: [], coordinator: null }, cx);
   }
 
   /** A space made in a git repo no project has: offer to make it one, once per repo. */
@@ -288,20 +326,20 @@ export default class Projects extends View {
       this.seenSpaces.add(s.id);
       delete this.born[s.id];
       if (s.machine || !at || at === home() || within(at, this.data.root) || within(at, this.data.worktreeRoot)) continue;
-      if (this.data.projects.some((p) => p.repos.some((r) => within(at, r)))) continue;
+      if (this.worktreeAt(at)) continue; // a project's checkout: followSpace handles it
       cx.spawn(async (cx) => {
-        const r = await exec("git", ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"], { cwd: at }).catch(() => null);
+        const r = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: at }).catch(() => null);
         if (!r || r.code !== 0) return;
-        const [top, gitDir, common] = r.stdout.trim().split("\n");
-        // A linked worktree (git dir isn't the common one) belongs to its main checkout.
-        if (!top || gitDir !== common) return;
-        if (this.dismissed.has(top) || this.data.projects.some((p) => p.repos.includes(top))) return;
-        this.offer = { repo: top };
-        this.dismissed.add(top); // asked once; + still makes it a project later
-        localStorage.setItem("dismissed", JSON.stringify([...this.dismissed]));
+        const common = r.stdout.trim();
+        if (!common.endsWith("/.git")) return;
+        const repo = common.slice(0, -5);
+        if (this.dismissed.has(repo) || this.data.projects.some((p) => p.repo === repo)) return;
+        this.offer = { repo: at };
+        this.dismissed.add(repo); // asked once; the folder button still makes it a project later
+        save("dismissed", [...this.dismissed]);
         notify({
-          title: `Make ${base(top)} a project?`,
-          body: `A coordinator for ${tilde(top)}: click to set it up.`,
+          title: `Make ${base(repo)} a project?`,
+          body: `A coordinator agent for ${tilde(repo)} and its worktrees: click to set it up.`,
           level: "info",
           timeout: 15000,
           action: { name: "hcoord.adopt" },
@@ -313,6 +351,14 @@ export default class Projects extends View {
 
   // ------------------------------------------------------------- drawing
 
+  pill(t, text, color) {
+    return div().flex_none().px(6).h(18).rounded(5).bg(color + "26").text_size(10.5).font_semibold().text_color(color).flex().items_center().child(text);
+  }
+
+  badge(t, text, color) {
+    return div().min_w(14).h(14).px(3).flex_none().rounded(4).bg(color + "26").text_size(10.5).font_bold().text_color(color).flex().items_center().justify_center().child(text);
+  }
+
   status(t, c, busy) {
     if (busy) return svg(ICON("spinner")).size(12).mx(1).flex_none().text_color(t.dim).spin(900);
     if (!c.live) return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.dim + "80");
@@ -321,23 +367,21 @@ export default class Projects extends View {
     if (c.status === "done") return div().size(7).mx(3).flex_none().rounded(4).bg(t.done);
     if (c.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
     // Running, no agent status: a shell after a restart, or a prompt.
-    return div().size(14).flex_none().rounded(4).bg(t.unknown + "26").text_size(10.5).font_bold().text_color(t.unknown).flex().items_center().justify_center().child("?");
-  }
-
-  pill(t, text, color) {
-    return div().flex_none().px(6).h(18).rounded(5).bg(color + "26").text_size(10.5).font_semibold().text_color(color).flex().items_center().child(text);
+    return this.badge(t, "?", t.unknown);
   }
 
   taskMark(t, task) {
     switch (task.state) {
       case "needs_you":
-        return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
+        return this.badge(t, "!", t.blocked);
       case "starting":
       case "working":
         return svg(ICON("spinner")).size(12).mx(1).flex_none().text_color(t.working).spin(900);
       case "failed":
         return svg(ICON("x")).size(12).mx(1).flex_none().text_color(t.blocked);
       case "done":
+        return svg(ICON("git-compare")).size(12).mx(1).flex_none().text_color(t.blocked);
+      case "merged":
         return svg(ICON("check")).size(12).mx(1).flex_none().text_color(t.done);
       case "cancelled":
         return svg(ICON("minus")).size(12).mx(1).flex_none().text_color(t.dim);
@@ -348,39 +392,66 @@ export default class Projects extends View {
     }
   }
 
+  iconButton(id, t, icon, tip, onClick) {
+    return div()
+      .id(id)
+      .size(18)
+      .flex_none()
+      .flex()
+      .items_center()
+      .justify_center()
+      .rounded(4)
+      .text_color(t.dim)
+      .cursor_pointer()
+      .hover((el) => el.bg(t.hover).text_color(t.foreground))
+      .tooltip(tip)
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        onClick(cx);
+      })
+      .child(svg(ICON(icon)).size(12));
+  }
+
   taskRow(t, p, task, all) {
-    const live = task.terminal && all.some((x) => x.address === task.terminal && x.state === "live");
+    const live = !!task.terminal && ACTIVE.includes(task.state) && all.some((x) => x.address === task.terminal && x.state === "live");
     const note =
       task.state === "needs_you" ? plain(task.reason)
-      : task.state === "failed" || task.state === "done" ? plain(task.summary)
+      : task.state === "done" ? (task.mergeError ? `not merged: ${task.mergeError}` : "merging…")
+      : task.state === "failed" ? plain(task.summary)
+      : task.state === "merged" ? plain(task.summary)
       : task.state === "queued" && task.waitingOn.length ? `after ${task.waitingOn.join(", ")}`
       : null;
-    const quiet = task.state === "done" || task.state === "cancelled";
+    const quiet = task.state === "merged" || task.state === "cancelled";
+    const log = () => this.openLog(task.id);
+    const tip = [`${task.id} ${task.title}`, live ? "Click: peek at its terminal" : task.hasLog ? "Click: its log" : null].filter(Boolean).join("\n");
     return v_flex()
       .id(`task-${task.id}`)
-      .pl(30)
-      .pr(8)
-      .py(4)
+      .pl(44)
+      .pr(6)
+      .py(3)
       .flex_none()
       .rounded(8)
       .gap(1)
-      .when(Boolean(live), (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => run("terminal.peek", { terminal: task.terminal })))
-      .tooltip([`${task.id} ${task.title}`, plain(task.reason) || plain(task.summary)].filter(Boolean).join("\n\n"))
-      .child(h_flex().gap(8).items_center()
+      .when(live || task.hasLog, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)))
+      .on_click(() => (live ? run("terminal.peek", { terminal: task.terminal }) : task.hasLog ? log() : null))
+      .tooltip(tip)
+      .child(h_flex().gap(7).items_center()
         .child(this.taskMark(t, task))
         .child(div().flex_none().text_size(11).text_color(t.dim).child(task.id))
-        .child(div().flex_1().min_w(0).truncate().text_color(quiet ? t.muted : t.foreground).child(task.title)))
-      .when(Boolean(note), (el) => el.child(div().pl(20).truncate().text_size(11.5).text_color(task.state === "needs_you" ? t.blocked : t.dim).child(note)));
+        .child(div().flex_1().min_w(0).truncate().text_color(quiet ? t.muted : t.foreground).child(task.title))
+        .when(task.hasLog, (el) => el.child(this.iconButton(`log-${task.id}`, t, "file-text", "Its log: what the agent did", log))))
+      .when(Boolean(note), (el) => el.child(div().pl(19).truncate().text_size(11.5)
+        .text_color(task.state === "needs_you" || task.state === "done" ? t.blocked : t.dim).child(note)));
   }
 
-  groupHeader(t, p, g, n) {
-    const folded = g.folded && !this.doneOpen.has(p.slug);
+  groupHeader(t, w, g, n) {
+    const folded = g.folded && !this.mergedOpen.has(w.path);
     return h_flex()
-      .id(`grp-${p.slug}-${g.id}`)
-      .pl(30)
+      .id(`grp-${w.path}-${g.id}`)
+      .pl(44)
       .pr(8)
-      .h(22)
-      .pt(4)
+      .h(20)
+      .pt(3)
       .flex_none()
       .gap(6)
       .items_center()
@@ -388,7 +459,7 @@ export default class Projects extends View {
       .font_medium()
       .text_color(t[g.tone] ?? t.dim)
       .when(Boolean(g.folded), (el) => el.cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click((_e, cx) => {
-        folded ? this.doneOpen.add(p.slug) : this.doneOpen.delete(p.slug);
+        folded ? this.mergedOpen.add(w.path) : this.mergedOpen.delete(w.path);
         cx.notify();
       }))
       .child(div().child(g.label))
@@ -396,19 +467,9 @@ export default class Projects extends View {
       .when(Boolean(g.folded), (el) => el.child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11).flex_none().text_color(t.dim)));
   }
 
-  projectRows(t, p, ctx) {
-    const { all, ags, ps } = ctx;
-    const c = this.coordinatorOf(p, all, ags);
-    const s = this.spaceOfProject(p, ps, ags);
-    const needs = p.tasks.filter((x) => x.state === "needs_you").length;
-    const working = p.tasks.filter((x) => x.state === "working" || x.state === "starting").length;
-    const here = s && s.id === focused()?.space;
-    const isOpen = this.open[p.slug] ?? (here || needs > 0);
-    const untrusted = Object.entries(p.trust ?? {}).filter(([, v]) => v === false).map(([r]) => r);
-    const busy = this.busy.has(p.slug);
-
-    const fold = div()
-      .id(`fold-${p.slug}`)
+  fold(t, key, isOpen) {
+    return div()
+      .id(`fold-${key}`)
       .size(16)
       .flex_none()
       .flex()
@@ -419,16 +480,31 @@ export default class Projects extends View {
       .hover((el) => el.bg(t.hover).text_color(t.foreground))
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.open[p.slug] = !isOpen;
-        localStorage.setItem("open", JSON.stringify(this.open));
+        this.open[key] = !isOpen;
+        save("open", this.open);
         cx.notify();
       })
       .child(svg(ICON(isOpen ? "chevron-down" : "chevron-right")).size(11));
+  }
+
+  worktreeRows(t, p, w, ctx) {
+    const { all, ags, ps, hereSpace } = ctx;
+    const c = this.coordinatorOf(w, all, ags);
+    const s = this.spaceOf(w, ps, ags);
+    const tasks = w.lane ? p.tasks.filter((x) => x.lane === w.lane.key) : [];
+    const needs = tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
+    const working = tasks.filter((x) => x.state === "working" || x.state === "starting").length;
+    const here = s && s.id === hereSpace;
+    const key = `w:${w.path}`;
+    const isOpen = this.open[key] ?? (here || needs > 0 || working > 0);
+    const busy = this.busy.has(w.path);
+    const label = w.branch ?? base(w.path);
 
     const head = h_flex()
-      .id(`proj-${p.slug}`)
-      .px(8)
-      .h(30)
+      .id(`wt-${w.path}`)
+      .pl(22)
+      .pr(6)
+      .h(28)
       .flex_none()
       .rounded(8)
       .items_center()
@@ -436,54 +512,108 @@ export default class Projects extends View {
       .when(Boolean(here), (el) => el.bg(t.selected))
       .cursor_pointer()
       .hover((el) => el.bg(t.hover))
-      .tooltip(c.live ? `${p.name}: show its coordinator` : `${p.name}: start its coordinator`)
-      .on_click((_e, cx) => cx.spawn(async (cx) => this.go(p, cx)))
-      .child(fold)
-      .child(div().flex_1().min_w(0).truncate().text_color(c.live || here ? t.foreground : t.muted).child(p.name))
-      .when(!isOpen && working > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.working).child(`${working} working`)))
-      .when(!isOpen && needs > 0, (el) => el.child(this.pill(t, String(needs), t.blocked)))
+      .tooltip(`${tilde(w.path)}\n${c.live ? "Click: show its coordinator" : w.gone ? "This worktree is gone" : "Click: start its coordinator"}`)
+      .on_click((_e, cx) => {
+        if (!w.gone) cx.spawn(async (cx) => this.go(p, w, cx));
+      })
+      .child(this.fold(t, key, isOpen))
+      .child(svg(ICON(w.main ? "folder" : "git-branch")).size(12).flex_none().text_color(t.dim))
+      .child(div().flex_1().min_w(0).truncate().text_color(w.gone ? t.dim : c.live || here ? t.foreground : t.muted).child(label))
+      .when(!isOpen && working > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.working).child(String(working))))
+      .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .when(Boolean(c.session), (el) => el.child(this.iconButton(`clog-${w.path}`, t, "file-text", "The coordinator's log", () => this.openLog({ project: p.slug, lane: w.lane.key }))))
       .child(this.status(t, c, busy));
 
     if (!isOpen) return [head];
     const rows = [head];
-    for (const r of untrusted) {
+    if (c.live && !c.agent) {
       rows.push(h_flex()
-        .id(`trust-${p.slug}-${r}`)
-        .pl(30)
-        .pr(8)
-        .py(4)
-        .flex_none()
-        .rounded(8)
-        .gap(6)
+        .id(`restart-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
         .cursor_pointer()
         .hover((el) => el.bg(t.hover))
-        .tooltip(`Claude hasn't been told to trust ${tilde(r)}, so workers there would stop at its prompt. Click to open Claude there and answer it yourself.`)
-        .on_click(() => run("tab.new", { name: `trust ${base(r)}`, folder: r, argv: ["claude"] }))
-        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`Claude doesn't trust ${tilde(r)} yet`)));
+        .tooltip("It reports no status: it's waiting at a prompt (Claude's trust question?), or it's a plain shell after a restart. Click: show it. The button at the end replaces it with a fresh Claude.")
+        .on_click(() => run("terminal.peek", { terminal: c.address }))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child("Coordinator reports no status: look at it"))
+        .child(this.iconButton(`restartbtn-${w.path}`, t, "square-pen", "Replace it with a fresh Claude, carrying on its conversation (after a restart)", (cx) => cx.spawn(async (cx) => this.go(p, w, cx, { restart: true })))));
     }
-    if (c.live && !c.agent) {
-      rows.push(div().pl(30).pr(8).py(2).text_size(11.5).text_color(t.unknown).truncate()
-        .child("Coordinator reports no status (a shell after a restart?)"));
+    const lost = tasks.filter((x) => x.state === "failed" && /no longer exists/.test(x.summary ?? ""));
+    if (lost.length) {
+      rows.push(h_flex()
+        .id(`recover-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .cursor_pointer()
+        .hover((el) => el.bg(t.hover))
+        .tooltip("Their terminals ended (a reboot?). Click to start them again, each carrying on in its checkout.")
+        .on_click((_e, cx) => cx.spawn(async (cx) => {
+          for (const x of lost) await hcoord(["task", "retry", x.id]);
+          this.refresh(cx);
+        }))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`${lost.length} worker${lost.length > 1 ? "s" : ""} lost: carry on`)));
     }
-    if (!p.tasks.length) {
-      rows.push(div().pl(30).pr(8).py(4).text_size(11.5).text_color(t.dim).child(c.live ? "No tasks yet: tell the coordinator what to do." : "No tasks yet."));
+    if (!tasks.length) {
+      rows.push(div().pl(44).pr(8).py(3).text_size(11.5).text_color(t.dim)
+        .child(c.live ? "No tasks yet: tell the coordinator what to do." : w.lane ? "No tasks yet." : "No coordinator yet: click to start one."));
     }
     for (const g of GROUPS) {
-      const members = p.tasks.filter((x) => g.states.includes(x.state));
+      const members = tasks.filter((x) => g.states.includes(x.state));
       if (!members.length) continue;
-      rows.push(this.groupHeader(t, p, g, members.length));
-      if (g.folded && !this.doneOpen.has(p.slug)) continue;
-      // Newest done first; the rest by number.
+      rows.push(this.groupHeader(t, w, g, members.length));
+      if (g.folded && !this.mergedOpen.has(w.path)) continue;
       const list = g.folded ? [...members].sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1)) : members;
       for (const task of list) rows.push(this.taskRow(t, p, task, all));
     }
-    rows.push(div().h(6).flex_none());
+    rows.push(div().h(4).flex_none());
+    return rows;
+  }
+
+  projectRows(t, p, ctx) {
+    const wts = this.worktrees(p);
+    const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
+    const hereHit = this.worktreeAt(ctx.herePlace);
+    const here = hereHit?.p.slug === p.slug;
+    const key = `p:${p.slug}`;
+    const isOpen = this.open[key] ?? (here || needs > 0 || this.data.projects.length === 1);
+    const head = h_flex()
+      .id(`proj-${p.slug}`)
+      .px(6)
+      .h(30)
+      .flex_none()
+      .rounded(8)
+      .items_center()
+      .gap(6)
+      .cursor_pointer()
+      .hover((el) => el.bg(t.hover))
+      .tooltip(`${p.name}: ${tilde(p.repo)}`)
+      .on_click((_e, cx) => {
+        this.open[key] = !isOpen;
+        save("open", this.open);
+        cx.notify();
+      })
+      .child(this.fold(t, key, isOpen))
+      .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
+      .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .child(this.iconButton(`newwt-${p.slug}`, t, "plus", "New worktree (with its own coordinator)", () => this.newWorktree(p)));
+    if (!isOpen) return [head];
+    const rows = [head];
+    if (p.trusted === false) {
+      rows.push(h_flex()
+        .id(`trust-${p.slug}`)
+        .pl(22).pr(8).py(3).flex_none().rounded(8)
+        .cursor_pointer()
+        .hover((el) => el.bg(t.hover))
+        .tooltip(`Claude hasn't been told to trust ${tilde(p.repo)}, so its agents would stop at that prompt. Click to open Claude there and answer it yourself.`)
+        .on_click(() => run("tab.new", { name: `trust ${base(p.repo)}`, folder: p.repo, argv: ["claude"] }))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`Claude doesn't trust ${tilde(p.repo)} yet`)));
+    }
+    for (const w of wts) rows.push(...this.worktreeRows(t, p, w, ctx));
     return rows;
   }
 
   railRow(t, p, ctx) {
-    const c = this.coordinatorOf(p, ctx.all, ctx.ags);
-    const needs = p.tasks.filter((x) => x.state === "needs_you").length;
+    const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
+    const working = p.tasks.filter((x) => x.state === "working" || x.state === "starting").length;
+    const main = this.worktrees(p).find((w) => w.main);
     return h_flex()
       .id(`rail-${p.slug}`)
       .h(26)
@@ -493,21 +623,28 @@ export default class Projects extends View {
       .gap(4)
       .hover((s) => s.bg(t.hover))
       .tooltip(p.name)
-      .on_click((_e, cx) => cx.spawn(async (cx) => this.go(p, cx)))
-      .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_size(11).text_color(c.live ? t.foreground : t.muted).child(p.prefix))
+      .on_click((_e, cx) => {
+        if (main) cx.spawn(async (cx) => this.go(p, main, cx));
+      })
+      .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_size(11).text_color(t.muted).child(p.prefix))
       .child(h_flex().w(14).flex_none().items_center().justify_center()
-        .child(needs ? div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child(String(needs)) : this.status(t, c, this.busy.has(p.slug))));
+        .child(needs ? this.badge(t, String(needs), t.blocked)
+          : working ? svg(ICON("spinner")).size(12).flex_none().text_color(t.working).spin(900)
+          : div().size(7).flex_none().rounded(4).border(1.5).border_color(t.dim + "80")));
   }
 
   render(cx) {
     const t = theme();
+    if (props()?.log) return this.renderLog(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
     this.maybeSync(all, cx);
     this.followSpace(cx);
     const collapsed = narrow();
-    const ctx = { all, ags, ps };
+    const hereSpace = focused()?.space ?? null;
+    const hs = spaces().find((s) => s.id === hereSpace);
+    const ctx = { all, ags, ps, hereSpace, herePlace: hs ? this.placeOf(hs, ps) : null };
     const projects = this.data?.projects ?? [];
 
     const plus = div()
@@ -520,7 +657,7 @@ export default class Projects extends View {
         await this.newProject(cx);
         cx.notify();
       }))
-      .child(svg(ICON("plus")).size(14));
+      .child(svg(ICON("folder-plus")).size(14));
 
     const body = collapsed
       ? projects.map((p) => this.railRow(t, p, ctx))
@@ -544,9 +681,67 @@ export default class Projects extends View {
         .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Projects"))
         .child(plus)))
       .when(Boolean(this.error) && !collapsed, (el) => el.child(div().px(16).pb(6).text_size(12).text_color(t.blocked).child(`hcoord: ${this.error}`)))
-      .when(!this.error && this.data && !projects.length && !collapsed, (el) => el.child(
-        div().px(16).text_size(12).text_color(t.dim).child("No projects yet. + makes one from a git folder, with a coordinator agent you talk to.")))
+      .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
+        div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
       .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(body))
       .when(collapsed, (el) => el.child(h_flex().h(28).items_center().justify_center().child(plus)));
+  }
+
+  // ------------------------------------------------------------- a log pane
+
+  initLog(cx) {
+    this.md = "Loading…";
+    this.transcript = null;
+    this.loadLog(cx);
+    cx.timer.every(FALLBACK_MS, (cx) => this.loadLog(cx));
+  }
+
+  logArgs() {
+    const l = props().log;
+    return typeof l === "string" ? ["log", l, "--json"] : ["log", "--lane", l.lane, l.project, "--json"];
+  }
+
+  loadLog(cx) {
+    if (this.logLoading) return;
+    this.logLoading = true;
+    cx.spawn(async (cx) => {
+      try {
+        const r = await hcoord(this.logArgs());
+        if (!r.ok) throw new Error(r.text);
+        const j = JSON.parse(r.stdout);
+        this.md = j.markdown;
+        if (j.transcript && j.transcript !== this.transcript) {
+          this.transcript = j.transcript;
+          this.followTranscript(cx, j.transcript);
+        }
+      } catch (e) {
+        this.md = `Couldn't read the log: ${e?.message ?? e}`;
+      }
+      this.logLoading = false;
+      cx.notify();
+    });
+  }
+
+  /** The transcript grows as the agent works: reload when its folder changes. */
+  followTranscript(cx, file) {
+    const dir = file.slice(0, file.lastIndexOf("/"));
+    cx.spawn(async (cx) => {
+      for (;;) {
+        try {
+          const changed = await watchFolder(dir);
+          if (changed.some((c) => c === file || c === dir)) this.loadLog(cx);
+        } catch {
+          return;
+        }
+      }
+    });
+  }
+
+  renderLog(t) {
+    return v_flex()
+      .size_full()
+      .min_h(0)
+      .bg(t.background)
+      .child(TextView.markdown("hc-log", this.md ?? "").selectable(true).scrollable(true).flex_1().min_h(0).px(18).py(12).text_size(13));
   }
 }
