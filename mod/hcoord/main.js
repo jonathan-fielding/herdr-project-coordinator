@@ -3,7 +3,8 @@
 // spaces), each with a coordinator agent; under each worktree, its tasks by state.
 // Click a worktree to go to its coordinator (started if it isn't running), a task to peek
 // at its worker or read its log. Going to a project's worktree space starts its coordinator.
-// The same mod with props { log } is a pane showing one agent's log (its transcript).
+// The same mod with props { log } is a pane showing one agent's log (its transcript); with
+// props { menu } a right-click menu, and with props { ask } a dialog asking before a delete.
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
@@ -12,7 +13,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home, props, openOverlay,
+  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
@@ -72,6 +73,8 @@ async function hcoord(args) {
 export default class Projects extends View {
   init(_props, cx) {
     if (props()?.log) return this.initLog(cx);
+    if (props()?.menu) return this.initMenu(cx);
+    if (props()?.ask) return this.initAsk(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.loading = false;
@@ -272,6 +275,11 @@ export default class Projects extends View {
     const s = this.spaceOf({ path: p.repo, lane: p.lanes.find((l) => l.key === "root") }, panes(), agents());
     // Herdr's own dialog: it makes the checkout and a space for it; going there starts its coordinator.
     openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: s?.id, folder: p.repo, action: "new" } });
+  }
+
+  menuFor(target) {
+    // A popup is as tall as its items; height is only the most.
+    openOverlay({ mod: "hcoord", kind: "popup", width: 210, height: 160, props: { menu: target } });
   }
 
   openLog(args) {
@@ -516,6 +524,10 @@ export default class Projects extends View {
       .on_click((_e, cx) => {
         if (!w.gone) cx.spawn(async (cx) => this.go(p, w, cx));
       })
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null });
+      })
       .child(this.fold(t, key, isOpen))
       .child(svg(ICON(w.main ? "folder" : "git-branch")).size(12).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_color(w.gone ? t.dim : c.live || here ? t.foreground : t.muted).child(label))
@@ -590,6 +602,10 @@ export default class Projects extends View {
         save("open", this.open);
         cx.notify();
       })
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        this.menuFor({ kind: "project", project: p.slug, name: p.name, repo: p.repo });
+      })
       .child(this.fold(t, key, isOpen))
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
@@ -636,6 +652,8 @@ export default class Projects extends View {
   render(cx) {
     const t = theme();
     if (props()?.log) return this.renderLog(t);
+    if (props()?.menu) return this.renderMenu(t);
+    if (props()?.ask) return this.renderAsk(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -743,5 +761,193 @@ export default class Projects extends View {
       .min_h(0)
       .bg(t.background)
       .child(TextView.markdown("hc-log", this.md ?? "").selectable(true).scrollable(true).flex_1().min_h(0).px(18).py(12).text_size(13));
+  }
+
+  // ------------------------------------------------------------- a right-click menu
+
+  initMenu(cx) {
+    this.at = 0;
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+  }
+
+  menuItems() {
+    const m = props().menu;
+    if (m.kind === "project") {
+      return [
+        { label: "New worktree", icon: "git-branch", go: () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { folder: m.repo, action: "new" } }) },
+        { label: "Delete project…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 480, height: 360, props: { ask: { ...m, what: "project" } } }) },
+      ];
+    }
+    const items = [];
+    if (m.log) items.push({ label: "Coordinator's log", icon: "file-text", go: () => run("pane.split", { direction: "right", mod: "hcoord", props: { log: m.log } }) });
+    if (m.main) items.push({ label: "Main checkout: delete the project instead", icon: "folder", disabled: true });
+    else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { ask: { ...m, what: "worktree" } } }) });
+    return items;
+  }
+
+  choose(i) {
+    const it = this.menuItems()[i];
+    if (!it || it.disabled) return;
+    closeOverlay(props().overlay);
+    it.go();
+  }
+
+  renderMenu(t) {
+    const list = this.menuItems();
+    return v_flex()
+      .id("hc-menu")
+      .track_focus(this.handle)
+      .w_full()
+      .min_h(0)
+      .p(5)
+      .bg(t.popover)
+      .text_size(12.8)
+      .on_key_down((e, cx) => {
+        if (e.key === "down") this.at = (this.at + 1) % list.length;
+        else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
+        else if (e.key === "enter") this.choose(this.at);
+        else if (e.key === "escape") closeOverlay(props().overlay);
+        else return;
+        cx.notify();
+      })
+      .children(list.map((it, i) =>
+        v_flex()
+          .when(i > 0 && !!it.danger, (el) => el.child(div().mx(7).my(4).h(1).bg(t.border)))
+          .child(h_flex()
+            .id(`hm-${i}`)
+            .h(31)
+            .px(8)
+            .gap(9)
+            .rounded(7)
+            .items_center()
+            .text_color(it.disabled ? t.dim : it.danger ? t.blocked : t.foreground)
+            .when(i === this.at && !it.disabled, (el) => el.bg(t.selected))
+            .when(!it.disabled, (el) => el.hover((s) => s.bg(t.hover)).on_click(() => this.choose(i)))
+            .child(svg(ICON(it.icon)).size(14).flex_none().text_color(it.danger ? t.blocked : t.muted))
+            .child(div().flex_1().min_w(0).truncate().child(it.label)))));
+  }
+
+  // ------------------------------------------------------------- asking before a delete
+
+  initAsk(cx) {
+    this.plan = null;
+    this.error = null;
+    this.busyAsk = false;
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+    const a = props().ask;
+    const args = a.what === "project" ? ["project", "delete", a.project, "--dry-run", "--json"] : ["lane", "remove", a.path, "--dry-run", "--json"];
+    cx.spawn(async (cx) => {
+      const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+      if (r.ok) {
+        try {
+          this.plan = JSON.parse(r.stdout);
+        } catch (e) {
+          this.error = String(e);
+        }
+      } else this.error = r.text;
+      cx.notify();
+    });
+  }
+
+  /** Spaces showing a folder in one of these checkouts. */
+  spacesIn(paths) {
+    const ps = panes();
+    return spaces().filter((s) => !s.machine && paths.some((p) => within(this.placeOf(s, ps), p)));
+  }
+
+  async doDelete(files, cx) {
+    const a = props().ask;
+    const plan = this.plan;
+    if (!plan || this.busyAsk) return;
+    this.busyAsk = true;
+    this.error = null;
+    cx.notify();
+    let args, closing = [];
+    if (a.what === "project") {
+      args = ["project", "delete", a.project, ...(files ? ["--files"] : [])];
+      // Its folders are about to go: their spaces first, so no shell sits in them.
+      if (files) closing = this.spacesIn(plan.checkouts.map((c) => c.path));
+    } else {
+      args = ["lane", "remove", plan.path, ...(plan.changed.length ? ["--force"] : [])];
+      closing = this.spacesIn([plan.path]);
+    }
+    for (const s of closing) run("space.close", { id: s.id, confirmed: true });
+    const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+    this.busyAsk = false;
+    if (!r.ok) {
+      this.error = r.text;
+      cx.notify();
+      return;
+    }
+    closeOverlay(props().overlay);
+    const what = a.what === "project" ? `${a.name} deleted${files ? ", files too" : " from Herdr"}` : `Worktree ${a.branch} deleted`;
+    notify({ title: what, body: r.text.split("\n").slice(-3).join("\n"), level: "info", timeout: 8000 });
+  }
+
+  askLines(t) {
+    const a = props().ask;
+    const p = this.plan;
+    const line = (text, color = t.muted) => div().text_color(color).child(text);
+    const out = [];
+    if (!p) return [line(this.error ? "" : "Looking…", t.dim)];
+    if (a.what === "worktree") {
+      out.push(line(`${tilde(p.path)} goes, with its Herdr space. The branch ${p.branch ?? "(detached)"} is kept.`));
+      if (p.changed.length) out.push(line(`It has ${p.changed.length} uncommitted file${p.changed.length > 1 ? "s" : ""}: they will be lost (${p.changed.slice(0, 4).join(", ")}${p.changed.length > 4 ? ", …" : ""}).`, t.blocked));
+      if (p.coordinator) out.push(line("Its coordinator is stopped."));
+      if (p.unfinished.length) out.push(line(`Unfinished tasks are cancelled and their workers stopped: ${p.unfinished.join(", ")}.`, t.blocked));
+      return out;
+    }
+    const n = p.coordinators.length;
+    out.push(div().text_color(t.foreground).font_medium().child("Remove from Herdr"));
+    out.push(line(`Stops ${n ? `its ${n} coordinator${n > 1 ? "s" : ""}` : "its agents"}${p.unfinished.length ? ` and cancels ${p.unfinished.join(", ")}` : ""}. Its tasks and logs move to ${tilde(p.archive.replace(/\/[^/]+$/, ""))}. The repo and worktrees stay on disk.`));
+    out.push(div().h(6));
+    out.push(div().text_color(t.blocked).font_medium().child("Delete files too"));
+    out.push(line(`Also ${p.trash ? "moves these to the Trash" : "deletes these for good"}, and closes their spaces:`));
+    for (const c of p.checkouts) out.push(line(`  ${tilde(c.path)}${c.changed ? ` (${c.changed} uncommitted)` : ""}`, c.changed ? t.blocked : t.muted));
+    if (p.workerDir) out.push(line(`  ${tilde(p.workerDir)} (workers' checkouts)`));
+    if (p.unpushed) out.push(line(`${p.unpushed} commit${p.unpushed > 1 ? "s aren't" : " isn't"} pushed anywhere: ${p.trash ? "only the Trash will have them" : "they will be lost"}.`, t.blocked));
+    return out;
+  }
+
+  renderAsk(t) {
+    const a = props().ask;
+    const ready = !!this.plan && !this.busyAsk;
+    const button = (id, label, bg, fg, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "no" ? t.input : bg).bg(bg).text_color(fg)
+        .when(ready || id === "no", (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick))
+        .when(!ready && id !== "no", (el) => el.opacity(0.5))
+        .child(label);
+    const title = a.what === "project" ? `Delete project ${a.name}?` : `Delete worktree ${a.branch}?`;
+    const buttons = [button("no", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay))];
+    if (a.what === "project") {
+      buttons.push(button("herdr", "Remove from Herdr", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
+      buttons.push(button("files", "Delete files too", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(true, cx))));
+    } else {
+      buttons.push(button("yes", "Delete worktree", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
+    }
+    return v_flex()
+      .id("hc-ask")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key !== "escape") return;
+        closeOverlay(props().overlay);
+        cx.stop_propagation();
+      })
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child(title))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(v_flex().id("hc-ask-body").flex_1().min_h(0).gap(4).overflow_y_scrollbar().children(this.askLines(t))
+        .when(Boolean(this.error), (el) => el.child(div().pt(6).text_color(t.blocked).child(this.error))))
+      .child(h_flex().justify_end().gap(8).text_size(12)
+        .when(this.busyAsk, (el) => el.child(div().flex_1().text_color(t.dim).child("Deleting…")))
+        .children(buttons));
   }
 }
