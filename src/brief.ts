@@ -9,12 +9,21 @@ export interface BriefInput {
   coordinator: string | null;
   /** PROJECT.md (standing instructions: how to test, conventions). */
   projectNotes?: string;
+  /** The worktree already has work from an earlier worker on this task. */
+  resume?: { commits: string; dirty: string };
 }
 
 /** The worker's first and only prompt. Everything it needs is here; nobody watches its terminal. */
-export function renderWorkerBrief({ meta, task, worktree, coordinator, projectNotes }: BriefInput): string {
+export function renderWorkerBrief({ meta, task, worktree, coordinator, projectNotes, resume }: BriefInput): string {
   const id = task.id;
   const notes = projectNotes?.trim();
+  const picked = resume && (resume.commits || resume.dirty)
+    ? `\n## Picking up where an earlier worker left off\n\n` +
+      `An earlier worker on this task stopped before reporting (its terminal ended). Its work is in your worktree.\n` +
+      `Look at it first (git log, git status, git diff) and carry on from there; don't start over.\n` +
+      (resume.commits ? `\nCommits so far:\n${resume.commits.replace(/^/gm, "    ")}\n` : "") +
+      (resume.dirty ? `\nUncommitted changes:\n${resume.dirty.replace(/^/gm, "    ")}\n` : "")
+    : "";
   return `You are a worker agent on project "${meta.name}", started by hcoord for one task.
 No person is watching this terminal: a coordinator agent reads your report and talks to the person.
 
@@ -27,7 +36,7 @@ Coordinator terminal: ${coordinator ?? "(none)"}
 ## The task
 
 ${task.brief.trim()}
-${notes ? `\n## Project notes (from PROJECT.md)\n\n${notes}\n` : ""}
+${picked}${notes ? `\n## Project notes (from PROJECT.md)\n\n${notes}\n` : ""}
 ## Rules
 
 - Work only inside your worktree (${worktree}). Commit your work to ${task.branch} as you go.

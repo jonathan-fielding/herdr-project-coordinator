@@ -3,10 +3,11 @@ import { coordinatorArgv } from "./agents.ts";
 import { loadConfig } from "./config.ts";
 import { HcoordError } from "./errors.ts";
 import { atomicWrite, withLock } from "./fsutil.ts";
-import { hcGet, hcRunBg } from "./hc.ts";
+import { hcGet, hcKill, hcRunBg } from "./hc.ts";
 import { paths, root } from "./paths.ts";
 import { loadProject, type ProjectMeta } from "./store.ts";
-import { liveCoordinator, trustWarnings, type Outcome } from "./workers.ts";
+import { liveCoordinator, retryTask, sync, trustWarnings, type Outcome } from "./workers.ts";
+import { loadTasks } from "./store.ts";
 
 export const coordinatorName = (slug: string) => `coord-${slug}`.slice(0, 32);
 
@@ -59,20 +60,26 @@ async function saveCoordinator(slug: string, coordinator: ProjectMeta["coordinat
  * named "coord <slug>", in `opts.space` or the space whose folder is a project repo, else the
  * shown one. Without a Herdr window it runs headless; attach with `hc attach`.
  */
-export async function openProject(project: string, opts: { show?: boolean; space?: string } = {}): Promise<Outcome> {
+export async function openProject(project: string, opts: { show?: boolean; space?: string; restart?: boolean } = {}): Promise<Outcome> {
   const meta = loadProject(project);
   const slug = meta.slug;
   const name = coordinatorName(slug);
   const lines: string[] = [];
 
-  const live = liveCoordinator(meta);
+  let live = liveCoordinator(meta);
+  if (live && opts.restart && loadConfig().agent.kind === "claude" && !hcGet(live.address)?.status) {
+    // A kept coordinator comes back from a reboot as a plain shell: replace it.
+    hcKill(live.address);
+    lines.push(`stopped ${name} (${live.address}): it was a shell, not Claude (after a restart?)`);
+    live = null;
+  }
   if (live && loadConfig().agent.kind === "claude" && !hcGet(live.address)?.status) {
     // Claude reports a status as soon as it runs. A kept terminal recovered as a shell doesn't.
     return {
       ok: false,
       lines: [
         `${name} (${live.address}) is running but reports no agent status: Claude may have been replaced by a shell after a restart, or be at a prompt.`,
-        `Look with: hc attach ${live.address}. To start a fresh coordinator: hc kill ${live.address}, then hcoord project open ${slug}`,
+        `Look with: hc attach ${live.address}. To start a fresh one: hcoord project open ${slug} --restart`,
       ],
     };
   }
@@ -130,4 +137,37 @@ export async function addMemory(project: string, text: string): Promise<Outcome>
     appendFileSync(paths.memoryMd(meta.slug), `- ${new Date().toISOString().slice(0, 10)}: ${note}\n`);
   });
   return { ok: true, lines: [`noted in ${paths.memoryMd(meta.slug)}`] };
+}
+
+/**
+ * After a reboot (or a core restart): checks workers, brings back the coordinator if the project had
+ * one (a fresh Claude; its notes are in the project files), and restarts tasks whose worker vanished,
+ * in their worktrees, with what's there so far.
+ */
+export async function recoverProject(project: string, opts: { show?: boolean } = {}): Promise<Outcome> {
+  const slug = loadProject(project).slug;
+  const out: Outcome = { ok: true, lines: [] };
+  const add = (o: Outcome) => {
+    out.lines.push(...o.lines);
+    out.ok &&= o.ok;
+  };
+  add(await sync(slug));
+  const meta = loadProject(slug);
+  if (meta.coordinator) {
+    const live = liveCoordinator(meta);
+    const working = live && (loadConfig().agent.kind !== "claude" || !!hcGet(live.address)?.status);
+    if (working) out.lines.push(`coordinator ${live!.name} (${live!.address}) is running`);
+    else add(await openProject(slug, { show: opts.show, restart: true }));
+  }
+  const lost = loadTasks(slug).tasks.filter((t) => t.state === "failed" && t.lostWorker);
+  for (const t of lost) {
+    try {
+      add(await retryTask(t.id));
+    } catch (e) {
+      out.ok = false;
+      out.lines.push(`${t.id}: couldn't retry: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  if (!out.lines.length) out.lines.push("nothing to recover");
+  return out;
 }

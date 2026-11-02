@@ -52,6 +52,12 @@ export function ensureWorktree(repo: string, path: string, branch: string): { ba
 }
 
 /** Uncommitted or untracked files in a worktree ("" = clean). */
+/** Commits on HEAD since \`base\`, newest first, one line each ("" if none or unknown). */
+export function commitsSince(path: string, base: string): string {
+  const r = git(path, ["log", "--oneline", "--no-decorate", `${base}..HEAD`]);
+  return r.code === 0 ? r.out : "";
+}
+
 export function dirtyFiles(path: string): string {
   return gitOk(path, ["status", "--porcelain"], `checking ${path}`);
 }

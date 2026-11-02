@@ -4,7 +4,7 @@ import { claudeTrusts, showsTrustPrompt, untrustedRepoMessage, workerArgv } from
 import { renderWorkerBrief } from "./brief.ts";
 import { loadConfig } from "./config.ts";
 import { HcoordError, UsageError } from "./errors.ts";
-import { dirtyFiles, ensureWorktree, mergedInto, removeWorktree } from "./git.ts";
+import { commitsSince, dirtyFiles, ensureWorktree, mergedInto, removeWorktree } from "./git.ts";
 import { hcCall, hcGet, hcKill, hcList, hcRm, hcRunBg, hcSend, type HcTerminal } from "./hc.ts";
 import { ACTIVE_STATES, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
@@ -147,9 +147,12 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
   try {
     assertTrusted(task.repo);
     mkdirSync(dirname(wt), { recursive: true });
-    const { base } = ensureWorktree(task.repo, wt, task.branch);
+    const made = ensureWorktree(task.repo, wt, task.branch);
+    // A retried task keeps the base its branch was made from.
+    const base = task.base ?? made.base;
     const worktree = realpathSync(wt);
-    const prompt = renderWorkerBrief({ meta, task, worktree, coordinator: parent, projectNotes: readProjectNotes(slug) });
+    const resume = made.reused ? { commits: commitsSince(worktree, base), dirty: dirtyFiles(worktree) } : undefined;
+    const prompt = renderWorkerBrief({ meta, task, worktree, coordinator: parent, projectNotes: readProjectNotes(slug), resume });
     const term = hcRunBg({
       name: workerName(id),
       cwd: worktree,
@@ -274,6 +277,20 @@ export async function startTask(idArg: string, opts: { parent?: string } = {}): 
  * worker stopped without reporting (it asked in plain text, or gave up): mark it needs_you and tell
  * the coordinator, since the core sends no note for an ordinary end of turn. Otherwise do nothing.
  */
+/** A failed or cancelled task back to todo, then started again in its worktree (work so far kept). */
+export async function retryTask(idArg: string, opts: { parent?: string } = {}): Promise<Outcome> {
+  const { meta, task } = findTask(idArg);
+  assertTrusted(task.repo);
+  await mutate(meta.slug, ({ file, now }) => {
+    const t = get(file, task.id);
+    if (t.state !== "failed" && t.state !== "cancelled") {
+      throw new HcoordError(`${t.id} is ${t.state}; only failed or cancelled tasks can be retried`);
+    }
+    return { result: null, events: [transition(t, "todo", now, { by: "retry" })] };
+  });
+  return startTask(task.id, opts);
+}
+
 export async function workerStopped(idArg: string): Promise<Outcome> {
   const { meta, task } = findTask(idArg);
   if (task.state !== "working") return { ok: true, lines: [] };
@@ -449,6 +466,8 @@ interface Change {
   to: TaskState;
   reason: string;
   auto?: boolean;
+  /** The worker's terminal is gone: retryable. */
+  lost?: boolean;
 }
 
 /**
@@ -480,7 +499,10 @@ export async function reconcile(slug: string): Promise<Outcome> {
     const h = byAddr.get(a);
     const read = `hc read ${a}`;
     if (!h || (h.name ?? null) !== t.terminal.name) {
-      changes.push({ id: t.id, from: t.state, address: a, to: "failed", reason: `worker terminal ${t.terminal.name} (${a}) no longer exists` });
+      changes.push({
+        id: t.id, from: t.state, address: a, to: "failed", lost: true,
+        reason: `worker terminal ${t.terminal.name} (${a}) no longer exists (a restart?); hcoord task retry ${t.id} picks it up again`,
+      });
     } else if (h.state === "finished") {
       changes.push({ id: t.id, from: t.state, address: a, to: "failed", reason: `worker exited without reporting (${describeExit(h)}); ${read}` });
     } else if (t.state === "working" && (h.status === "blocked" || h.status === "error")) {
@@ -510,7 +532,10 @@ export async function reconcile(slug: string): Promise<Outcome> {
       const t = get(file, c.id);
       if (t.state !== c.from || t.terminal?.address !== c.address) continue; // changed meanwhile
       events.push(transition(t, c.to, now, { by: "reconcile", reason: c.reason }));
-      if (c.to === "failed") t.summary = c.reason;
+      if (c.to === "failed") {
+        t.summary = c.reason;
+        if (c.lost) t.lostWorker = true;
+      }
       if (c.to === "needs_you") {
         t.needsYouReason = c.reason;
         t.needsYouAuto = !!c.auto;

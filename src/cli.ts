@@ -18,6 +18,7 @@ import {
 import {
   cancelTask,
   cleanTask,
+  retryTask,
   REPORT_STATES,
   replyTask,
   report,
@@ -28,7 +29,7 @@ import {
   type Outcome,
   type ReportState,
 } from "./workers.ts";
-import { addMemory, openProject } from "./coordinator.ts";
+import { addMemory, openProject, recoverProject } from "./coordinator.ts";
 import { board, type BoardProject } from "./board.ts";
 import { installMod } from "./modinstall.ts";
 
@@ -38,10 +39,11 @@ Projects
   hcoord project new <name> --repo <path> [--repo <path>...] [--prefix ABC]
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
-  hcoord project open [<slug>] [--no-show] [--space <id>]
+  hcoord project open [<slug>] [--no-show] [--space <id>] [--restart]
                                                   start (or show) its coordinator agent
   hcoord board [--json]                           every project and its tasks (read only)
   hcoord sync [<slug>]                            check workers, start queued tasks (all projects)
+  hcoord recover [<slug>] [--no-show]             after a reboot: coordinators back, lost workers retried
 
 Herdr
   hcoord mod install                              put the Projects section in ~/.config/herdr-app/mods/hcoord
@@ -56,6 +58,7 @@ Tasks
 Workers
   hcoord task start <id> [--parent <terminal>]   worktree + worker (or queue it)
   hcoord task reply <id> (<text> | --file <file|->)   answer a needs_you worker
+  hcoord task retry <id>                          a failed/cancelled task again, in its worktree
   hcoord task cancel <id>                         stop its worker, keep the worktree
   hcoord task clean <id>                          remove its worktree if clean and merged
   hcoord report <id> --state done|needs_you|failed --file <file|-> [--no-notify]
@@ -153,9 +156,17 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case "project open": {
-      const { positionals, values } = parse(rest, { "no-show": { type: "boolean" }, space: { type: "string" } }, 1);
+      const { positionals, values } = parse(
+        rest,
+        { "no-show": { type: "boolean" }, space: { type: "string" }, restart: { type: "boolean" } },
+        1,
+      );
       return report_(
-        await openProject(positionals[0] ?? defaultProjectSlug(), { show: !values["no-show"], space: values.space }),
+        await openProject(positionals[0] ?? defaultProjectSlug(), {
+          show: !values["no-show"],
+          space: values.space,
+          restart: values.restart,
+        }),
       );
     }
     case "task add": {
@@ -191,6 +202,11 @@ async function main(argv: string[]): Promise<number> {
       if (words.length && values.file !== undefined) throw new UsageError("give the reply as text or --file, not both");
       const text = values.file !== undefined ? await readFileArg(values.file) : words.join(" ");
       return report_(await replyTask(id, text));
+    }
+    case "task retry": {
+      const { values, positionals } = parse(rest, { parent: { type: "string" } }, 1);
+      if (!positionals[0]) throw new UsageError("hcoord task retry <id>");
+      return report_(await retryTask(positionals[0], { parent: values.parent }));
     }
     case "task cancel": {
       const { positionals } = parse(rest, {}, 1);
@@ -260,6 +276,17 @@ async function main(argv: string[]): Promise<number> {
       if (group === "mod" && cmd === "install") {
         parse(rest, {}, 0);
         return report_(installMod());
+      }
+      if (group === "recover") {
+        const { positionals, values } = parse(cmd === undefined ? rest : [cmd, ...rest], { "no-show": { type: "boolean" } }, 1);
+        const slugs = positionals[0] ? [loadProject(positionals[0]).slug] : listProjects().map((p) => p.slug);
+        let ok = true;
+        for (const slug of slugs) {
+          const o = await recoverProject(slug, { show: !values["no-show"] });
+          ok &&= o.ok;
+          for (const l of o.lines) out(slugs.length > 1 ? `${slug}: ${l}` : l);
+        }
+        return ok ? 0 : 1;
       }
       if (group === "sync") {
         const { positionals } = parse(cmd === undefined ? rest : [cmd, ...rest], {}, 1);

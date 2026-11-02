@@ -37,6 +37,8 @@ export interface Task {
   needsYouAuto?: boolean;
   /** Set from the worker's final report. */
   summary?: string;
+  /** failed because its worker terminal vanished (a reboot, a core restart, hc kill): \`hcoord recover\` retries it. */
+  lostWorker?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -96,6 +98,7 @@ export function transition(
     delete task.needsYouReason;
     delete task.needsYouAuto;
   }
+  if (to !== "failed") delete task.lostWorker;
   return { type: "task.state", task: task.id, from, to, ...(data ? { data } : {}) };
 }
 
