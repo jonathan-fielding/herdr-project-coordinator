@@ -56,9 +56,10 @@ async function saveCoordinator(slug: string, coordinator: ProjectMeta["coordinat
 
 /**
  * Starts the project's coordinator agent (or brings back the running one) in a Herdr tab
- * named "coord <slug>". Without a Herdr window it runs headless; attach with `hc attach`.
+ * named "coord <slug>", in `opts.space` or the space whose folder is a project repo, else the
+ * shown one. Without a Herdr window it runs headless; attach with `hc attach`.
  */
-export async function openProject(project: string, opts: { show?: boolean } = {}): Promise<Outcome> {
+export async function openProject(project: string, opts: { show?: boolean; space?: string } = {}): Promise<Outcome> {
   const meta = loadProject(project);
   const slug = meta.slug;
   const name = coordinatorName(slug);
@@ -85,7 +86,7 @@ export async function openProject(project: string, opts: { show?: boolean } = {}
     throw new HcoordError(`a terminal named ${name} is running but isn't this project's coordinator; stop it (hc kill ${name}) first`);
   }
 
-  const space = opts.show === false ? null : pickSpace(meta);
+  const space = opts.show === false ? null : (opts.space ?? pickSpace(meta));
   const tab = space ? `tbhcoord${slug.replace(/[^a-z0-9]/g, "")}${Date.now().toString(36)}` : null;
   const labels: Record<string, string> = { "hcoord.project": slug, "hcoord.role": "coordinator" };
   if (space && tab) Object.assign(labels, { "herdr.space": space, "herdr.tab": tab });

@@ -161,3 +161,17 @@ All test terminals (`disc-env`, `disc-parent`, `disc-orphan`, `disc-dies`, `disc
   terminal closes the tab.
 - Tests run against a private core: `HC_SESSION` + `XDG_{STATE,CONFIG,RUNTIME}_HOME`, with the
   runtime dir short (macOS socket paths max 103 bytes) and `HC_TERMINAL_*` unset.
+
+## 8. Phase 4 findings (Herdr Projects section)
+
+- `mod.open {name}` shows a mod as an overlay. With no `overlay` size in `mod.json` it sizes to its content, and a
+  `flex_1` scrolling list inside collapses to nothing; `"overlay": {"width", "height"}` fixes that.
+- Reinstalling a mod (saving its files) closes its open overlay.
+- A mod's `exec` takes no environment, so the installed `hcoord-path.js` names bun and `cli.ts` exactly (and goes
+  through `env HCOORD_HOME=…` for a non-default root). The app's PATH doesn't matter.
+- `mutate` used to rewrite tasks.json even when nothing changed (schedule with only blocked queued tasks). With a
+  folder watch on `projects/` that would loop; it now writes only when something changed.
+- Verified in the real window: a click on a project with no space ran `space.new` + `hcoord project open`; Herdr took the
+  coordinator into a tab "coord <slug>" and Claude ran the skill's first turn.
+- Not yet verified by hand: `pickFolder` from the + button, and a toast `action: {name: "hcoord.adopt"}` reaching the
+  mod's `nextCommand()`.

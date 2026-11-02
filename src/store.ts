@@ -175,7 +175,10 @@ export async function mutate<T>(
   const slug = meta.slug;
   return withLock(paths.lock(slug), () => {
     const ctx: MutationContext = { meta, file: loadTasks(slug), now: now() };
+    const before = JSON.stringify(ctx.file);
     const { result, events } = fn(ctx);
+    // Nothing changed, nothing written: folder watchers (the Herdr section) don't wake for no reason.
+    if (!events.length && JSON.stringify(ctx.file) === before) return result;
     writeTasks(meta, ctx.file);
     appendEvents(slug, ctx.now, events);
     return result;

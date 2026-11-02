@@ -29,6 +29,8 @@ import {
   type ReportState,
 } from "./workers.ts";
 import { addMemory, openProject } from "./coordinator.ts";
+import { board, type BoardProject } from "./board.ts";
+import { installMod } from "./modinstall.ts";
 
 const HELP = `hcoord ${pkg.version}: tasks and workers for a Herdr coordinator
 
@@ -36,7 +38,13 @@ Projects
   hcoord project new <name> --repo <path> [--repo <path>...] [--prefix ABC]
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
-  hcoord project open [<slug>] [--no-show]       start (or show) its coordinator agent
+  hcoord project open [<slug>] [--no-show] [--space <id>]
+                                                  start (or show) its coordinator agent
+  hcoord board [--json]                           every project and its tasks (read only)
+  hcoord sync [<slug>]                            check workers, start queued tasks (all projects)
+
+Herdr
+  hcoord mod install                              put the Projects section in ~/.config/herdr-app/mods/hcoord
   hcoord memory [<slug>] <text>                   add a dated note to its MEMORY.md
 
 Tasks
@@ -145,8 +153,10 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case "project open": {
-      const { positionals, values } = parse(rest, { "no-show": { type: "boolean" } }, 1);
-      return report_(await openProject(positionals[0] ?? defaultProjectSlug(), { show: !values["no-show"] }));
+      const { positionals, values } = parse(rest, { "no-show": { type: "boolean" }, space: { type: "string" } }, 1);
+      return report_(
+        await openProject(positionals[0] ?? defaultProjectSlug(), { show: !values["no-show"], space: values.space }),
+      );
     }
     case "task add": {
       const { values, positionals } = parse(
@@ -239,6 +249,29 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     default:
+      if (group === "board") {
+        const { values } = parse(cmd === undefined ? rest : [cmd, ...rest], {}, 0);
+        const b = board();
+        if (values.json) json(b);
+        else if (!b.projects.length) out("no projects yet: hcoord project new <name> --repo <path>");
+        else for (const p of b.projects) out(boardLine(p));
+        return 0;
+      }
+      if (group === "mod" && cmd === "install") {
+        parse(rest, {}, 0);
+        return report_(installMod());
+      }
+      if (group === "sync") {
+        const { positionals } = parse(cmd === undefined ? rest : [cmd, ...rest], {}, 1);
+        const slugs = positionals[0] ? [loadProject(positionals[0]).slug] : listProjects().map((p) => p.slug);
+        let ok = true;
+        for (const slug of slugs) {
+          const o = await sync(slug);
+          ok &&= o.ok;
+          for (const l of o.lines) out(slugs.length > 1 ? `${slug}: ${l}` : l);
+        }
+        return ok ? 0 : 1;
+      }
       if (group === "memory") {
         // hcoord memory [<slug>] <text...>: a first word naming a project is the slug.
         const words = cmd === undefined ? rest : [cmd, ...rest];
@@ -271,6 +304,14 @@ async function main(argv: string[]): Promise<number> {
       }
       throw new UsageError(`unknown command: ${[group, cmd].filter(Boolean).join(" ")} (hcoord --help)`);
   }
+}
+
+function boardLine(p: BoardProject): string {
+  const counts: Record<string, number> = {};
+  for (const t of p.tasks) counts[t.state] = (counts[t.state] ?? 0) + 1;
+  const summary = Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ") || "no tasks";
+  const untrusted = Object.entries(p.trust).filter(([, v]) => v === false).map(([r]) => r);
+  return `${p.slug.padEnd(24)} ${summary}${untrusted.length ? `  (Claude doesn't trust ${untrusted.join(", ")})` : ""}`;
 }
 
 /** Prints an outcome's lines; exit 1 if any part failed. */
