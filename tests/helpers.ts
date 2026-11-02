@@ -42,8 +42,14 @@ export interface CliResult {
   stderr: string;
 }
 
-export async function cli(home: string, args: string[], stdin?: string): Promise<CliResult> {
-  const env: Record<string, string | undefined> = { ...process.env, HCOORD_HOME: home };
+/** Runs hcoord. `baseEnv` (e.g. a TestCore's) replaces process.env, so hc talks to that core. */
+export async function cli(
+  home: string,
+  args: string[],
+  stdin?: string,
+  baseEnv: Record<string, string | undefined> = process.env,
+): Promise<CliResult> {
+  const env: Record<string, string | undefined> = { ...baseEnv, HCOORD_HOME: home };
   delete env.HCOORD_PROJECT;
   const p = Bun.spawn(["bun", CLI, ...args], {
     env,

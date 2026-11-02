@@ -25,10 +25,16 @@ export interface Task {
   branch: string;
   /** Absolute path once created. */
   worktree?: string;
+  /** Commit the branch was created from. */
+  base?: string;
   /** hc terminal of the worker: address (e.g. "t12") and name (e.g. "w-qhq-12"). */
   terminal?: { address: string; name: string };
+  /** Address of the coordinator terminal this worker reports to (its hc parent). */
+  parent?: string;
   dependsOn: string[];
   needsYouReason?: string;
+  /** True when needs_you came from the core seeing the worker blocked, not from a report. */
+  needsYouAuto?: boolean;
   /** Set from the worker's final report. */
   summary?: string;
   createdAt: string;
@@ -86,7 +92,10 @@ export function transition(
   }
   task.state = to;
   task.updatedAt = now;
-  if (to !== "needs_you") delete task.needsYouReason;
+  if (to !== "needs_you") {
+    delete task.needsYouReason;
+    delete task.needsYouAuto;
+  }
   return { type: "task.state", task: task.id, from, to, ...(data ? { data } : {}) };
 }
 
@@ -103,6 +112,14 @@ export function slugify(text: string, max = 40): string {
 
 export function taskNumber(id: string): number {
   return Number(id.slice(id.lastIndexOf("-") + 1));
+}
+
+/** States that hold a worker slot. */
+export const ACTIVE_STATES: readonly TaskState[] = ["starting", "working", "needs_you"];
+
+/** hc terminal name for a task's worker: lowercase, hc allows [a-z0-9_-]{1,32}. */
+export function workerName(id: string): string {
+  return `w-${id.toLowerCase()}`.slice(0, 32);
 }
 
 export function branchFor(id: string, title: string): string {

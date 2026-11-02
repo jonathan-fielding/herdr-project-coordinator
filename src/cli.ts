@@ -15,6 +15,17 @@ import {
   loadProject,
   loadTasks,
 } from "./store.ts";
+import {
+  cancelTask,
+  cleanTask,
+  REPORT_STATES,
+  replyTask,
+  report,
+  startTask,
+  sync,
+  type Outcome,
+  type ReportState,
+} from "./workers.ts";
 
 const HELP = `hcoord ${pkg.version}: tasks and workers for a Herdr coordinator
 
@@ -26,9 +37,19 @@ Projects
 Tasks
   hcoord task add [<slug>] --title <text> (--brief-file <file|-> | --brief <text>)
                   [--depends-on ID[,ID...]]... [--repo <path>] [--json]
-  hcoord task list [<slug>] [--state <state>] [--json]
+  hcoord task list [<slug>] [--state <state>] [--json] [--no-sync]
   hcoord task show <id> [--json]
 
+Workers
+  hcoord task start <id> [--parent <terminal>]   worktree + worker (or queue it)
+  hcoord task reply <id> (<text> | --file <file|->)   answer a needs_you worker
+  hcoord task cancel <id>                         stop its worker, keep the worktree
+  hcoord task clean <id>                          remove its worktree if clean and merged
+  hcoord report <id> --state done|needs_you|failed --file <file|-> [--no-notify]
+                                                  (run by workers)
+
+task list first checks workers against herdr-core (a vanished or exited worker → failed,
+a blocked one → needs_you) and starts queued tasks that can start; --no-sync skips that.
 <slug> may be left out when $HCOORD_PROJECT is set or only one project exists.
 Data: ${paths.projects()}  ($HCOORD_HOME overrides the root)
 `;
@@ -63,12 +84,7 @@ async function readBrief(values: Record<string, any>): Promise<string> {
   if (values.brief !== undefined) return values.brief;
   const file = values["brief-file"];
   if (file === undefined) throw new UsageError("--brief-file <file> (or - for stdin) or --brief <text> is required");
-  if (file === "-") return await Bun.stdin.text();
-  try {
-    return readFileSync(file, "utf8");
-  } catch (e: any) {
-    throw new HcoordError(`can't read brief file ${file}: ${e.code ?? e.message}`);
-  }
+  return readFileArg(file);
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -143,10 +159,37 @@ async function main(argv: string[]): Promise<number> {
       else out(task.id);
       return 0;
     }
+    case "task start": {
+      const { values, positionals } = parse(rest, { parent: { type: "string" } }, 1);
+      if (!positionals[0]) throw new UsageError("hcoord task start <id>");
+      return report_(await startTask(positionals[0], { parent: values.parent }));
+    }
+    case "task reply": {
+      const { values, positionals } = parse(rest, { file: { type: "string" } }, Infinity);
+      const [id, ...words] = positionals;
+      if (!id) throw new UsageError("hcoord task reply <id> <text>");
+      if (words.length && values.file !== undefined) throw new UsageError("give the reply as text or --file, not both");
+      const text = values.file !== undefined ? await readFileArg(values.file) : words.join(" ");
+      return report_(await replyTask(id, text));
+    }
+    case "task cancel": {
+      const { positionals } = parse(rest, {}, 1);
+      if (!positionals[0]) throw new UsageError("hcoord task cancel <id>");
+      return report_(await cancelTask(positionals[0]));
+    }
+    case "task clean": {
+      const { positionals } = parse(rest, {}, 1);
+      if (!positionals[0]) throw new UsageError("hcoord task clean <id>");
+      return report_(await cleanTask(positionals[0]));
+    }
     case "task list": {
-      const { values, positionals } = parse(rest, { state: { type: "string" } }, 1);
+      const { values, positionals } = parse(rest, { state: { type: "string" }, "no-sync": { type: "boolean" } }, 1);
       if (values.state !== undefined && !isTaskState(values.state)) throw new UsageError(`unknown state: ${values.state}`);
       const slug = loadProject(positionals[0] ?? defaultProjectSlug()).slug;
+      if (!values["no-sync"]) {
+        // Changes go to stderr so --json output stays parseable.
+        for (const l of (await sync(slug)).lines) process.stderr.write(l + "\n");
+      }
       const tasks = loadTasks(slug).tasks.sort(byNumber);
       const shown = values.state ? tasks.filter((t) => t.state === values.state) : tasks;
       if (values.json) json(shown);
@@ -186,7 +229,36 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     default:
+      if (group === "report") {
+        const { values, positionals } = parse(
+          cmd === undefined ? rest : [cmd, ...rest],
+          { state: { type: "string" }, file: { type: "string" }, "no-notify": { type: "boolean" } },
+          1,
+        );
+        if (!positionals[0]) throw new UsageError("hcoord report <id> --state done|needs_you|failed --file <file|->");
+        if (!values.state || !REPORT_STATES.includes(values.state)) {
+          throw new UsageError(`--state must be one of ${REPORT_STATES.join(", ")}`);
+        }
+        if (values.file === undefined) throw new UsageError("--file <report.md> (or - for stdin) is required");
+        const text = await readFileArg(values.file);
+        return report_(await report(positionals[0], values.state as ReportState, text, { notify: !values["no-notify"] }));
+      }
       throw new UsageError(`unknown command: ${[group, cmd].filter(Boolean).join(" ")} (hcoord --help)`);
+  }
+}
+
+/** Prints an outcome's lines; exit 1 if any part failed. */
+function report_(o: Outcome): number {
+  for (const l of o.lines) out(l);
+  return o.ok ? 0 : 1;
+}
+
+async function readFileArg(file: string): Promise<string> {
+  if (file === "-") return await Bun.stdin.text();
+  try {
+    return readFileSync(file, "utf8");
+  } catch (e: any) {
+    throw new HcoordError(`can't read ${file}: ${e.code ?? e.message}`);
   }
 }
 

@@ -15,6 +15,8 @@ export interface ProjectMeta {
   prefix: string;
   /** Absolute repo roots. The first is the default for new tasks. */
   repos: string[];
+  /** The coordinator's hc terminal, set by `hcoord project open`. */
+  coordinator?: { address: string; name: string };
   createdAt: string;
 }
 
