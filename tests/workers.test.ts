@@ -96,7 +96,7 @@ describe("workers", () => {
     for (let i = 1; i <= 3; i++) {
       const t = task(`DM-${i}`);
       expect(t.worktree).toBe(join(home, "wt", "demo", `dm-${i}`));
-      expect(git(t.worktree!, "branch", "--show-current")).toBe(`coord/dm-${i}-job-${i}`);
+      expect(git(t.worktree!, "branch", "--show-current")).toBe(`coord/root/dm-${i}-job-${i}`);
       const h = core.hc("get", t.terminal!.address);
       expect(h).toMatchObject({ name: `w-dm-${i}`, state: "live", parent: coord, die_with_parent: false });
       expect(h.argv.at(-1)).toContain(`Task: DM-${i} Job ${i}`); // the brief is the last argument
@@ -105,41 +105,45 @@ describe("workers", () => {
     }
 
     writeFileSync(join(home, "gate-1"), "");
-    await until("DM-1 done and DM-4 started", () => task("DM-1").state === "done" && task("DM-4").state === "working");
+    await until("DM-1 merged and DM-4 started", () => task("DM-1").state === "merged" && task("DM-4").state === "working");
     // Started by DM-1's report (run inside DM-1's terminal), yet its parent is the coordinator.
     expect(core.hc("get", task("DM-4").terminal!.address).parent).toBe(coord);
 
     for (const i of [2, 3, 4]) writeFileSync(join(home, `gate-${i}`), "");
-    await until("all done", () => tasks().every((t) => t.state === "done"));
+    await until("all merged", () => tasks().every((t) => t.state === "merged"));
 
+    // Each done report merged its branch into the main checkout's branch, one merge commit each.
+    const mainBranch = git(repo, "branch", "--show-current");
     for (let i = 1; i <= 4; i++) {
       const t = task(`DM-${i}`);
       expect(t.summary).toBe(`Wrote work-DM-${i}.txt.`);
+      expect(t.mergeCommit).toBeTruthy();
       expect(readFileSync(join(home, "projects", "demo", "reports", `DM-${i}.md`), "utf8")).toContain("Tested: nothing to test.");
-      expect(git(repo, "log", "--format=%s", t.branch)).toContain(`DM-${i}: fake work`);
+      expect(readFileSync(join(repo, `work-DM-${i}.txt`), "utf8")).toBe(`work for DM-${i}\n`);
     }
+    expect(git(repo, "log", "--merges", "--format=%s")).toContain(`Merge branch '${task("DM-1").branch}'`);
+    expect(git(repo, "status", "--porcelain")).toBe("");
     await until("4 notes in the coordinator's inbox", () => existsSync(inbox) && readFileSync(inbox, "utf8").trim().split("\n").length >= 4);
     const notes = readFileSync(inbox, "utf8").trim().split("\n").sort();
     expect(notes).toHaveLength(4);
-    for (const [i, note] of notes.entries()) expect(note).toMatch(new RegExp(`^DM-${i + 1} done: Wrote work-DM-${i + 1}\\.txt\\. \\(report: .*DM-${i + 1}\\.md\\)$`));
+    for (const [i, note] of notes.entries()) {
+      expect(note).toMatch(new RegExp(`^DM-${i + 1} done \\(merged into ${mainBranch}\\): Wrote work-DM-${i + 1}\\.txt\\. \\(report: .*DM-${i + 1}\\.md\\)$`));
+    }
 
     const events = readFileSync(join(home, "projects", "demo", "events.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     const dm4 = events.filter((e) => e.task === "DM-4" && e.type === "task.state").map((e) => `${e.from}>${e.to}`);
-    expect(dm4).toEqual(["todo>queued", "queued>starting", "starting>working", "working>done"]);
+    expect(dm4).toEqual(["todo>queued", "queued>starting", "starting>working", "working>done", "done>merged"]);
 
-    // clean: refused until merged; then removes the worktree and terminal, keeps the branch.
+    // clean: removes a merged task's checkout and terminal, keeps the branch.
     const dm1 = task("DM-1");
-    expect((await hcoord("task", "clean", "DM-1")).out).toContain(`${dm1.branch} isn't merged into`);
-    git(repo, "merge", "-q", "--ff-only", dm1.branch);
     expect(await ok("task", "clean", "DM-1")).toContain(`branch ${dm1.branch} kept`);
     expect(existsSync(dm1.worktree!)).toBe(false);
     expect(git(repo, "branch", "--list", dm1.branch)).toContain(dm1.branch);
     expect(task("DM-1").worktree).toBeUndefined();
     expect(core.hc("ls", "--all", "--label", "hcoord.task=DM-1").terminals).toEqual([]);
 
-    // clean refuses a dirty worktree, even once merged.
+    // clean refuses a dirty checkout, even once merged.
     const dm2 = task("DM-2");
-    git(repo, "merge", "-q", "--no-edit", dm2.branch);
     writeFileSync(join(dm2.worktree!, "stray.txt"), "x");
     const dirty = await hcoord("task", "clean", "DM-2");
     expect(dirty.code).toBe(1);
@@ -156,9 +160,84 @@ describe("workers", () => {
     await ok("task", "start", "DM-1", "--parent", coord);
     expect(states()).toEqual({ "DM-1": "working", "DM-2": "queued" });
     writeFileSync(join(home, "gate-a"), "");
-    await until("both done", () => tasks().every((t) => t.state === "done"));
-    // DM-2 branched from the repo's HEAD, not from DM-1's branch (hcoord never merges).
-    expect(git(repo, "log", "--format=%s", task("DM-2").branch)).not.toContain("DM-1");
+    await until("both merged", () => tasks().every((t) => t.state === "merged"));
+    // DM-2 waited for DM-1's merge, so it branched from a worktree that already had DM-1's work.
+    expect(git(repo, "log", "--format=%s", task("DM-2").branch)).toContain("DM-1: fake work");
+  }, 60_000);
+
+  test("a merge conflict leaves the task done with the reason; task merge tries again", async () => {
+    setup(3);
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    await addTask("One", { FILE: "same.txt", GATE: join(home, "gate-1") });
+    await addTask("Two", { FILE: "same.txt", GATE: join(home, "gate-2") });
+    await ok("task", "start", "DM-1", "--parent", coord);
+    await ok("task", "start", "DM-2", "--parent", coord);
+    writeFileSync(join(home, "gate-1"), "");
+    await until("DM-1 merged", () => task("DM-1").state === "merged");
+    writeFileSync(join(home, "gate-2"), "");
+    await until("DM-2 done, not merged", () => task("DM-2").state === "done" && !!task("DM-2").mergeError);
+    expect(task("DM-2").mergeError).toContain("conflicts in same.txt");
+    // The main checkout is as it was: DM-1's work, no merge in progress.
+    expect(readFileSync(join(repo, "same.txt"), "utf8")).toBe("work for DM-1\n");
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    await until("the coordinator told", () => existsSync(inbox) && readFileSync(inbox, "utf8").includes("DM-2 done (NOT merged: merging"));
+    expect(await ok("task", "list", "demo")).toContain("DM-2      done       Two  (not merged: merging");
+
+    // Someone resolves it on the branch; task merge then goes through.
+    const wt = task("DM-2").worktree!;
+    git(wt, "-c", "user.name=t", "-c", "user.email=t@example.com", "merge", "-q", git(repo, "branch", "--show-current"), "-X", "ours", "-m", "resolve");
+    expect(await ok("task", "merge", "DM-2")).toContain(`merged ${task("DM-2").branch} into`);
+    expect(task("DM-2")).toMatchObject({ state: "merged" });
+    expect(task("DM-2").mergeError).toBeUndefined();
+  }, 60_000);
+
+  test("a worktree's tasks branch from it, merge into it, and report to its coordinator", async () => {
+    setup(3);
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    // A linked worktree on its own branch with a commit main doesn't have.
+    const wtPath = join(home, "feature");
+    git(repo, "worktree", "add", "-q", "-b", "feature/login", wtPath);
+    writeFileSync(join(wtPath, "login.txt"), "login\n");
+    git(wtPath, "add", "-A");
+    git(wtPath, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "login work");
+
+    // Its coordinator: a stand-in like `coord`, started by lane open (generic agent = command + prompt).
+    const cfg = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+    const laneInbox = join(home, "lane-inbox.txt");
+    writeFileSync(join(home, "config.json"), JSON.stringify({ ...cfg, agent: { kind: "generic", command: ["sh", "-c", `cat >> '${laneInbox}'`, "x"] } }));
+    const opened = await ok("lane", "open", wtPath, "--no-show");
+    expect(opened).toContain("started coordinator coord-dm-feature-login");
+    expect(opened).toContain(`in ${wtPath}`);
+    const meta = JSON.parse(readFileSync(join(home, "projects", "demo", "project.json"), "utf8"));
+    expect(meta.lanes["feature-login"]).toMatchObject({ path: wtPath, branch: "feature/login" });
+    const laneCoord = meta.lanes["feature-login"].coordinator.address;
+    expect(core.hc("get", laneCoord)).toMatchObject({ cwd: wtPath, labels: { "hcoord.lane": "feature-login" } });
+    // Opening again finds the same worktree and coordinator.
+    expect(await ok("lane", "open", join(wtPath, "."), "--no-show")).toContain("is already running");
+    writeFileSync(join(home, "config.json"), JSON.stringify(cfg));
+
+    // As its coordinator would: HCOORD_LANE picks the worktree.
+    const asLane = { ...core.env, HCOORD_LANE: "feature-login" };
+    await cli(home, ["task", "add", "demo", "--title", "Form", "--brief", brief({})], undefined, asLane);
+    expect(task("DM-1")).toMatchObject({ lane: "feature-login", branch: "coord/feature-login/dm-1-form" });
+    await ok("task", "start", "DM-1");
+    expect(core.hc("get", task("DM-1").terminal!.address).parent).toBe(laneCoord);
+    await until("DM-1 merged", () => task("DM-1").state === "merged");
+
+    // Branched from the worktree (it has login.txt), merged into feature/login, main untouched.
+    expect(git(wtPath, "log", "--format=%s", "feature/login")).toContain("DM-1: fake work");
+    expect(existsSync(join(wtPath, "work-DM-1.txt"))).toBe(true);
+    expect(existsSync(join(repo, "work-DM-1.txt"))).toBe(false);
+    expect(git(repo, "log", "--format=%s", task("DM-1").branch)).toContain("login work");
+    await until("the report at the worktree's coordinator", () => existsSync(laneInbox) && readFileSync(laneInbox, "utf8").includes("DM-1 done (merged into feature/login)"));
+
+    // task list from the worktree's coordinator shows only its tasks.
+    await cli(home, ["task", "add", "demo", "--title", "Main thing", "--brief", "b"], undefined, core.env);
+    const listed = (await cli(home, ["task", "list", "demo", "--no-sync"], undefined, asLane)).stdout;
+    expect(listed).toContain("DM-1");
+    expect(listed).not.toContain("DM-2");
+    expect(await ok("task", "list", "demo", "--no-sync")).toContain("root           todo       Main thing");
+    core.hc("kill", laneCoord);
   }, 60_000);
 
   test("cancel stops the worker, keeps the worktree, and frees the slot", async () => {
@@ -213,14 +292,14 @@ describe("workers", () => {
     await until("DM-1 needs you", () => task("DM-1").state === "needs_you");
     expect(task("DM-1").needsYouReason).toBe("Which colour should it be?");
     await until("the question in the inbox", () => existsSync(inbox) && readFileSync(inbox, "utf8").includes("DM-1 needs_you: Which colour should it be?"));
-    expect(readFileSync(join(home, "projects", "demo", "TASKS.md"), "utf8")).toContain("## Needs you (1)\n\n- **DM-1** Paint\n  Which colour should it be?");
+    expect(readFileSync(join(home, "projects", "demo", "TASKS.md"), "utf8")).toContain("### Needs you (1)\n\n- **DM-1** Paint\n  Which colour should it be?");
 
     expect(await ok("task", "reply", "DM-1", "blue")).toContain("DM-1 → working");
-    await until("DM-1 done", () => task("DM-1").state === "done");
+    await until("DM-1 merged", () => task("DM-1").state === "merged");
     expect(task("DM-1").summary).toBe("Used blue, as asked.");
     const report = readFileSync(join(home, "projects", "demo", "reports", "DM-1.md"), "utf8");
     expect(report).toMatch(/## needs_you · .*\n\nWhich colour[\s\S]*## done · .*\n\nUsed blue/);
-    expect((await hcoord("task", "reply", "DM-1", "red")).out).toContain("DM-1 is done, not needs_you");
+    expect((await hcoord("task", "reply", "DM-1", "red")).out).toContain("DM-1 is merged, not needs_you");
   }, 60_000);
 
   test("a launch that fails marks the task failed with the reason", async () => {

@@ -4,12 +4,13 @@ import { claudeTrusts, showsTrustPrompt, untrustedRepoMessage, workerArgv } from
 import { renderWorkerBrief } from "./brief.ts";
 import { loadConfig } from "./config.ts";
 import { HcoordError, UsageError } from "./errors.ts";
-import { commitsSince, dirtyFiles, ensureWorktree, mergedInto, removeWorktree } from "./git.ts";
+import { commitsSince, dirtyFiles, ensureWorktree, mergeBranch, mergedInto, removeWorktree } from "./git.ts";
+import { withLock } from "./fsutil.ts";
 import { hcCall, hcGet, hcKill, hcList, hcRm, hcRunBg, hcSend, type HcTerminal } from "./hc.ts";
-import { ACTIVE_STATES, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
+import { ACTIVE_STATES, depMet, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
 import { byNumber } from "./render.ts";
-import { findTask, loadProject, loadTasks, mutate, type NewEvent, type ProjectMeta } from "./store.ts";
+import { findTask, loadProject, loadTasks, mutate, type CoordinatorRef, type Lane, type NewEvent, type ProjectMeta } from "./store.ts";
 
 /** What a command did, line by line, and whether all of it worked. */
 export interface Outcome {
@@ -23,15 +24,23 @@ function get(file: { tasks: Task[] }, id: string): Task {
   return t;
 }
 
-/** Dependencies not yet done, as "ID (state)". */
+/** Dependencies not merged yet, as "ID (state)". */
 function pendingDeps(task: Task, tasks: Task[]): string[] {
   const byId = new Map(tasks.map((t) => [t.id, t]));
   return task.dependsOn
-    .filter((d) => byId.get(d)?.state !== "done")
+    .filter((d) => !depMet(byId.get(d)))
     .map((d) => `${d} (${byId.get(d)?.state ?? "missing"})`);
 }
 
-const activeCount = (tasks: Task[]) => tasks.filter((t) => ACTIVE_STATES.includes(t.state)).length;
+/** Workers running in one worktree: maxParallel applies to each worktree. */
+const activeCount = (tasks: Task[], lane: string) =>
+  tasks.filter((t) => t.lane === lane && ACTIVE_STATES.includes(t.state)).length;
+
+export function laneOf(meta: ProjectMeta, key: string): Lane {
+  const lane = meta.lanes[key];
+  if (!lane) throw new HcoordError(`${meta.slug} has no worktree "${key}" (it has: ${Object.keys(meta.lanes).join(", ")})`);
+  return lane;
+}
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -57,17 +66,17 @@ function ourTerminal(task: Task): HcTerminal | null {
 
 // ---------------------------------------------------------------- who gets notes
 
-/** The project's coordinator terminal if it's still that exact live terminal. */
-export function liveCoordinator(meta: ProjectMeta): { address: string; name: string } | null {
-  const c = meta.coordinator;
+/** A worktree's coordinator terminal if it's still that exact live terminal. */
+export function liveCoordinator(meta: ProjectMeta, lane: string): CoordinatorRef | null {
+  const c = meta.lanes[lane]?.coordinator;
   if (!c) return null;
   const h = hcGet(c.address);
   return h && h.state === "live" && h.name === c.name ? c : null;
 }
 
-/** Where a task's news goes: the project's live coordinator (it may have been restarted), else the worker's parent. */
+/** Where a task's news goes: its worktree's live coordinator (it may have been restarted), else the worker's parent. */
 function notifyTarget(meta: ProjectMeta, task: Task): string | null {
-  return liveCoordinator(meta)?.address ?? task.parent ?? null;
+  return liveCoordinator(meta, task.lane)?.address ?? task.parent ?? null;
 }
 
 /**
@@ -75,13 +84,13 @@ function notifyTarget(meta: ProjectMeta, task: Task): string | null {
  * project's coordinator, else `fallback` (the reporting worker's coordinator), else the caller when
  * the caller isn't one of our workers. Never a worker: that would send notes to the wrong agent.
  */
-export function resolveParent(meta: ProjectMeta, explicit?: string, fallback?: string): string | null {
+export function resolveParent(meta: ProjectMeta, lane: string, explicit?: string, fallback?: string): string | null {
   if (explicit) {
     const h = hcGet(explicit);
     if (!h || h.state !== "live") throw new HcoordError(`--parent ${explicit} isn't a live terminal`);
     return h.address;
   }
-  for (const c of [meta.coordinator?.address, fallback]) {
+  for (const c of [meta.lanes[lane]?.coordinator?.address, fallback]) {
     if (!c) continue;
     const h = hcGet(c);
     if (h?.state === "live" && !h.labels?.["hcoord.task"]) return h.address;
@@ -115,7 +124,7 @@ function assertTrusted(repo: string): void {
 /** Warnings for project repos Claude doesn't trust yet (shown by project new/open). */
 export function trustWarnings(meta: ProjectMeta): string[] {
   if (loadConfig().agent.kind !== "claude") return [];
-  return meta.repos.filter((r) => claudeTrusts(r) === false).map((r) => `warning: ${untrustedRepoMessage(r)}`);
+  return claudeTrusts(meta.repo) === false ? [`warning: ${untrustedRepoMessage(meta.repo)}`] : [];
 }
 
 const FIRST_STATUS_MS = 20_000;
@@ -146,23 +155,28 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
   const wt = join(config.worktreeRoot, slug, id.toLowerCase());
   try {
     assertTrusted(task.repo);
+    const lane = laneOf(meta, task.lane);
+    if (!existsSync(lane.path)) throw new HcoordError(`its worktree ${lane.path} is gone`);
     mkdirSync(dirname(wt), { recursive: true });
-    const made = ensureWorktree(task.repo, wt, task.branch);
+    // The worker's branch starts where its worktree is now.
+    const made = ensureWorktree(task.repo, wt, task.branch, lane.path);
     // A retried task keeps the base its branch was made from.
     const base = task.base ?? made.base;
     const worktree = realpathSync(wt);
     const resume = made.reused ? { commits: commitsSince(worktree, base), dirty: dirtyFiles(worktree) } : undefined;
     const prompt = renderWorkerBrief({ meta, task, worktree, coordinator: parent, projectNotes: readProjectNotes(slug), resume });
+    const session = config.agent.kind === "claude" ? crypto.randomUUID() : undefined;
     const term = hcRunBg({
       name: workerName(id),
       cwd: worktree,
-      argv: workerArgv(config, slug, id, workerName(id), prompt),
+      argv: workerArgv(config, slug, id, workerName(id), prompt, session),
       parent,
       labels: { "hcoord.project": slug, "hcoord.task": id },
     });
     const stillStarting = await mutate(slug, ({ file, now }) => {
       const t = get(file, id);
       Object.assign(t, { worktree, base, terminal: term, updatedAt: now });
+      if (session) t.session = session;
       if (parent) t.parent = parent;
       else delete t.parent;
       if (t.state !== "starting") {
@@ -210,27 +224,30 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
 }
 
 /** Starts queued tasks whose dependencies are done, while worker slots are free. */
-export async function schedule(slug: string, fallbackParent?: string): Promise<Outcome> {
+export async function schedule(slug: string, fallbackParent?: { lane: string; address: string }): Promise<Outcome> {
   if (!loadTasks(slug).tasks.some((t) => t.state === "queued")) return { ok: true, lines: [] };
   const max = loadConfig().maxParallel;
   const claimed = await mutate(slug, ({ file, now }) => {
-    let running = activeCount(file.tasks);
+    const running: Record<string, number> = {};
     const ids: string[] = [];
     const events: NewEvent[] = [];
     for (const t of file.tasks.filter((x) => x.state === "queued").sort(byNumber)) {
-      if (running >= max) break;
+      running[t.lane] ??= activeCount(file.tasks, t.lane);
+      if (running[t.lane]! >= max) continue;
       if (pendingDeps(t, file.tasks).length) continue;
       events.push(transition(t, "starting", now, { by: "scheduler" }));
       ids.push(t.id);
-      running++;
+      running[t.lane]! += 1;
     }
     return { result: ids, events };
   });
   const out: Outcome = { ok: true, lines: [] };
   if (!claimed.length) return out;
-  const parent = resolveParent(loadProject(slug), undefined, fallbackParent);
+  const meta = loadProject(slug);
+  const tasks = loadTasks(slug).tasks;
   for (const id of claimed) {
-    const r = await launch(slug, id, parent);
+    const lane = get({ tasks }, id).lane;
+    const r = await launch(slug, id, resolveParent(meta, lane, undefined, fallbackParent?.lane === lane ? fallbackParent.address : undefined));
     out.lines.push(...r.lines);
     out.ok &&= r.ok;
   }
@@ -243,7 +260,7 @@ export async function startTask(idArg: string, opts: { parent?: string } = {}): 
   const id = task.id;
   const max = loadConfig().maxParallel;
   assertTrusted(task.repo);
-  const parent = resolveParent(meta, opts.parent);
+  const parent = resolveParent(meta, task.lane, opts.parent);
   const decision = await mutate(slug, ({ file, now }) => {
     const t = get(file, id);
     if (ACTIVE_STATES.includes(t.state)) {
@@ -253,7 +270,7 @@ export async function startTask(idArg: string, opts: { parent?: string } = {}): 
       throw new HcoordError(`${id} is ${t.state}; only todo or queued tasks can start`);
     }
     const waits = pendingDeps(t, file.tasks);
-    const running = activeCount(file.tasks);
+    const running = activeCount(file.tasks, t.lane);
     if (waits.length || running >= max) {
       const events = t.state === "todo" ? [transition(t, "queued", now, { waits, running, max })] : [];
       return { result: { start: false, waits, running }, events };
@@ -355,16 +372,23 @@ export async function report(
   const parent = notifyTarget(meta, updated);
 
   const out: Outcome = { ok: true, lines: [`${id} → ${state}; report saved to ${reportPath}`] };
+  // Done work goes into its worktree's branch at once, so the next task starts from it.
+  let merged = "";
+  if (state === "done") {
+    const m = await mergeTask(id, { quiet: true });
+    out.lines.push(...m.lines);
+    merged = m.ok ? ` (merged into ${laneOf(meta, task.lane).branch ?? task.lane})` : ` (NOT merged: ${m.lines.at(-1)})`;
+  }
   if (opts.notify !== false) {
     if (!parent) {
       out.lines.push("no coordinator terminal to notify");
     } else {
-      const r = hcSend(parent, `${id} ${state}: ${line} (report: ${reportPath})`);
+      const r = hcSend(parent, `${id} ${state}${merged}: ${line} (report: ${reportPath})`);
       out.lines.push(r.ok ? `notified the coordinator (${parent})` : `warning: couldn't notify ${parent}: ${r.error}`);
     }
   }
   if (state !== "needs_you") {
-    const s = await schedule(slug, parent ?? undefined);
+    const s = await schedule(slug, parent ? { lane: task.lane, address: parent } : undefined);
     out.lines.push(...s.lines);
     out.ok &&= s.ok;
   }
@@ -388,6 +412,42 @@ export async function replyTask(idArg: string, text: string): Promise<Outcome> {
   return { ok: true, lines: [`sent to ${task.terminal!.name} (${h.address}); ${task.id} → working`] };
 }
 
+// ---------------------------------------------------------------- merging back
+
+/**
+ * Merges a done task's branch into its worktree's branch (in the worktree). One merge per worktree
+ * at a time. A conflict leaves everything as it was and the task done with `mergeError`.
+ */
+export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): Promise<Outcome> {
+  const { meta, task } = findTask(idArg);
+  const id = task.id;
+  if (task.state === "merged") return { ok: true, lines: [`${id} is already merged`] };
+  if (task.state !== "done") throw new HcoordError(`${id} is ${task.state}; only done tasks are merged`);
+  const lane = laneOf(meta, task.lane);
+  if (!existsSync(lane.path)) throw new HcoordError(`${id}'s worktree ${lane.path} is gone`);
+  const result = await withLock(join(paths.project(meta.slug), `.merge-${task.lane}.lock`), () => mergeBranch(lane.path, task.branch));
+  await mutate(meta.slug, ({ file, now }) => {
+    const t = get(file, id);
+    if (t.state !== "done") return { result: null, events: [] };
+    if (result.ok) {
+      t.mergeCommit = result.commit;
+      return { result: null, events: [transition(t, "merged", now, { into: result.into, commit: result.commit })] };
+    }
+    t.mergeError = result.error;
+    t.updatedAt = now;
+    return { result: null, events: [{ type: "task.merge_failed", task: id, data: { error: result.error } }] };
+  });
+  if (result.ok) {
+    const lines = [`merged ${task.branch} into ${result.into} (${result.commit}) in ${lane.path}`];
+    if (!opts.quiet) {
+      const s = await schedule(meta.slug);
+      lines.push(...s.lines);
+    }
+    return { ok: true, lines };
+  }
+  return { ok: false, lines: [result.error] };
+}
+
 // ---------------------------------------------------------------- cancel / clean
 
 export async function cancelTask(idArg: string): Promise<Outcome> {
@@ -404,7 +464,7 @@ export async function cancelTask(idArg: string): Promise<Outcome> {
     const k = hcKill(term.address);
     out.lines.push(k.ok ? `stopped ${term.name} (${term.address})` : `warning: couldn't stop ${term.address}: ${k.error}`);
   }
-  const s = await schedule(meta.slug, task.parent);
+  const s = await schedule(meta.slug, task.parent ? { lane: task.lane, address: task.parent } : undefined);
   out.lines.push(...s.lines);
   out.ok &&= s.ok;
   return out;
@@ -415,16 +475,17 @@ export async function cleanTask(idArg: string): Promise<Outcome> {
   const { meta, task } = findTask(idArg);
   const id = task.id;
   if (!FINAL_STATES.includes(task.state)) {
-    throw new HcoordError(`${id} is ${task.state}; only done, failed or cancelled tasks can be cleaned`);
+    throw new HcoordError(`${id} is ${task.state}; only merged, done, failed or cancelled tasks can be cleaned`);
   }
   if (!task.worktree) throw new HcoordError(`${id} has no worktree`);
   const lines: string[] = [];
   if (existsSync(task.worktree)) {
     const dirty = dirtyFiles(task.worktree);
     if (dirty) throw new HcoordError(`${task.worktree} has uncommitted changes; not removing it:\n${dirty}`);
-    const { target, merged } = mergedInto(task.repo, task.branch);
+    const lanePath = meta.lanes[task.lane]?.path ?? task.repo;
+    const { target, merged } = mergedInto(lanePath, task.branch);
     if (!merged) {
-      throw new HcoordError(`${task.branch} isn't merged into ${target} in ${task.repo}; not removing the worktree (hcoord never merges)`);
+      throw new HcoordError(`${task.branch} isn't merged into ${target} in ${lanePath}; not removing the worktree (hcoord task merge ${id})`);
     }
     const term = ourTerminal(task);
     if (term) {

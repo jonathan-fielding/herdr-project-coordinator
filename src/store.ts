@@ -2,9 +2,27 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from
 import { ensureRoot } from "./config.ts";
 import { HcoordError } from "./errors.ts";
 import { atomicWrite, readJson, withLock } from "./fsutil.ts";
-import { branchFor, defaultPrefix, PREFIX_RE, slugify, type Task, type TaskState } from "./model.ts";
+import { branchFor, defaultPrefix, PREFIX_RE, ROOT_LANE, slugify, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
 import { renderTasksMd } from "./render.ts";
+
+/** A coordinator agent: its hc terminal and Claude session. */
+export interface CoordinatorRef {
+  address: string;
+  name: string;
+  /** Claude session id: its transcript, and what recovery resumes. */
+  session?: string;
+}
+
+/** A checkout of the project's repo that has (or had) a coordinator: the main one ("root") or a worktree. */
+export interface Lane {
+  /** Absolute path of the checkout. */
+  path: string;
+  /** Its branch when registered (the live one can differ). Null: detached or unknown. */
+  branch: string | null;
+  coordinator?: CoordinatorRef;
+  createdAt: string;
+}
 
 /** Machine-readable project facts (PROJECT.md is the human-edited half). */
 export interface ProjectMeta {
@@ -13,11 +31,25 @@ export interface ProjectMeta {
   name: string;
   /** Task id prefix, unique across projects, e.g. "QHQ". */
   prefix: string;
-  /** Absolute repo roots. The first is the default for new tasks. */
-  repos: string[];
-  /** The coordinator's hc terminal, set by `hcoord project open`. */
-  coordinator?: { address: string; name: string };
+  /** Absolute path of the repo's main checkout. A project is one repo. */
+  repo: string;
+  /** Worktrees by key ("root" = the main checkout). */
+  lanes: Record<string, Lane>;
   createdAt: string;
+}
+
+/** Project files written before worktrees: `repos` → `repo`, one project coordinator → none (it ran outside the repo). */
+function normalizeMeta(raw: any): ProjectMeta {
+  const repo: string = raw.repo ?? raw.repos?.[0];
+  const lanes: Record<string, Lane> = raw.lanes ?? {};
+  lanes[ROOT_LANE] ??= { path: repo, branch: null, createdAt: raw.createdAt };
+  const { repos: _r, coordinator: _c, ...rest } = raw;
+  return { ...rest, repo, lanes };
+}
+
+function normalizeTasks(file: TaskFile): TaskFile {
+  for (const t of file.tasks) t.lane ??= ROOT_LANE;
+  return file;
 }
 
 export interface TaskFile {
@@ -58,7 +90,7 @@ export function listProjects(): ProjectMeta[] {
   if (!existsSync(paths.projects())) return [];
   return readdirSync(paths.projects(), { withFileTypes: true })
     .filter((d) => d.isDirectory() && existsSync(paths.projectJson(d.name)))
-    .map((d) => readJson<ProjectMeta>(paths.projectJson(d.name)))
+    .map((d) => normalizeMeta(readJson<ProjectMeta>(paths.projectJson(d.name))))
     .sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
@@ -72,7 +104,24 @@ export function loadProject(slug: string): ProjectMeta {
       `no project "${slug}"` + (known.length ? ` (projects: ${known.join(", ")})` : " (none yet: hcoord project new)"),
     );
   }
-  return readJson<ProjectMeta>(paths.projectJson(slug));
+  return normalizeMeta(readJson<ProjectMeta>(paths.projectJson(slug)));
+}
+
+/** Changes project.json under the project lock (re-read inside it). */
+export async function updateMeta<T>(project: string, fn: (meta: ProjectMeta) => { result: T; event?: NewEvent }): Promise<T> {
+  const slug = loadProject(project).slug;
+  return withLock(paths.lock(slug), () => {
+    const meta = loadProject(slug);
+    const { result, event } = fn(meta);
+    atomicWrite(paths.projectJson(slug), JSON.stringify(meta, null, 2) + "\n");
+    if (event) appendEvents(slug, now(), [event]);
+    return result;
+  });
+}
+
+/** The project whose repo is `repo` (a main checkout), if any. */
+export function projectForRepo(repo: string): ProjectMeta | null {
+  return listProjects().find((p) => p.repo === repo) ?? null;
 }
 
 /** The project to use when none is named: $HCOORD_PROJECT, else the only one. */
@@ -87,21 +136,44 @@ export function defaultProjectSlug(): string {
   );
 }
 
-/** Resolves a path to the root of the git repo containing it. */
+/** Resolves a path to the root of the git checkout containing it (a worktree's own root for a worktree). */
 export function gitRoot(path: string): string {
+  return checkoutOf(path).top;
+}
+
+/**
+ * The checkout containing `path`: its root (`top`), the repo's main checkout (`main`; the same as
+ * `top` unless it's a linked worktree) and its branch (null when detached).
+ */
+export function checkoutOf(path: string): { top: string; main: string; branch: string | null } {
   if (!existsSync(path)) throw new HcoordError(`no such folder: ${path}`);
-  const r = Bun.spawnSync(["git", "-C", path, "rev-parse", "--show-toplevel"], { stderr: "pipe" });
-  if (r.exitCode !== 0) throw new HcoordError(`not a git repository: ${path}`);
-  return realpathSync(r.stdout.toString().trim());
+  const r = Bun.spawnSync(
+    ["git", "-C", path, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD"],
+    { stderr: "pipe" },
+  );
+  if (r.exitCode !== 0) {
+    // A repo with no commit yet has no HEAD to name; ask for the rest alone.
+    const r2 = Bun.spawnSync(["git", "-C", path, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], { stderr: "pipe" });
+    if (r2.exitCode !== 0) throw new HcoordError(`not a git repository: ${path}`);
+    const [top, common] = r2.stdout.toString().trim().split("\n");
+    return { top: realpathSync(top!), main: mainOf(common!, top!), branch: null };
+  }
+  const [top, common, head] = r.stdout.toString().trim().split("\n");
+  return { top: realpathSync(top!), main: mainOf(common!, top!), branch: head && head !== "HEAD" ? head : null };
+}
+
+function mainOf(common: string, top: string): string {
+  // The common git dir is <main>/.git for a normal repo; a bare repo has no main checkout.
+  return common.endsWith("/.git") ? realpathSync(common.slice(0, -5)) : realpathSync(top);
 }
 
 function projectMdStub(meta: ProjectMeta): string {
   return [
     `# ${meta.name}`,
     "",
-    "## Repos",
+    "## Repo",
     "",
-    ...meta.repos.map((r) => `- ${r}`),
+    `- ${meta.repo}`,
     "",
     "## Standing instructions",
     "",
@@ -111,12 +183,13 @@ function projectMdStub(meta: ProjectMeta): string {
   ].join("\n");
 }
 
-export async function createProject(opts: { name: string; repos: string[]; prefix?: string }): Promise<ProjectMeta> {
+export async function createProject(opts: { name: string; repo: string; prefix?: string }): Promise<ProjectMeta> {
   const name = opts.name.trim();
   const slug = slugify(name);
   if (!slug) throw new HcoordError(`can't make a folder name from "${opts.name}"`, 2);
-  if (!opts.repos.length) throw new HcoordError("give at least one --repo", 2);
-  const repos = [...new Set(opts.repos.map(gitRoot))];
+  // A worktree's path names its repo: the project is the main checkout.
+  const { main: repo } = checkoutOf(opts.repo);
+  const branch = checkoutOf(repo).branch;
   const prefix = (opts.prefix ?? defaultPrefix(name)).toUpperCase();
   if (!PREFIX_RE.test(prefix)) {
     throw new HcoordError(`prefix "${prefix}" must be 2-8 letters/digits starting with a letter (use --prefix)`, 2);
@@ -126,14 +199,21 @@ export async function createProject(opts: { name: string; repos: string[]; prefi
     if (existsSync(paths.project(slug))) throw new HcoordError(`project "${slug}" already exists`);
     const clash = listProjects().find((p) => p.prefix === prefix);
     if (clash) throw new HcoordError(`prefix ${prefix} is used by "${clash.slug}"; pick another with --prefix`);
-    const meta: ProjectMeta = { version: 1, slug, name, prefix, repos, createdAt: now() };
+    const same = listProjects().find((p) => p.repo === repo);
+    if (same) throw new HcoordError(`${repo} is already project "${same.slug}"`);
+    const createdAt = now();
+    const meta: ProjectMeta = {
+      version: 1, slug, name, prefix, repo,
+      lanes: { [ROOT_LANE]: { path: repo, branch, createdAt } },
+      createdAt,
+    };
     mkdirSync(paths.reports(slug), { recursive: true });
     atomicWrite(paths.projectMd(slug), projectMdStub(meta));
     atomicWrite(paths.memoryMd(slug), `# ${name}: coordinator memory\n\n`);
     writeTasks(meta, { version: 1, nextId: 1, tasks: [] });
     // project.json last: a project only "exists" (listProjects) once everything else is there.
     atomicWrite(paths.projectJson(slug), JSON.stringify(meta, null, 2) + "\n");
-    appendEvents(slug, meta.createdAt, [{ type: "project.created", data: { name, prefix, repos } }]);
+    appendEvents(slug, meta.createdAt, [{ type: "project.created", data: { name, prefix, repo } }]);
     return meta;
   });
 }
@@ -141,7 +221,7 @@ export async function createProject(opts: { name: string; repos: string[]; prefi
 // ---------------------------------------------------------------- tasks
 
 export function loadTasks(slug: string): TaskFile {
-  return readJson<TaskFile>(paths.tasksJson(slug));
+  return normalizeTasks(readJson<TaskFile>(paths.tasksJson(slug)));
 }
 
 /** Finds a task by id ("QHQ-12", any case) across projects, using its prefix. */
@@ -189,8 +269,8 @@ export interface NewTask {
   title: string;
   brief: string;
   dependsOn?: string[];
-  /** Must be one of the project's repos; default: the first. */
-  repo?: string;
+  /** The worktree it belongs to; default $HCOORD_LANE, else the main checkout. */
+  lane?: string;
 }
 
 export async function addTask(slug: string, input: NewTask): Promise<Task> {
@@ -198,13 +278,13 @@ export async function addTask(slug: string, input: NewTask): Promise<Task> {
   if (!title) throw new HcoordError("--title is empty", 2);
   if (!input.brief.trim()) throw new HcoordError("the brief is empty", 2);
   const deps = [...new Set((input.dependsOn ?? []).map((d) => d.trim().toUpperCase()).filter(Boolean))];
-  const repoArg = input.repo ? gitRoot(input.repo) : undefined;
+  const lane = input.lane ?? (process.env.HCOORD_LANE || ROOT_LANE);
 
   return mutate(slug, ({ meta, file, now }) => {
-    const repo = repoArg ?? meta.repos[0]!;
-    if (!meta.repos.includes(repo)) {
-      throw new HcoordError(`${repo} isn't one of ${slug}'s repos (${meta.repos.join(", ")})`);
+    if (!meta.lanes[lane]) {
+      throw new HcoordError(`${slug} has no worktree "${lane}" (it has: ${Object.keys(meta.lanes).join(", ")})`);
     }
+    const repo = meta.repo;
     const known = new Set(file.tasks.map((t) => t.id));
     const missing = deps.filter((d) => !known.has(d));
     if (missing.length) throw new HcoordError(`unknown task${missing.length > 1 ? "s" : ""} in --depends-on: ${missing.join(", ")}`);
@@ -217,7 +297,8 @@ export async function addTask(slug: string, input: NewTask): Promise<Task> {
       brief: input.brief,
       state: "todo",
       repo,
-      branch: branchFor(id, title),
+      lane,
+      branch: branchFor(id, title, lane),
       dependsOn: deps,
       createdAt: now,
       updatedAt: now,

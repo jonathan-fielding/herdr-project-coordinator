@@ -33,13 +33,15 @@ describe("board", () => {
     const before = statSync(tasksJson).mtimeMs;
 
     const b = JSON.parse(await ok("board", "--json"));
-    expect(b).toMatchObject({ version: 1, root: home, agent: "generic" });
+    expect(b).toMatchObject({ version: 2, root: home, agent: "generic" });
     expect(b.projects).toHaveLength(1);
     const p = b.projects[0];
-    expect(p).toMatchObject({ slug: "demo", prefix: "DM", repos: [repo], coordinator: null, trust: {} });
-    expect(p.tasks.map((t: any) => [t.id, t.state, t.waitingOn])).toEqual([
-      ["DM-1", "todo", []],
-      ["DM-2", "todo", ["DM-1"]],
+    expect(p).toMatchObject({ slug: "demo", prefix: "DM", repo, trusted: null });
+    expect(p.lanes).toEqual([{ key: "root", path: repo, branch: p.checkouts[0].branch, present: true, coordinator: null }]);
+    expect(p.checkouts).toEqual([{ path: repo, branch: expect.any(String) }]);
+    expect(p.tasks.map((t: any) => [t.id, t.state, t.lane, t.waitingOn, t.hasLog])).toEqual([
+      ["DM-1", "todo", "root", [], false],
+      ["DM-2", "todo", "root", ["DM-1"], false],
     ]);
     expect(statSync(tasksJson).mtimeMs).toBe(before);
     expect(await ok("board")).toMatch(/^demo\s+2 todo\n$/);
@@ -58,7 +60,7 @@ describe("board", () => {
     const env = { ...process.env, HCOORD_CLAUDE_JSON: claudeJson };
     await cli(home, ["project", "new", "demo", "--repo", repo], undefined, env);
     const b = JSON.parse((await cli(home, ["board", "--json"], undefined, env)).stdout);
-    expect(b.projects[0].trust).toEqual({ [repo]: false });
+    expect(b.projects[0].trusted).toBe(false);
     expect((await cli(home, ["board"], undefined, env)).stdout).toContain(`Claude doesn't trust ${repo}`);
   });
 });

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import pkg from "../package.json" with { type: "json" };
 import { HcoordError, UsageError } from "./errors.ts";
@@ -18,6 +19,8 @@ import {
 import {
   cancelTask,
   cleanTask,
+  laneOf,
+  mergeTask,
   retryTask,
   REPORT_STATES,
   replyTask,
@@ -29,18 +32,26 @@ import {
   type Outcome,
   type ReportState,
 } from "./workers.ts";
-import { addMemory, openProject, recoverProject } from "./coordinator.ts";
+import { addMemory, laneForPath, openLane, recoverProject } from "./coordinator.ts";
+import { renderLog } from "./log.ts";
+import { depMet, ROOT_LANE } from "./model.ts";
 import { board, type BoardProject } from "./board.ts";
 import { installMod } from "./modinstall.ts";
 
 const HELP = `hcoord ${pkg.version}: tasks and workers for a Herdr coordinator
 
-Projects
-  hcoord project new <name> --repo <path> [--repo <path>...] [--prefix ABC]
+A project is one git repo. Each of its worktrees (the main checkout is "root") has a coordinator
+agent; its workers each get a branch and checkout of their own, merged back into the worktree when done.
+
+Projects and worktrees
+  hcoord project new <name> --repo <path> [--prefix ABC]
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
-  hcoord project open [<slug>] [--no-show] [--space <id>] [--restart]
-                                                  start (or show) its coordinator agent
+  hcoord project open [<slug>] [...]              the main checkout's coordinator (lane open for root)
+  hcoord lane open [<path>] [--space <id>] [--no-show] [--restart] [--fresh]
+                                                  start (or show) the coordinator of the worktree at
+                                                  <path> (default: here), registering it the first time
+  hcoord lane list [<slug>] [--json]
   hcoord board [--json]                           every project and its tasks (read only)
   hcoord sync [<slug>]                            check workers, start queued tasks (all projects)
   hcoord recover [<slug>] [--no-show]             after a reboot: coordinators back, lost workers retried
@@ -51,22 +62,25 @@ Herdr
 
 Tasks
   hcoord task add [<slug>] --title <text> (--brief-file <file|-> | --brief <text>)
-                  [--depends-on ID[,ID...]]... [--repo <path>] [--json]
-  hcoord task list [<slug>] [--state <state>] [--json] [--no-sync]
+                  [--depends-on ID[,ID...]]... [--lane <key>] [--json]
+  hcoord task list [<slug>] [--lane <key> | --all-lanes] [--state <state>] [--json] [--no-sync]
   hcoord task show <id> [--json]
+  hcoord log <id> | --lane <key> [<slug>] [--json]   an agent's log (its Claude transcript)
 
 Workers
   hcoord task start <id> [--parent <terminal>]   worktree + worker (or queue it)
   hcoord task reply <id> (<text> | --file <file|->)   answer a needs_you worker
-  hcoord task retry <id>                          a failed/cancelled task again, in its worktree
+  hcoord task retry <id>                          a failed/cancelled task again, in its checkout
+  hcoord task merge <id>                          merge a done task into its worktree again (after a conflict)
   hcoord task cancel <id>                         stop its worker, keep the worktree
-  hcoord task clean <id>                          remove its worktree if clean and merged
+  hcoord task clean <id>                          remove its checkout if clean and merged
   hcoord report <id> --state done|needs_you|failed --file <file|-> [--no-notify]
                                                   (run by workers)
 
 task list first checks workers against herdr-core (a vanished or exited worker → failed,
 a blocked one → needs_you) and starts queued tasks that can start; --no-sync skips that.
-<slug> may be left out when $HCOORD_PROJECT is set or only one project exists.
+<slug> may be left out when $HCOORD_PROJECT is set or only one project exists; --lane defaults to
+$HCOORD_LANE (set for coordinators), else "root" for task add and every worktree for task list.
 Data: ${paths.projects()}  ($HCOORD_HOME overrides the root)
 `;
 
@@ -88,9 +102,11 @@ function parse(args: string[], options: Opts, maxPositionals: number) {
 const out = (s: string) => process.stdout.write(s.endsWith("\n") ? s : s + "\n");
 const json = (v: unknown) => out(JSON.stringify(v, null, 2));
 
-function taskRow(t: Task, all: Map<string, Task>): string {
-  const waits = t.dependsOn.filter((d) => all.get(d)?.state !== "done");
-  return `${t.id.padEnd(9)} ${t.state.padEnd(10)} ${t.title}${waits.length ? `  (after ${waits.join(", ")})` : ""}`;
+function taskRow(t: Task, all: Map<string, Task>, showLane = false): string {
+  const waits = t.dependsOn.filter((d) => !depMet(all.get(d)));
+  const lane = showLane ? `${t.lane.padEnd(14)} ` : "";
+  const note = t.state === "done" && t.mergeError ? `  (not merged: ${t.mergeError})` : waits.length ? `  (after ${waits.join(", ")})` : "";
+  return `${t.id.padEnd(9)} ${lane}${t.state.padEnd(10)} ${t.title}${note}`;
 }
 
 async function readBrief(values: Record<string, any>): Promise<string> {
@@ -120,13 +136,9 @@ async function main(argv: string[]): Promise<number> {
 
   switch (`${group} ${cmd ?? ""}`) {
     case "project new": {
-      const { values, positionals } = parse(
-        rest,
-        { repo: { type: "string", multiple: true }, prefix: { type: "string" } },
-        1,
-      );
-      if (!positionals[0]) throw new UsageError("hcoord project new <name> --repo <path>");
-      const meta = await createProject({ name: positionals[0], repos: values.repo ?? [], prefix: values.prefix });
+      const { values, positionals } = parse(rest, { repo: { type: "string" }, prefix: { type: "string" } }, 1);
+      if (!positionals[0] || !values.repo) throw new UsageError("hcoord project new <name> --repo <path>");
+      const meta = await createProject({ name: positionals[0], repo: values.repo, prefix: values.prefix });
       if (values.json) json(meta);
       else out(`created ${meta.slug} (tasks ${meta.prefix}-n) at ${paths.project(meta.slug)}\nedit ${paths.projectMd(meta.slug)} to add standing instructions`);
       for (const w of trustWarnings(meta)) process.stderr.write(w + "\n");
@@ -137,7 +149,7 @@ async function main(argv: string[]): Promise<number> {
       const all = listProjects();
       if (values.json) json(all);
       else if (!all.length) out("no projects yet: hcoord project new <name> --repo <path>");
-      else for (const p of all) out(`${p.slug.padEnd(24)} ${p.prefix.padEnd(6)} ${p.repos.join(", ")}`);
+      else for (const p of all) out(`${p.slug.padEnd(24)} ${p.prefix.padEnd(6)} ${p.repo}`);
       return 0;
     }
     case "project show": {
@@ -150,7 +162,8 @@ async function main(argv: string[]): Promise<number> {
       else {
         out(`${meta.name} (${meta.slug}, tasks ${meta.prefix}-n)`);
         out(`folder:  ${paths.project(meta.slug)}`);
-        out(`repos:   ${meta.repos.join(", ")}`);
+        out(`repo:    ${meta.repo}`);
+        out(`worktrees: ${Object.keys(meta.lanes).join(", ")}`);
         out(`tasks:   ${tasks.length ? Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ") : "none"}`);
       }
       return 0;
@@ -158,16 +171,28 @@ async function main(argv: string[]): Promise<number> {
     case "project open": {
       const { positionals, values } = parse(
         rest,
-        { "no-show": { type: "boolean" }, space: { type: "string" }, restart: { type: "boolean" } },
+        { "no-show": { type: "boolean" }, space: { type: "string" }, restart: { type: "boolean" }, fresh: { type: "boolean" } },
         1,
       );
-      return report_(
-        await openProject(positionals[0] ?? defaultProjectSlug(), {
-          show: !values["no-show"],
-          space: values.space,
-          restart: values.restart,
-        }),
+      return report_(await openLane(positionals[0] ?? defaultProjectSlug(), ROOT_LANE, openOpts(values)));
+    }
+    case "lane open": {
+      const { positionals, values } = parse(
+        rest,
+        { "no-show": { type: "boolean" }, space: { type: "string" }, restart: { type: "boolean" }, fresh: { type: "boolean" } },
+        1,
       );
+      const { meta, lane } = await laneForPath(positionals[0] ?? process.cwd());
+      return report_(await openLane(meta.slug, lane, openOpts(values)));
+    }
+    case "lane list": {
+      const { positionals, values } = parse(rest, {}, 1);
+      const meta = loadProject(positionals[0] ?? defaultProjectSlug());
+      if (values.json) json(meta.lanes);
+      else for (const [k, l] of Object.entries(meta.lanes)) {
+        out(`${k.padEnd(24)} ${(l.branch ?? "-").padEnd(24)} ${l.path}${l.coordinator ? `  (${l.coordinator.name} ${l.coordinator.address})` : ""}`);
+      }
+      return 0;
     }
     case "task add": {
       const { values, positionals } = parse(
@@ -177,7 +202,7 @@ async function main(argv: string[]): Promise<number> {
           brief: { type: "string" },
           "brief-file": { type: "string" },
           "depends-on": { type: "string", multiple: true },
-          repo: { type: "string" },
+          lane: { type: "string" },
         },
         1,
       );
@@ -185,7 +210,7 @@ async function main(argv: string[]): Promise<number> {
       const slug = positionals[0] ?? defaultProjectSlug();
       const brief = await readBrief(values);
       const dependsOn = ((values["depends-on"] as string[] | undefined) ?? []).flatMap((d) => d.split(/[,\s]+/));
-      const task = await addTask(slug, { title: values.title, brief, dependsOn, repo: values.repo });
+      const task = await addTask(slug, { title: values.title, brief, dependsOn, lane: values.lane });
       if (values.json) json(task);
       else out(task.id);
       return 0;
@@ -208,6 +233,11 @@ async function main(argv: string[]): Promise<number> {
       if (!positionals[0]) throw new UsageError("hcoord task retry <id>");
       return report_(await retryTask(positionals[0], { parent: values.parent }));
     }
+    case "task merge": {
+      const { positionals } = parse(rest, {}, 1);
+      if (!positionals[0]) throw new UsageError("hcoord task merge <id>");
+      return report_(await mergeTask(positionals[0]));
+    }
     case "task cancel": {
       const { positionals } = parse(rest, {}, 1);
       if (!positionals[0]) throw new UsageError("hcoord task cancel <id>");
@@ -219,20 +249,28 @@ async function main(argv: string[]): Promise<number> {
       return report_(await cleanTask(positionals[0]));
     }
     case "task list": {
-      const { values, positionals } = parse(rest, { state: { type: "string" }, "no-sync": { type: "boolean" } }, 1);
+      const { values, positionals } = parse(
+        rest,
+        { state: { type: "string" }, "no-sync": { type: "boolean" }, lane: { type: "string" }, "all-lanes": { type: "boolean" } },
+        1,
+      );
       if (values.state !== undefined && !isTaskState(values.state)) throw new UsageError(`unknown state: ${values.state}`);
-      const slug = loadProject(positionals[0] ?? defaultProjectSlug()).slug;
+      const meta = loadProject(positionals[0] ?? defaultProjectSlug());
+      const slug = meta.slug;
+      const lane: string | undefined = values["all-lanes"] ? undefined : (values.lane ?? (process.env.HCOORD_LANE || undefined));
+      if (lane) laneOf(meta, lane);
       if (!values["no-sync"]) {
         // Changes go to stderr so --json output stays parseable.
         for (const l of (await sync(slug)).lines) process.stderr.write(l + "\n");
       }
       const tasks = loadTasks(slug).tasks.sort(byNumber);
-      const shown = values.state ? tasks.filter((t) => t.state === values.state) : tasks;
+      const shown = tasks.filter((t) => (!values.state || t.state === values.state) && (!lane || t.lane === lane));
       if (values.json) json(shown);
       else if (!shown.length) out(values.state ? `no ${values.state} tasks` : "no tasks yet");
       else {
         const all = new Map(tasks.map((t) => [t.id, t]));
-        for (const t of shown) out(taskRow(t, all));
+        const showLane = !lane && Object.keys(meta.lanes).length > 1;
+        for (const t of shown) out(taskRow(t, all, showLane));
       }
       return 0;
     }
@@ -248,13 +286,16 @@ async function main(argv: string[]): Promise<number> {
       const deps = task.dependsOn.map((d) => `${d} (${all.get(d)?.state ?? "missing"})`).join(", ");
       const rows: [string, string | undefined][] = [
         ["project", meta.slug],
+        ["worktree", task.lane],
         ["state", task.state],
         ["needs you", task.needsYouReason],
         ["summary", task.summary],
         ["depends on", deps || undefined],
         ["repo", task.repo],
         ["branch", task.branch],
-        ["worktree", task.worktree],
+        ["checkout", task.worktree],
+        ["session", task.session],
+        ["not merged", task.mergeError],
         ["terminal", task.terminal && `${task.terminal.name} (${task.terminal.address})`],
         ["created", task.createdAt],
         ["updated", task.updatedAt],
@@ -271,6 +312,29 @@ async function main(argv: string[]): Promise<number> {
         if (values.json) json(b);
         else if (!b.projects.length) out("no projects yet: hcoord project new <name> --repo <path>");
         else for (const p of b.projects) out(boardLine(p));
+        return 0;
+      }
+      if (group === "log") {
+        const { values, positionals } = parse(cmd === undefined ? rest : [cmd, ...rest], { lane: { type: "string" } }, 1);
+        let log;
+        if (values.lane) {
+          const meta = loadProject(positionals[0] ?? defaultProjectSlug());
+          const l = laneOf(meta, values.lane);
+          log = renderLog({
+            title: `${meta.name} · worktree ${values.lane}: coordinator`,
+            session: l.coordinator?.session,
+            promptLines: 3,
+          });
+        } else {
+          if (!positionals[0]) throw new UsageError("hcoord log <task id> | --lane <key> [<slug>]");
+          const { meta, task } = findTask(positionals[0]);
+          const reports = existsSync(join(paths.reports(meta.slug), `${task.id}.md`))
+            ? `---\n\n## Reports\n\n${readFileSync(join(paths.reports(meta.slug), `${task.id}.md`), "utf8").replace(/^## /gm, "### ")}`
+            : "";
+          log = renderLog({ title: `${task.id} ${task.title} (${task.state})`, session: task.session, extra: reports });
+        }
+        if (values.json) json(log);
+        else out(log.markdown);
         return 0;
       }
       if (group === "mod" && cmd === "install") {
@@ -337,8 +401,11 @@ function boardLine(p: BoardProject): string {
   const counts: Record<string, number> = {};
   for (const t of p.tasks) counts[t.state] = (counts[t.state] ?? 0) + 1;
   const summary = Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ") || "no tasks";
-  const untrusted = Object.entries(p.trust).filter(([, v]) => v === false).map(([r]) => r);
-  return `${p.slug.padEnd(24)} ${summary}${untrusted.length ? `  (Claude doesn't trust ${untrusted.join(", ")})` : ""}`;
+  return `${p.slug.padEnd(24)} ${summary}${p.trusted === false ? `  (Claude doesn't trust ${p.repo})` : ""}`;
+}
+
+function openOpts(values: Record<string, any>) {
+  return { show: !values["no-show"], space: values.space, restart: values.restart, fresh: values.fresh };
 }
 
 /** Prints an outcome's lines; exit 1 if any part failed. */

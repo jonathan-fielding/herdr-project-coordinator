@@ -19,7 +19,8 @@ function task(state: TaskState, extra: Partial<Task> = {}): Task {
     brief: "b",
     state,
     repo: "/r",
-    branch: "coord/qhq-1-t",
+    lane: "root",
+    branch: "coord/root/qhq-1-t",
     dependsOn: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -36,12 +37,13 @@ describe("state machine", () => {
   });
 
   test("the happy path is allowed", () => {
-    const path: TaskState[] = ["todo", "queued", "starting", "working", "needs_you", "working", "done"];
+    const path: TaskState[] = ["todo", "queued", "starting", "working", "needs_you", "working", "done", "merged"];
     for (let i = 1; i < path.length; i++) expect(canTransition(path[i - 1]!, path[i]!)).toBe(true);
   });
 
-  test("done is final; failed and cancelled only reopen to todo", () => {
-    expect(TRANSITIONS.done).toEqual([]);
+  test("merged is final; done only merges; failed and cancelled only reopen to todo", () => {
+    expect(TRANSITIONS.merged).toEqual([]);
+    expect(TRANSITIONS.done).toEqual(["merged"]);
     expect(TRANSITIONS.failed).toEqual(["todo"]);
     expect(TRANSITIONS.cancelled).toEqual(["todo"]);
     for (const s of FINAL_STATES) expect(canTransition(s, "working")).toBe(false);
@@ -66,6 +68,15 @@ describe("state machine", () => {
     expect(ev).toEqual({ type: "task.state", task: "QHQ-1", from: "working", to: "done", data: { summary: "ok" } });
   });
 
+  test("transition() clears mergeError and lostWorker when they no longer apply", () => {
+    const d = task("done", { mergeError: "conflict" });
+    transition(d, "merged", "now");
+    expect(d.mergeError).toBeUndefined();
+    const f = task("failed", { lostWorker: true });
+    transition(f, "todo", "now");
+    expect(f.lostWorker).toBeUndefined();
+  });
+
   test("transition() clears needsYouReason when leaving needs_you", () => {
     const t = task("needs_you", { needsYouReason: "which DB?" });
     transition(t, "working", "now");
@@ -73,9 +84,10 @@ describe("state machine", () => {
   });
 
   test("transition() refuses a disallowed move and leaves the task alone", () => {
-    const t = task("done");
-    expect(() => transition(t, "working", "now")).toThrow("QHQ-1 is done; it can't become working (it's final)");
-    expect(t.state).toBe("done");
+    const t = task("merged");
+    expect(() => transition(t, "working", "now")).toThrow("QHQ-1 is merged; it can't become working (it's final)");
+    expect(t.state).toBe("merged");
+    expect(() => transition(task("done"), "working", "now")).toThrow("(allowed: merged)");
     expect(() => transition(task("todo"), "done", "now")).toThrow("allowed: queued, starting, cancelled");
   });
 });
@@ -89,8 +101,8 @@ describe("names", () => {
   });
 
   test("branchFor", () => {
-    expect(branchFor("QHQ-12", "Add OAuth login")).toBe("coord/qhq-12-add-oauth-login");
-    expect(branchFor("QHQ-3", "???")).toBe("coord/qhq-3");
+    expect(branchFor("QHQ-12", "Add OAuth login", "root")).toBe("coord/root/qhq-12-add-oauth-login");
+    expect(branchFor("QHQ-3", "???", "feature-login")).toBe("coord/feature-login/qhq-3");
   });
 
   test("defaultPrefix", () => {

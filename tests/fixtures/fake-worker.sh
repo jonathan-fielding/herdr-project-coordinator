@@ -4,6 +4,8 @@
 # the test puts KEY=value lines in the task brief to steer it:
 #   BUN, CLI, HCOORD_HOME  how to run hcoord
 #   GATE=<file>            wait until this file exists before doing anything
+#   FILE=<name>            the file MODE=done writes (default work-<id>.txt): the same name in
+#                          two tasks makes their merges conflict
 #   MODE=done (default)    commit a file, report done, stay alive like an idle agent
 #   MODE=exit              exit 7 without reporting
 #   MODE=block             report "blocked" over OSC 7501, then hang
@@ -47,9 +49,11 @@ case "$(field MODE)" in
     sleep 600
     ;;
   *)
-    echo "work for $id" > "work-$id.txt"
+    file=$(field FILE)
+    [ -n "$file" ] || file="work-$id.txt"
+    echo "work for $id" > "$file"
     commit "fake work"
-    printf 'Wrote work-%s.txt.\n\nTested: nothing to test.\n' "$id" | hcoord report "$id" --state done --file -
+    printf 'Wrote %s.\n\nTested: nothing to test.\n' "$file" | hcoord report "$id" --state done --file -
     sleep 600
     ;;
 esac

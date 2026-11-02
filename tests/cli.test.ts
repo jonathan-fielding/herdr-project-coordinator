@@ -33,7 +33,7 @@ describe("project", () => {
     }
     const meta = JSON.parse(readFileSync(join(p, "project.json"), "utf8"));
     // A subfolder resolves to the repo root.
-    expect(meta).toMatchObject({ slug: "quiet-harbour-quay", prefix: "QHQ", repos: [repo] });
+    expect(meta).toMatchObject({ slug: "quiet-harbour-quay", prefix: "QHQ", repo, lanes: { root: { path: repo } } });
     expect(readFileSync(join(p, "PROJECT.md"), "utf8")).toContain(`- ${repo}`);
     const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
     expect(config).toMatchObject({ agent: { kind: "claude" }, maxParallel: 3 });
@@ -41,23 +41,25 @@ describe("project", () => {
 
   test("refuses duplicates, prefix clashes, bad prefixes and non-repos", async () => {
     await ok("project", "new", "website", "--repo", repo);
-    expect((await run("project", "new", "Website", "--repo", repo)).stderr).toContain('project "website" already exists');
-    expect((await run("project", "new", "webapp", "--repo", repo)).stderr).toContain("prefix WEB is used by \"website\"");
+    expect((await run("project", "new", "Website", "--repo", repo2)).stderr).toContain('project "website" already exists');
+    expect((await run("project", "new", "webapp", "--repo", repo2)).stderr).toContain("prefix WEB is used by \"website\"");
+    // A project is one repo: the same repo (or a path inside it) can't be a second project.
+    expect((await run("project", "new", "other", "--repo", join(repo, "src"))).stderr).toContain(`${repo} is already project "website"`);
     expect((await run("project", "new", "webapp", "--repo", repo, "--prefix", "1x")).code).toBe(2);
     const notRepo = tempDir("plain");
     const r = await run("project", "new", "plain", "--repo", notRepo);
     rmSync(notRepo, { recursive: true });
     expect(r).toMatchObject({ code: 1 });
     expect(r.stderr).toContain("not a git repository");
-    expect((await run("project", "new", "norepo")).stderr).toContain("at least one --repo");
+    expect((await run("project", "new", "norepo")).code).toBe(2);
   });
 
   test("list and show", async () => {
     await ok("project", "new", "alpha", "--repo", repo);
-    await ok("project", "new", "beta", "--repo", repo, "--repo", repo2);
+    await ok("project", "new", "beta", "--repo", repo2);
     const list = JSON.parse(await ok("project", "list", "--json"));
     expect(list.map((p: any) => p.slug)).toEqual(["alpha", "beta"]);
-    expect(list[1].repos).toEqual([repo, repo2]);
+    expect(list[1].repo).toEqual(repo2);
     expect(await ok("project", "show", "beta")).toContain("tasks:   none");
     // Two projects: a slug is required.
     expect((await run("task", "list")).stderr).toContain("name a project (alpha, beta)");
@@ -66,7 +68,7 @@ describe("project", () => {
 
 describe("task", () => {
   beforeEach(async () => {
-    await ok("project", "new", "demo", "--repo", repo, "--repo", repo2, "--prefix", "DM");
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
   });
 
   test("add, with dependencies, list and show", async () => {
@@ -75,13 +77,14 @@ describe("task", () => {
     expect((await ok("task", "add", "demo", "--title", "DB schema", "--brief-file", briefFile)).trim()).toBe("DM-1");
     expect((await ok("task", "add", "demo", "--title", "API", "--brief", "Endpoints", "--depends-on", "dm-1")).trim()).toBe("DM-2");
     const third = JSON.parse(
-      await ok("task", "add", "--title", "UI", "--brief", "Screens", "--depends-on", "DM-1,DM-2", "--repo", repo2, "--json"),
+      await ok("task", "add", "--title", "UI", "--brief", "Screens", "--depends-on", "DM-1,DM-2", "--json"),
     );
     expect(third).toMatchObject({
       id: "DM-3",
       state: "todo",
-      repo: repo2,
-      branch: "coord/dm-3-ui",
+      repo,
+      lane: "root",
+      branch: "coord/root/dm-3-ui",
       dependsOn: ["DM-1", "DM-2"],
     });
 
@@ -99,7 +102,7 @@ describe("task", () => {
     const shown = await ok("task", "show", "dm-3");
     expect(shown).toContain("DM-3  UI");
     expect(shown).toContain("depends on: DM-1 (todo), DM-2 (todo)");
-    expect(shown).toContain("branch:     coord/dm-3-ui");
+    expect(shown).toContain("branch:     coord/root/dm-3-ui");
     const shownJson = JSON.parse(await ok("task", "show", "DM-1", "--json"));
     expect(shownJson).toMatchObject({ project: "demo", brief: "Build the schema.\nOwn: db/ only.\n" });
 
@@ -140,11 +143,10 @@ describe("task", () => {
     expect((await run("task", "frobnicate")).code).toBe(2);
   });
 
-  test("a repo outside the project is refused", async () => {
-    const other = tempRepo("other");
-    const r = await run("task", "add", "demo", "--title", "t", "--brief", "b", "--repo", other);
-    rmSync(other, { recursive: true });
-    expect(r.stderr).toContain("isn't one of demo's repos");
+  test("a worktree the project doesn't have is refused", async () => {
+    const r = await run("task", "add", "demo", "--title", "t", "--brief", "b", "--lane", "nope");
+    expect(r.stderr).toContain('demo has no worktree "nope" (it has: root)');
+    expect((await run("task", "list", "demo", "--lane", "nope")).code).toBe(1);
   });
 
   test("show for unknown ids", async () => {

@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { HcoordError } from "./errors.ts";
 
@@ -30,11 +31,11 @@ export function listWorktrees(repo: string): { path: string; branch: string | nu
 }
 
 /**
- * Makes (or reuses) a worktree at `path` on `branch`. A new branch starts from the repo's HEAD.
- * Returns the commit it is based on.
+ * Makes (or reuses) a worktree at `path` on `branch`. A new branch starts from `from`'s HEAD (a
+ * checkout of the same repo: the task's worktree). Returns the commit it is based on.
  */
-export function ensureWorktree(repo: string, path: string, branch: string): { base: string; reused: boolean } {
-  const base = gitOk(repo, ["rev-parse", "HEAD"], `reading HEAD of ${repo} (does it have a commit?)`);
+export function ensureWorktree(repo: string, path: string, branch: string, from = repo): { base: string; reused: boolean } {
+  const base = gitOk(from, ["rev-parse", "HEAD"], `reading HEAD of ${from} (does it have a commit?)`);
   const real = existsSync(path) ? realpathSync(path) : path;
   const existing = listWorktrees(repo).find((w) => w.path === real);
   if (existing) {
@@ -51,23 +52,45 @@ export function ensureWorktree(repo: string, path: string, branch: string): { ba
   return { base, reused: false };
 }
 
-/** Uncommitted or untracked files in a worktree ("" = clean). */
-/** Commits on HEAD since \`base\`, newest first, one line each ("" if none or unknown). */
+/** Commits on HEAD since `base`, newest first, one line each ("" if none or unknown). */
 export function commitsSince(path: string, base: string): string {
   const r = git(path, ["log", "--oneline", "--no-decorate", `${base}..HEAD`]);
   return r.code === 0 ? r.out : "";
 }
 
+/** Uncommitted or untracked files in a worktree ("" = clean). */
 export function dirtyFiles(path: string): string {
   return gitOk(path, ["status", "--porcelain"], `checking ${path}`);
 }
 
-/** The branch checked out in the main repo, and whether `branch` is fully merged into it. */
+/** The branch checked out at `repo` (any checkout), and whether `branch` is fully merged into it. */
 export function mergedInto(repo: string, branch: string): { target: string; merged: boolean } {
   const target = git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).out || "HEAD";
   const r = git(repo, ["merge-base", "--is-ancestor", branch, "HEAD"]);
   if (r.code > 1) throw new HcoordError(`checking whether ${branch} is merged: ${r.err}`);
   return { target, merged: r.code === 0 };
+}
+
+/**
+ * Merges `branch` into whatever `checkout` has checked out (`git merge --no-ff --no-edit`).
+ * On a conflict the merge is aborted, leaving the checkout as it was. Never forced.
+ */
+export function mergeBranch(checkout: string, branch: string): { ok: true; commit: string; into: string } | { ok: false; error: string } {
+  const into = git(checkout, ["rev-parse", "--abbrev-ref", "HEAD"]).out || "HEAD";
+  if (into === "HEAD") return { ok: false, error: `${checkout} is on a detached HEAD; check out a branch to merge into` };
+  if (existsSync(join(gitDir(checkout), "MERGE_HEAD"))) return { ok: false, error: `${checkout} is in the middle of another merge` };
+  const r = git(checkout, ["-c", "user.name=hcoord", "-c", "user.email=hcoord@localhost", "merge", "--no-ff", "--no-edit", branch]);
+  if (r.code === 0) return { ok: true, commit: git(checkout, ["rev-parse", "--short", "HEAD"]).out, into };
+  const conflicts = git(checkout, ["diff", "--name-only", "--diff-filter=U"]).out;
+  if (existsSync(join(gitDir(checkout), "MERGE_HEAD"))) git(checkout, ["merge", "--abort"]);
+  const why = conflicts
+    ? `conflicts in ${conflicts.split("\n").join(", ")}`
+    : (r.err || r.out).split("\n").filter(Boolean).slice(0, 4).join(" ");
+  return { ok: false, error: `merging ${branch} into ${into} failed (${why}); nothing was changed` };
+}
+
+function gitDir(checkout: string): string {
+  return git(checkout, ["rev-parse", "--path-format=absolute", "--git-dir"]).out;
 }
 
 /** Removes a worktree. Never forced; the branch is kept. */

@@ -1,4 +1,4 @@
-import { FINAL_STATES, taskNumber, type Task, type TaskState } from "./model.ts";
+import { depMet, FINAL_STATES, taskNumber, type Task, type TaskState } from "./model.ts";
 import type { ProjectMeta, TaskFile } from "./store.ts";
 
 /** Sections in TASKS.md, most urgent first. */
@@ -8,7 +8,8 @@ const GROUPS: { title: string; states: TaskState[] }[] = [
   { title: "Queued", states: ["queued"] },
   { title: "To do", states: ["todo"] },
   { title: "Failed", states: ["failed"] },
-  { title: "Done", states: ["done"] },
+  { title: "Done, not merged", states: ["done"] },
+  { title: "Merged", states: ["merged"] },
   { title: "Cancelled", states: ["cancelled"] },
 ];
 
@@ -23,7 +24,7 @@ function oneLine(s: string): string {
 
 function pendingDeps(task: Task, all: Map<string, Task>): string[] {
   return task.dependsOn
-    .filter((d) => all.get(d)?.state !== "done")
+    .filter((d) => !depMet(all.get(d)))
     .map((d) => `${d} (${all.get(d)?.state ?? "missing"})`);
 }
 
@@ -35,7 +36,9 @@ function line(task: Task, all: Map<string, Task>): string {
     if (waits.length) s += ` · waits for ${waits.join(", ")}`;
   }
   const note =
-    task.state === "needs_you" ? task.needsYouReason : task.summary;
+    task.state === "needs_you" ? task.needsYouReason
+    : task.state === "done" && task.mergeError ? `not merged: ${task.mergeError}`
+    : task.summary;
   if (note) s += `\n  ${oneLine(note)}`;
   return s;
 }
@@ -53,10 +56,16 @@ export function renderTasksMd(meta: ProjectMeta, file: TaskFile): string {
     out.push("_No tasks yet._", "");
     return out.join("\n");
   }
-  for (const g of GROUPS) {
-    const ts = file.tasks.filter((t) => g.states.includes(t.state)).sort(byNumber);
-    if (!ts.length) continue;
-    out.push(`## ${g.title} (${ts.length})`, "", ...ts.map((t) => line(t, all)), "");
+  // One section per worktree, the main checkout first.
+  const lanes = [...new Set(file.tasks.map((t) => t.lane))].sort((a, b) => (a === "root" ? -1 : b === "root" ? 1 : a.localeCompare(b)));
+  for (const lane of lanes) {
+    const branch = meta.lanes?.[lane]?.branch;
+    out.push(`## Worktree ${lane}${branch && branch !== lane ? ` (${branch})` : ""}`, "");
+    for (const g of GROUPS) {
+      const ts = file.tasks.filter((t) => t.lane === lane && g.states.includes(t.state)).sort(byNumber);
+      if (!ts.length) continue;
+      out.push(`### ${g.title} (${ts.length})`, "", ...ts.map((t) => line(t, all)), "");
+    }
   }
   return out.join("\n");
 }

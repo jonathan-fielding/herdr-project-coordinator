@@ -7,6 +7,7 @@ export const TASK_STATES = [
   "working",
   "needs_you",
   "done",
+  "merged",
   "failed",
   "cancelled",
 ] as const;
@@ -19,8 +20,11 @@ export interface Task {
   /** Full instructions given to the worker. */
   brief: string;
   state: TaskState;
-  /** Absolute path of the base repo. */
+  /** Absolute path of the project's repo (its main checkout). */
   repo: string;
+  /** The worktree it belongs to (a key of the project's lanes): its coordinator runs it and its
+   *  branch is merged back there. */
+  lane: string;
   /** "coord/<id>-<slug>". */
   branch: string;
   /** Absolute path once created. */
@@ -37,7 +41,13 @@ export interface Task {
   needsYouAuto?: boolean;
   /** Set from the worker's final report. */
   summary?: string;
-  /** failed because its worker terminal vanished (a reboot, a core restart, hc kill): \`hcoord recover\` retries it. */
+  /** Claude session of its (latest) worker: the transcript `hcoord log` shows. */
+  session?: string;
+  /** done, but merging into its worktree's branch failed: why. */
+  mergeError?: string;
+  /** merged: the commit the merge made in the worktree. */
+  mergeCommit?: string;
+  /** failed because its worker terminal vanished (a reboot, a core restart, hc kill): `hcoord recover` retries it. */
   lostWorker?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -53,13 +63,17 @@ export const TRANSITIONS: Readonly<Record<TaskState, readonly TaskState[]>> = {
   starting: ["working", "needs_you", "done", "failed", "cancelled"],
   working: ["needs_you", "done", "failed", "cancelled"],
   needs_you: ["working", "done", "failed", "cancelled"],
-  done: [],
+  done: ["merged"],
+  merged: [],
   failed: ["todo"],
   cancelled: ["todo"],
 };
 
-/** States that need no further action. */
-export const FINAL_STATES: readonly TaskState[] = ["done", "failed", "cancelled"];
+/** States that need no further action from a worker. (done still waits for its merge.) */
+export const FINAL_STATES: readonly TaskState[] = ["done", "merged", "failed", "cancelled"];
+
+/** A dependency is met once its work is in the worktree's branch. */
+export const depMet = (t: Task | undefined): boolean => t?.state === "merged";
 
 export function isTaskState(s: string): s is TaskState {
   return (TASK_STATES as readonly string[]).includes(s);
@@ -99,6 +113,7 @@ export function transition(
     delete task.needsYouAuto;
   }
   if (to !== "failed") delete task.lostWorker;
+  if (to !== "done") delete task.mergeError;
   return { type: "task.state", task: task.id, from, to, ...(data ? { data } : {}) };
 }
 
@@ -125,10 +140,15 @@ export function workerName(id: string): string {
   return `w-${id.toLowerCase()}`.slice(0, 32);
 }
 
-export function branchFor(id: string, title: string): string {
+/** A worker's branch: "coord/<lane>/<id>-<title slug>". */
+export function branchFor(id: string, title: string, lane: string): string {
   const s = slugify(title, 40);
-  return `coord/${id.toLowerCase()}${s ? `-${s}` : ""}`;
+  return `coord/${lane}/${id.toLowerCase()}${s ? `-${s}` : ""}`;
 }
+
+/** The main checkout's lane key. Other worktrees are keyed by their branch's slug. */
+export const ROOT_LANE = "root";
+export const LANE_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
 /** Prefix for a project's task ids: initials of a multi-word name, else its first 3 letters. */
 export function defaultPrefix(name: string): string {

@@ -31,6 +31,7 @@ Task: ${id} ${task.title}
 Worktree: ${worktree}
 Branch: ${task.branch}
 Base repo: ${task.repo}
+Merged into: worktree "${task.lane}"${meta.lanes?.[task.lane]?.path ? ` (${meta.lanes[task.lane]!.path})` : ""}, by hcoord when you report done
 Coordinator terminal: ${coordinator ?? "(none)"}
 
 ## The task
@@ -40,7 +41,8 @@ ${picked}${notes ? `\n## Project notes (from PROJECT.md)\n\n${notes}\n` : ""}
 ## Rules
 
 - Work only inside your worktree (${worktree}). Commit your work to ${task.branch} as you go.
-  Do not push, merge, rebase onto other branches, switch branches, or delete branches.
+  Do not push, rebase onto other branches, switch branches, or delete branches. Don't merge other
+  branches into yours unless the task says to. hcoord merges your branch when you report done.
 - Change only the files and areas the task gives you. Other workers own the rest.
 - Do not start other agents or subagents. The only hcoord command you run is \`hcoord report\`.
 - Don't ask questions in plain text and stop: nobody will see them. Use a needs_you report (below).

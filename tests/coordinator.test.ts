@@ -72,17 +72,18 @@ describe("project open", () => {
     writeFileSync(join(home, "config.json"), JSON.stringify({ ...cfg, agent: { ...cfg.agent, command: coordinatorCmd } }));
 
     const out = await ok("project", "open", "demo", "--no-show");
-    expect(out).toContain("started coordinator coord-demo");
-    const c = meta().coordinator;
-    expect(c.name).toBe("coord-demo");
+    expect(out).toContain("started coordinator coord-dm-root");
+    const c = meta().lanes.root.coordinator;
+    expect(c.name).toBe("coord-dm-root");
     const h = core.hc("get", c.address);
-    expect(h).toMatchObject({ state: "live", keep: true, parent: null, cwd: home });
-    expect(h.labels).toMatchObject({ "hcoord.project": "demo", "hcoord.role": "coordinator" });
-    expect(h.argv.slice(0, 4)).toEqual(["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "HCOORD_PROJECT=demo"]);
+    // It runs in the main checkout (the "root" worktree), kept, with no parent.
+    expect(h).toMatchObject({ state: "live", keep: true, parent: null, cwd: repo });
+    expect(h.labels).toMatchObject({ "hcoord.project": "demo", "hcoord.lane": "root", "hcoord.role": "coordinator" });
+    expect(h.argv.slice(0, 5)).toEqual(["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "HCOORD_PROJECT=demo", "HCOORD_LANE=root"]);
     // Exactly what hcoord built: nothing of hc's own (like --json) leaked onto the end.
-    expect(h.argv.at(-1)).toBe("You coordinate hcoord project demo.");
+    expect(h.argv.at(-1)).toBe("You coordinate hcoord project demo, worktree root.");
 
-    expect(await ok("project", "open", "demo", "--no-show")).toContain(`coordinator coord-demo (${c.address}) is already running`);
+    expect(await ok("project", "open", "demo", "--no-show")).toContain(`coordinator coord-dm-root (${c.address}) is already running`);
     expect(core.hc("ls", "--label", "hcoord.role=coordinator").terminals).toHaveLength(1);
 
     // Back to the fake worker; no --parent: the project's coordinator is used.
@@ -91,8 +92,8 @@ describe("project open", () => {
     await ok("task", "add", "--title", "Job", "--brief", brief);
     expect(await ok("task", "start", "DM-1")).toContain(`reporting to ${c.address}`);
     expect(core.hc("get", tasks()[0]!.terminal!.address).parent).toBe(c.address);
-    await until("DM-1 done", () => tasks()[0]!.state === "done");
-    await until("the report in the coordinator", () => inbox().includes("DM-1 done: Wrote work-DM-1.txt."));
+    await until("DM-1 merged", () => tasks()[0]!.state === "merged");
+    await until("the report in the coordinator", () => inbox().includes("DM-1 done (merged into"));
   }, 60_000);
 });
 

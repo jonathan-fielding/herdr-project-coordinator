@@ -29,8 +29,15 @@ describe("agent argv", () => {
   });
 
   test("Claude coordinator: plugin, hcoord/hc allowed, skill invoked as the first message", () => {
-    const argv = coordinatorArgv(claude(), "demo", "coord-demo");
-    expect(argv.at(-1)).toBe("/hcoord:coordinator demo");
+    const argv = coordinatorArgv(claude(), "demo", "login", "coord-dm-login", "11111111-2222-3333-4444-555555555555");
+    expect(argv.at(-1)).toBe("/hcoord:coordinator demo login");
+    expect(argv).toContain("HCOORD_LANE=login");
+    expect(argv[argv.indexOf("--session-id") + 1]).toBe("11111111-2222-3333-4444-555555555555");
+    // Resuming after a reboot: the same session, carried on with a note instead of the skill.
+    const again = coordinatorArgv(claude(), "demo", "login", "coord-dm-login", "11111111-2222-3333-4444-555555555555", true);
+    expect(again[again.indexOf("--resume") + 1]).toBe("11111111-2222-3333-4444-555555555555");
+    expect(again).not.toContain("--session-id");
+    expect(again.at(-1)).toContain("You were restarted");
     expect(argv[argv.indexOf("--plugin-dir") + 1]).toBe(PLUGIN_DIR);
     const i = argv.indexOf("--allowedTools");
     expect(argv.slice(i + 1, i + 3)).toEqual(["Bash(hcoord *)", "Bash(hc *)"]);
@@ -71,21 +78,22 @@ describe("claudeTrusts", () => {
 
 describe("worker brief", () => {
   const task: Task = {
-    id: "DM-2", title: "API", brief: "Build it.\nYou own: api/.", state: "starting", repo: "/r",
-    branch: "coord/dm-2-api", dependsOn: [], createdAt: "x", updatedAt: "x",
+    id: "DM-2", title: "API", brief: "Build it.\nYou own: api/.", state: "starting", repo: "/r", lane: "root",
+    branch: "coord/root/dm-2-api", dependsOn: [], createdAt: "x", updatedAt: "x",
   };
-  const meta = { version: 1 as const, slug: "demo", name: "Demo", prefix: "DM", repos: ["/r"], createdAt: "x" };
+  const meta = { version: 1 as const, slug: "demo", name: "Demo", prefix: "DM", repo: "/r", lanes: {}, createdAt: "x" };
 
   test("has the task, paths, rules, project notes and exact report commands", () => {
     const b = renderWorkerBrief({ meta, task, worktree: "/wt/dm-2", coordinator: "t9", projectNotes: "Run tests with bun test." });
     expect(b).toContain("Task: DM-2 API\n");
-    expect(b).toContain("Worktree: /wt/dm-2\nBranch: coord/dm-2-api");
+    expect(b).toContain("Worktree: /wt/dm-2\nBranch: coord/root/dm-2-api");
     expect(b).toContain("Coordinator terminal: t9");
     expect(b).toContain("Build it.\nYou own: api/.");
     expect(b).toContain("## Project notes (from PROJECT.md)\n\nRun tests with bun test.");
     expect(b).toContain("hcoord report DM-2 --state done --file - <<'REPORT'");
     expect(b).toContain("hcoord report DM-2 --state needs_you --file - <<'REPORT'");
-    expect(b).toContain("Do not push, merge");
+    expect(b).toContain("Do not push, rebase");
+    expect(b).toContain(`Merged into: worktree "root", by hcoord when you report done`);
   });
 
   test("leaves out the notes section when PROJECT.md says nothing", () => {

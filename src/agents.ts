@@ -14,8 +14,9 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * `env` prefix for every agent we start: the project, our data root when it isn't the default,
  * and no CLAUDE_CODE_CHILD_SESSION (inherited from a Claude parent, it turns off transcript saving).
  */
-function envPrefix(slug: string): string[] {
+function envPrefix(slug: string, lane?: string): string[] {
   const e = ["env", "-u", "CLAUDE_CODE_CHILD_SESSION", `HCOORD_PROJECT=${slug}`];
+  if (lane) e.push(`HCOORD_LANE=${lane}`);
   if (process.env.HCOORD_HOME) e.push(`HCOORD_HOME=${process.env.HCOORD_HOME}`);
   return e;
 }
@@ -27,7 +28,9 @@ function supported(config: Config): void {
 }
 
 /** argv for a worker. The prompt goes last; Claude's variadic --allowedTools is never right before it. */
-export function workerArgv(config: Config, slug: string, taskId: string, name: string, prompt: string): string[] {
+export function workerArgv(
+  config: Config, slug: string, taskId: string, name: string, prompt: string, session?: string,
+): string[] {
   supported(config);
   const a = config.agent;
   if (a.kind !== "claude") return [...envPrefix(slug), ...a.command, ...(a.workerArgs ?? []), prompt];
@@ -43,19 +46,31 @@ export function workerArgv(config: Config, slug: string, taskId: string, name: s
     JSON.stringify(settings),
     "--name",
     name,
+    // Its own session id: the transcript hcoord log shows.
+    ...(session ? ["--session-id", session] : []),
     ...(a.workerArgs ?? []),
     prompt,
   ];
 }
 
-export function coordinatorArgv(config: Config, slug: string, name: string): string[] {
+/**
+ * argv for a worktree's coordinator. `session`: a new session with that id, or with `resume` the
+ * earlier one, carried on (after a reboot).
+ */
+export function coordinatorArgv(
+  config: Config, slug: string, lane: string, name: string, session?: string, resume = false,
+): string[] {
   supported(config);
   const a = config.agent;
   if (a.kind !== "claude") {
-    return [...envPrefix(slug), ...a.command, ...(a.coordinatorArgs ?? []), `You coordinate hcoord project ${slug}.`];
+    return [...envPrefix(slug, lane), ...a.command, ...(a.coordinatorArgs ?? []), `You coordinate hcoord project ${slug}, worktree ${lane}.`];
   }
+  const sessionArgs = session ? (resume ? ["--resume", session] : ["--session-id", session]) : [];
+  const prompt = resume
+    ? `You were restarted (after a reboot or a crash) and are still coordinating hcoord project ${slug}, worktree ${lane}. Run \`hcoord task list\` and carry on from where things are.`
+    : `/hcoord:coordinator ${slug} ${lane}`;
   return [
-    ...envPrefix(slug),
+    ...envPrefix(slug, lane),
     ...a.command,
     "--allowedTools",
     "Bash(hcoord *)",
@@ -64,8 +79,9 @@ export function coordinatorArgv(config: Config, slug: string, name: string): str
     PLUGIN_DIR,
     "--name",
     name,
+    ...sessionArgs,
     ...(a.coordinatorArgs ?? []),
-    `/hcoord:coordinator ${slug}`,
+    prompt,
   ];
 }
 
