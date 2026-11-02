@@ -34,7 +34,7 @@ function setup(maxParallel: number) {
   git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init");
   writeFileSync(
     join(home, "config.json"),
-    JSON.stringify({ version: 1, agent: { kind: "claude", command: ["sh", FAKE] }, worktreeRoot: join(home, "wt"), maxParallel }),
+    JSON.stringify({ version: 1, agent: { kind: "generic", command: ["sh", FAKE] }, worktreeRoot: join(home, "wt"), maxParallel }),
   );
   inbox = join(home, "inbox.txt");
   coord = core.hc("run", "--bg", "--name", `coord-${++n}`, "--", "sh", "-c", `cat >> '${inbox}'`).address;
@@ -99,6 +99,8 @@ describe("workers", () => {
       expect(git(t.worktree!, "branch", "--show-current")).toBe(`coord/dm-${i}-job-${i}`);
       const h = core.hc("get", t.terminal!.address);
       expect(h).toMatchObject({ name: `w-dm-${i}`, state: "live", parent: coord, die_with_parent: false });
+      expect(h.argv.at(-1)).toContain(`Task: DM-${i} Job ${i}`); // the brief is the last argument
+
       expect(h.labels).toMatchObject({ "hcoord.project": "demo", "hcoord.task": `DM-${i}` });
     }
 

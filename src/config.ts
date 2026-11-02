@@ -4,14 +4,19 @@ import { atomicWrite, readJson } from "./fsutil.ts";
 import { paths, root } from "./paths.ts";
 import { HcoordError } from "./errors.ts";
 
-export type AgentKind = "claude" | "codex";
+/** "claude": Claude Code with hcoord's flags; "generic": any program, prompt as its last argument. */
+export type AgentKind = "claude" | "codex" | "generic";
 
 export interface Config {
   version: 1;
   agent: {
     kind: AgentKind;
-    /** argv used to start a worker or coordinator; the prompt is appended as the last argument. */
+    /** The program to start, e.g. ["claude"]. hcoord adds its own flags and the prompt last. */
     command: string[];
+    /** Extra arguments for workers, e.g. ["--permission-mode", "acceptEdits"] or ["--model", "sonnet"]. */
+    workerArgs?: string[];
+    /** Extra arguments for the coordinator. */
+    coordinatorArgs?: string[];
   };
   /** Worktrees go to <worktreeRoot>/<project>/<task id>. */
   worktreeRoot: string;

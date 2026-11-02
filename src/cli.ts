@@ -23,9 +23,12 @@ import {
   report,
   startTask,
   sync,
+  trustWarnings,
+  workerStopped,
   type Outcome,
   type ReportState,
 } from "./workers.ts";
+import { addMemory, openProject } from "./coordinator.ts";
 
 const HELP = `hcoord ${pkg.version}: tasks and workers for a Herdr coordinator
 
@@ -33,6 +36,8 @@ Projects
   hcoord project new <name> --repo <path> [--repo <path>...] [--prefix ABC]
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
+  hcoord project open [<slug>] [--no-show]       start (or show) its coordinator agent
+  hcoord memory [<slug>] <text>                   add a dated note to its MEMORY.md
 
 Tasks
   hcoord task add [<slug>] --title <text> (--brief-file <file|-> | --brief <text>)
@@ -113,6 +118,7 @@ async function main(argv: string[]): Promise<number> {
       const meta = await createProject({ name: positionals[0], repos: values.repo ?? [], prefix: values.prefix });
       if (values.json) json(meta);
       else out(`created ${meta.slug} (tasks ${meta.prefix}-n) at ${paths.project(meta.slug)}\nedit ${paths.projectMd(meta.slug)} to add standing instructions`);
+      for (const w of trustWarnings(meta)) process.stderr.write(w + "\n");
       return 0;
     }
     case "project list": {
@@ -137,6 +143,10 @@ async function main(argv: string[]): Promise<number> {
         out(`tasks:   ${tasks.length ? Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ") : "none"}`);
       }
       return 0;
+    }
+    case "project open": {
+      const { positionals, values } = parse(rest, { "no-show": { type: "boolean" } }, 1);
+      return report_(await openProject(positionals[0] ?? defaultProjectSlug(), { show: !values["no-show"] }));
     }
     case "task add": {
       const { values, positionals } = parse(
@@ -229,6 +239,22 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     default:
+      if (group === "memory") {
+        // hcoord memory [<slug>] <text...>: a first word naming a project is the slug.
+        const words = cmd === undefined ? rest : [cmd, ...rest];
+        const named = words.length > 1 && listProjects().some((p) => p.slug === words[0] || p.prefix === words[0]!.toUpperCase());
+        const slug = named ? words[0]! : defaultProjectSlug();
+        return report_(await addMemory(slug, (named ? words.slice(1) : words).join(" ")));
+      }
+      if (group === "worker-stopped") {
+        // Called by a Claude worker's Stop hook. Never fails loudly: it must not disturb the worker.
+        try {
+          if (cmd) await workerStopped(cmd);
+        } catch (e) {
+          process.stderr.write(`hcoord worker-stopped: ${e instanceof Error ? e.message : e}\n`);
+        }
+        return 0;
+      }
       if (group === "report") {
         const { values, positionals } = parse(
           cmd === undefined ? rest : [cmd, ...rest],

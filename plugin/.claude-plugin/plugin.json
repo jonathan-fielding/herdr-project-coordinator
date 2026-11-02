@@ -1,0 +1,6 @@
+{
+  "name": "hcoord",
+  "version": "0.1.0",
+  "description": "Coordinator skill for herdr-coordinator (hcoord): plan tasks, run one worker per task in its own worktree, and only bother the person when something needs them.",
+  "author": { "name": "Jonathan Fielding" }
+}

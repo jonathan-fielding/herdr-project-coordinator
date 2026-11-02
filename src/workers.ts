@@ -1,10 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { claudeTrusts, showsTrustPrompt, untrustedRepoMessage, workerArgv } from "./agents.ts";
 import { renderWorkerBrief } from "./brief.ts";
 import { loadConfig } from "./config.ts";
 import { HcoordError, UsageError } from "./errors.ts";
 import { dirtyFiles, ensureWorktree, mergedInto, removeWorktree } from "./git.ts";
-import { hcGet, hcKill, hcList, hcRm, hcRunBg, hcSend, type HcTerminal } from "./hc.ts";
+import { hcCall, hcGet, hcKill, hcList, hcRm, hcRunBg, hcSend, type HcTerminal } from "./hc.ts";
 import { ACTIVE_STATES, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
 import { byNumber } from "./render.ts";
@@ -56,6 +57,19 @@ function ourTerminal(task: Task): HcTerminal | null {
 
 // ---------------------------------------------------------------- who gets notes
 
+/** The project's coordinator terminal if it's still that exact live terminal. */
+export function liveCoordinator(meta: ProjectMeta): { address: string; name: string } | null {
+  const c = meta.coordinator;
+  if (!c) return null;
+  const h = hcGet(c.address);
+  return h && h.state === "live" && h.name === c.name ? c : null;
+}
+
+/** Where a task's news goes: the project's live coordinator (it may have been restarted), else the worker's parent. */
+function notifyTarget(meta: ProjectMeta, task: Task): string | null {
+  return liveCoordinator(meta)?.address ?? task.parent ?? null;
+}
+
 /**
  * The coordinator terminal a new worker reports to (its hc parent): an explicit --parent, else the
  * project's coordinator, else `fallback` (the reporting worker's coordinator), else the caller when
@@ -82,6 +96,48 @@ export function resolveParent(meta: ProjectMeta, explicit?: string, fallback?: s
 
 // ---------------------------------------------------------------- launching
 
+/** PROJECT.md without its generated header comment, for the worker brief. */
+function readProjectNotes(slug: string): string {
+  try {
+    return readFileSync(paths.projectMd(slug), "utf8").replace(/<!--[\s\S]*?-->/g, "").trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Refuses to start a Claude worker in a repo Claude doesn't trust (it would hang at the dialog). */
+function assertTrusted(repo: string): void {
+  if (loadConfig().agent.kind === "claude" && claudeTrusts(repo) === false) {
+    throw new HcoordError(untrustedRepoMessage(repo));
+  }
+}
+
+/** Warnings for project repos Claude doesn't trust yet (shown by project new/open). */
+export function trustWarnings(meta: ProjectMeta): string[] {
+  if (loadConfig().agent.kind !== "claude") return [];
+  return meta.repos.filter((r) => claudeTrusts(r) === false).map((r) => `warning: ${untrustedRepoMessage(r)}`);
+}
+
+const FIRST_STATUS_MS = 20_000;
+
+/**
+ * Right after a Claude worker starts: wait (briefly) for its first status report. If it hasn't
+ * reported and its screen shows the trust dialog, say so, instead of letting it wait silently.
+ */
+async function checkFirstStatus(address: string): Promise<string | null> {
+  const end = Date.now() + FIRST_STATUS_MS;
+  while (Date.now() < end) {
+    const h = hcGet(address);
+    if (!h || h.state !== "live" || h.status) return null;
+    const screen = hcCall(["read", address]);
+    if (screen.ok && showsTrustPrompt(JSON.stringify(screen.data))) {
+      return `worker is stuck at Claude's "trust this folder?" prompt; trust the repo (or answer it: hc attach ${address})`;
+    }
+    await Bun.sleep(500);
+  }
+  return null;
+}
+
 /** Creates the worktree and starts the worker for a task already claimed as `starting`. */
 async function launch(slug: string, id: string, parent: string | null): Promise<Outcome> {
   const meta = loadProject(slug);
@@ -89,14 +145,15 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
   const task = get(loadTasks(slug), id);
   const wt = join(config.worktreeRoot, slug, id.toLowerCase());
   try {
+    assertTrusted(task.repo);
     mkdirSync(dirname(wt), { recursive: true });
     const { base } = ensureWorktree(task.repo, wt, task.branch);
     const worktree = realpathSync(wt);
-    const prompt = renderWorkerBrief({ meta, task, worktree, coordinator: parent });
+    const prompt = renderWorkerBrief({ meta, task, worktree, coordinator: parent, projectNotes: readProjectNotes(slug) });
     const term = hcRunBg({
       name: workerName(id),
       cwd: worktree,
-      argv: [...config.agent.command, prompt],
+      argv: workerArgv(config, slug, id, workerName(id), prompt),
       parent,
       labels: { "hcoord.project": slug, "hcoord.task": id },
     });
@@ -115,10 +172,26 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
       hcKill(term.address);
       return { ok: true, lines: [`${id} was cancelled while starting; stopped ${term.name} (${term.address})`] };
     }
-    return {
-      ok: true,
-      lines: [`started ${id}: ${term.name} (${term.address}) in ${worktree}${parent ? `, reporting to ${parent}` : ", no coordinator"}`],
-    };
+    const lines = [`started ${id}: ${term.name} (${term.address}) in ${worktree}${parent ? `, reporting to ${parent}` : ", no coordinator"}`];
+    if (config.agent.kind === "claude") {
+      const stuck = await checkFirstStatus(term.address);
+      if (stuck) {
+        const changed = await mutate(slug, ({ file, now }) => {
+          const t = get(file, id);
+          if (t.state !== "working") return { result: false, events: [] };
+          const ev = transition(t, "needs_you", now, { by: "launch-check", reason: stuck });
+          t.needsYouReason = stuck;
+          t.needsYouAuto = true;
+          return { result: true, events: [ev] };
+        });
+        if (changed) {
+          lines.push(`${id} → needs_you: ${stuck}`);
+          // Only tell the coordinator when someone else (a worker's report) started this task.
+          if (parent && parent !== process.env.HC_TERMINAL_ID) hcSend(parent, `${id} needs_you: ${stuck}`);
+        }
+      }
+    }
+    return { ok: true, lines };
   } catch (e) {
     const reason = errText(e);
     await mutate(slug, ({ file, now }) => {
@@ -166,6 +239,7 @@ export async function startTask(idArg: string, opts: { parent?: string } = {}): 
   const slug = meta.slug;
   const id = task.id;
   const max = loadConfig().maxParallel;
+  assertTrusted(task.repo);
   const parent = resolveParent(meta, opts.parent);
   const decision = await mutate(slug, ({ file, now }) => {
     const t = get(file, id);
@@ -195,6 +269,31 @@ export async function startTask(idArg: string, opts: { parent?: string } = {}): 
   return launch(slug, id, parent);
 }
 
+/**
+ * Run by a Claude worker's Stop hook at the end of each turn. If the task is still "working", the
+ * worker stopped without reporting (it asked in plain text, or gave up): mark it needs_you and tell
+ * the coordinator, since the core sends no note for an ordinary end of turn. Otherwise do nothing.
+ */
+export async function workerStopped(idArg: string): Promise<Outcome> {
+  const { meta, task } = findTask(idArg);
+  if (task.state !== "working") return { ok: true, lines: [] };
+  const caller = process.env.HC_TERMINAL_ID;
+  if (caller && task.terminal && caller !== task.terminal.address) return { ok: true, lines: [] }; // not its worker
+  const where = task.terminal ? `; hc read ${task.terminal.address}` : "";
+  const reason = `worker ended its turn without reporting${where}`;
+  const changed = await mutate(meta.slug, ({ file, now }) => {
+    const t = get(file, task.id);
+    if (t.state !== "working") return { result: false, events: [] };
+    const ev = transition(t, "needs_you", now, { by: "stop-hook", reason });
+    t.needsYouReason = reason;
+    t.needsYouAuto = true;
+    return { result: true, events: [ev] };
+  });
+  const parent = notifyTarget(meta, task);
+  if (changed && parent) hcSend(parent, `${task.id} needs_you: ${reason}`);
+  return { ok: true, lines: [] };
+}
+
 // ---------------------------------------------------------------- reports
 
 export type ReportState = "done" | "needs_you" | "failed";
@@ -214,7 +313,7 @@ export async function report(
   const line = summaryOf(text);
   const reportPath = join(paths.reports(slug), `${id}.md`);
 
-  const parent = await mutate(slug, ({ file, now }) => {
+  const updated = await mutate(slug, ({ file, now }) => {
     const t = get(file, id);
     let ev: NewEvent;
     if (state === "needs_you" && t.state === "needs_you") {
@@ -234,8 +333,9 @@ export async function report(
     }
     mkdirSync(paths.reports(slug), { recursive: true });
     appendFileSync(reportPath, `## ${state} · ${now}\n\n${text.trim()}\n\n`);
-    return { result: t.parent ?? meta.coordinator?.address ?? null, events: [ev] };
+    return { result: { ...t }, events: [ev] };
   });
+  const parent = notifyTarget(meta, updated);
 
   const out: Outcome = { ok: true, lines: [`${id} → ${state}; report saved to ${reportPath}`] };
   if (opts.notify !== false) {
@@ -339,6 +439,8 @@ function describeExit(h: HcTerminal): string {
 }
 
 const LAUNCH_GRACE_MS = 120_000;
+/** A Claude worker silent for this long is probably stuck at a dialog. */
+const SILENT_MS = 90_000;
 
 interface Change {
   id: string;
@@ -364,6 +466,8 @@ export async function reconcile(slug: string): Promise<Outcome> {
     return { ok: true, lines: [`warning: couldn't reach herdr-core, worker states not checked: ${errText(e)}`] };
   }
   const byAddr = new Map(terms.map((h) => [h.address, h]));
+  // Claude reports a status within seconds of starting; plain programs never do.
+  const claudeWorkers = loadConfig().agent.kind === "claude";
   const changes: Change[] = [];
   for (const t of active) {
     if (!t.terminal) {
@@ -384,6 +488,16 @@ export async function reconcile(slug: string): Promise<Outcome> {
       changes.push({ id: t.id, from: t.state, address: a, to: "needs_you", reason: `${why}; ${read}`, auto: true });
     } else if (t.state === "working" && (h.status === "idle" || h.status === "done") && (h.turn ?? 0) >= 1) {
       changes.push({ id: t.id, from: t.state, address: a, to: "needs_you", reason: `worker stopped without reporting; ${read}`, auto: true });
+    } else if (
+      t.state === "working" &&
+      !h.status &&
+      claudeWorkers &&
+      Date.now() - Date.parse(t.updatedAt) > SILENT_MS
+    ) {
+      changes.push({
+        id: t.id, from: t.state, address: a, to: "needs_you", auto: true,
+        reason: `worker hasn't reported any status after ${SILENT_MS / 1000} s (a trust or login prompt?); ${read}`,
+      });
     } else if (t.state === "needs_you" && t.needsYouAuto && h.status === "working") {
       changes.push({ id: t.id, from: t.state, address: a, to: "working", reason: "worker is working again" });
     }

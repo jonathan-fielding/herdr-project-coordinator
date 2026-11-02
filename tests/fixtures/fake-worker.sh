@@ -1,5 +1,6 @@
 #!/bin/sh
-# A stand-in worker agent for integration tests: no tokens. hcoord passes the brief as $1;
+# A stand-in worker agent for integration tests: no tokens. hcoord passes the brief as the last
+# argument (after Claude-style flags when the agent kind is "claude");
 # the test puts KEY=value lines in the task brief to steer it:
 #   BUN, CLI, HCOORD_HOME  how to run hcoord
 #   GATE=<file>            wait until this file exists before doing anything
@@ -7,7 +8,8 @@
 #   MODE=exit              exit 7 without reporting
 #   MODE=block             report "blocked" over OSC 7501, then hang
 #   MODE=ask               report needs_you, read the answer from the terminal, then finish
-p="$1"
+#   MODE=trustprompt       show something like Claude's folder-trust dialog and hang, silent
+for p; do :; done # p = last argument
 field() { printf '%s\n' "$p" | sed -n "s/^$1=//p" | head -1; }
 id=$(printf '%s\n' "$p" | sed -n 's/^Task: \([A-Z0-9]*-[0-9]*\) .*/\1/p' | head -1)
 BUN=$(field BUN)
@@ -27,6 +29,10 @@ fi
 case "$(field MODE)" in
   exit)
     exit 7
+    ;;
+  trustprompt)
+    printf ' Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n'
+    sleep 600
     ;;
   block)
     printf '\033]7501;state=blocked:kind=permission\007'

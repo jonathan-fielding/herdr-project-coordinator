@@ -27,9 +27,12 @@ interface HcResult {
 
 /** Runs `hc <args> --json` and parses its output. Never throws for hc-level errors. */
 export function hcCall(args: string[]): HcResult {
+  // --json must come before "--": after it, it would be the started program's own argument.
+  const dd = args.indexOf("--");
+  const full = dd < 0 ? [...args, "--json"] : [...args.slice(0, dd), "--json", ...args.slice(dd)];
   let r;
   try {
-    r = Bun.spawnSync([HC(), ...args, "--json"], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    r = Bun.spawnSync([HC(), ...full], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
   } catch (e: any) {
     return { ok: false, data: null, error: `can't run ${HC()}: ${e.message}` };
   }
@@ -63,11 +66,14 @@ export interface RunOptions {
   /** Coordinator address; null = no parent (and no notes to anyone). */
   parent: string | null;
   labels: Record<string, string>;
+  /** Core keep: a lost program is replaced by a shell (never rerun). */
+  keep?: boolean;
 }
 
 /** Starts a background terminal that outlives its parent. Returns its address. */
 export function hcRunBg(o: RunOptions): { address: string; name: string } {
   const args = ["run", "--bg", "--outlive-parent", "--name", o.name, "--cwd", o.cwd];
+  if (o.keep) args.push("--keep");
   args.push(...(o.parent ? ["--parent", o.parent] : ["--no-parent"]));
   for (const [k, v] of Object.entries(o.labels)) args.push("--label", `${k}=${v}`);
   args.push("--", ...o.argv);

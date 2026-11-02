@@ -137,3 +137,27 @@ No Board ships, so "duplicate the Board layout" isn't possible. **Recommendation
 ## 6. Probe cleanup
 
 All test terminals (`disc-env`, `disc-parent`, `disc-orphan`, `disc-dies`, `disc-claude`) were killed and removed. Nothing was written outside this repo except scratch files in the session temp dir. `~/.claude`, `~/.config/herdr*` and git config were not modified.
+
+## 7. Found during Phases 2–3 (2026-11-02)
+
+- **Claude folder trust is per git repo root.** A worktree takes its main repo's trust, so
+  workers in a repo you've opened Claude in before never prompt. A brand-new folder, or a repo
+  nested inside a trusted folder, shows "trust this folder?". While that dialog is up Claude
+  reports **no status**, so the core sends no note and a worker would wait silently.
+  hcoord now refuses `task start` for a repo Claude doesn't trust (read-only check of
+  `~/.claude.json`), and right after any Claude launch it watches for the dialog for 20 s and
+  marks the task `needs_you` if it sees it.
+- **Notes to the parent only reach agents.** A plain program as parent gets `hc send` text
+  (without the `<hc from=…>` tag) but not the core's exit/blocked notes.
+- **No note for an ordinary end of turn.** Workers therefore get a session-only Stop hook
+  (`--settings`, nothing written to `~/.claude`) that runs `hcoord worker-stopped <id>`.
+- **`CLAUDE_CODE_CHILD_SESSION`** is inherited by anything started from a Claude session and
+  turns off transcript saving; hcoord clears it for every agent it starts.
+- **`--json` must go before `--`** in `hc run … -- <cmd>`, or it becomes the program's argument.
+- A script can report status itself with `printf '\033]7501;state=blocked\007'`; `turn`
+  increments when a working stretch ends.
+- Herdr adopts a terminal labelled with an existing `herdr.space` and a new `herdr.tab` id
+  within ~2 s, as a new unfocused tab with that id; `tab.rename --id` works; killing the
+  terminal closes the tab.
+- Tests run against a private core: `HC_SESSION` + `XDG_{STATE,CONFIG,RUNTIME}_HOME`, with the
+  runtime dir short (macOS socket paths max 103 bytes) and `HC_TERMINAL_*` unset.

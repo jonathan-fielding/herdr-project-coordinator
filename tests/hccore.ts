@@ -24,7 +24,10 @@ export class TestCore {
   }
 
   hc(...args: string[]): any {
-    const r = Bun.spawnSync(["hc", ...args, "--json"], { env: this.env, stdout: "pipe", stderr: "pipe" });
+    // --json goes before "--", or it would become the program's own argument.
+    const dd = args.indexOf("--");
+    const full = dd < 0 ? [...args, "--json"] : [...args.slice(0, dd), "--json", ...args.slice(dd)];
+    const r = Bun.spawnSync(["hc", ...full], { env: this.env, stdout: "pipe", stderr: "pipe" });
     const text = r.stdout.toString().trim();
     if (r.exitCode !== 0) throw new Error(`hc ${args.join(" ")}: ${r.stderr.toString().trim() || text}`);
     try {
