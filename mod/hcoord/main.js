@@ -14,7 +14,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay,
+  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay, shared, setShared,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
@@ -104,6 +104,7 @@ export default class Projects extends View {
         const c = await nextCommand();
         if (c === "new") await this.newProject(cx);
         if (c === "adopt" && this.offer) await this.adopt(this.offer.repo, cx);
+        if (c === "raise-pr") await this.raisePrFromMenu(cx);
         cx.notify();
       }
     });
@@ -243,8 +244,30 @@ export default class Projects extends View {
     return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session };
   }
 
-  /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there. */
-  async go(p, w, cx, { auto = false, space = null, restart = false } = {}) {
+  /** A worktree on some branch other than the default one, on disk: it can have a pull request. */
+  canRaisePr(p, w) {
+    return !w.virtual && !w.gone && !!w.branch && !!p.defaultBranch?.name && w.branch !== p.defaultBranch.name;
+  }
+
+  /** "Raise PR": the request the person would type to the worktree's coordinator (its skill says how). */
+  raisePr(p, w, cx) {
+    const say = `Raise a PR for this worktree's branch (${w.branch}) against ${p.defaultBranch.name}.`;
+    return this.go(p, w, cx, { say });
+  }
+
+  /** The right-click menu (another copy of this mod) leaves which worktree in shared state, then sends "raise-pr". */
+  async raisePrFromMenu(cx) {
+    const ask = shared("hcoord.raise-pr");
+    if (!ask?.path) return;
+    setShared("hcoord.raise-pr", null); // taken: a second Projects copy finds nothing
+    const p = this.data?.projects.find((x) => x.slug === ask.project);
+    const w = p && this.worktrees(p).find((x) => x.path === ask.path);
+    if (w && this.canRaisePr(p, w)) await this.raisePr(p, w, cx);
+  }
+
+  /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there.
+   *  With `say`, that text is then typed to the coordinator (`hcoord lane say`, which waits for a new one to be up). */
+  async go(p, w, cx, { auto = false, space = null, restart = false, say = null } = {}) {
     if (w.virtual) {
       // The default branch isn't checked out anywhere: make its worktree (where Herdr would), then go there.
       if (auto || this.busy.has(w.path)) return;
@@ -267,22 +290,23 @@ export default class Projects extends View {
     const c = this.coordinatorOf(w, terminals(), ags);
     if (c.live && c.agent && !restart) {
       if (!auto) run("agent.focus", { terminal: c.address });
-      return;
+      if (!say) return;
     }
     if (this.busy.has(w.path)) return;
     let s = space ? { id: space } : this.spaceOf(w, panes(), ags);
-    if (!auto) {
+    if (!auto && !(c.live && c.agent && say)) {
       if (s) run("space.select", { id: s.id });
       else run("space.new", { name: w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`, folder: w.path });
     }
     this.busy.add(w.path);
     cx.notify();
-    const args = ["lane", "open", w.path];
+    const args = say ? ["lane", "say", w.path, say] : ["lane", "open", w.path];
     if (s) args.push("--space", s.id);
-    if (restart) args.push("--restart");
+    if (restart && !say) args.push("--restart");
     const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
     this.busy.delete(w.path);
-    if (!r.ok) notify({ title: `Couldn't open ${p.name} · ${w.branch ?? base(w.path)}`, body: r.text, level: "error", timeout: 12000 });
+    if (!r.ok) notify({ title: `Couldn't ${say ? "ask" : "open"} ${p.name} · ${w.branch ?? base(w.path)}${say ? "'s coordinator" : ""}`, body: r.text, level: "error", timeout: 12000 });
+    else if (say) notify({ title: `Asked ${w.branch ?? base(w.path)}'s coordinator`, body: say, level: "info", timeout: 6000 });
     this.refresh(cx);
   }
 
@@ -562,13 +586,14 @@ export default class Projects extends View {
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         if (w.virtual) return; // nothing on disk yet to act on
-        this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null });
+        this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null, pr: this.canRaisePr(p, w) });
       })
       .child(this.fold(t, key, isOpen))
       .child(svg(ICON(w.main ? "folder" : "git-branch")).size(12).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_color(w.gone ? t.dim : c.live || here ? t.foreground : t.muted).child(label))
       .when(!isOpen && working > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.working).child(String(working))))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .when(this.canRaisePr(p, w), (el) => el.child(this.iconButton(`pr-${w.path}`, t, "git-branch", `Raise PR: ask the coordinator to open a pull request for ${w.branch}`, (cx) => cx.spawn(async (cx) => this.raisePr(p, w, cx)))))
       .when(Boolean(c.session), (el) => el.child(this.iconButton(`clog-${w.path}`, t, "file-text", "The coordinator's log", () => this.openLog({ project: p.slug, lane: w.lane.key }))))
       .child(this.status(t, c, busy));
 
@@ -895,6 +920,10 @@ export default class Projects extends View {
       ];
     }
     const items = [];
+    if (m.pr) items.push({ label: "Raise PR", icon: "git-branch", go: () => {
+      setShared("hcoord.raise-pr", { project: m.project, path: m.path });
+      run("hcoord.raise-pr");
+    } });
     if (m.log) items.push({ label: "Coordinator's log", icon: "file-text", go: () => run("pane.split", { direction: "right", mod: "hcoord", props: { log: m.log } }) });
     if (m.main) items.push({ label: "Main checkout: delete the project instead", icon: "folder", disabled: true });
     else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { ask: { ...m, what: "worktree" } } }) });
