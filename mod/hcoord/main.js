@@ -92,6 +92,8 @@ export default class Projects extends View {
     this.seenSpaces = new Set(spaces().map((s) => s.id));
     this.born = {}; // space -> when this copy first saw it
     this.dismissed = new Set(load("dismissed", []));
+    this.order = load("order", []); // project slugs in the order the person dragged them to
+    this.drag = null; // { from, over }: a project header pressed, and the project it's over
     this.offer = null; // { repo } the last "make it a project?" toast is about
     this.refresh(cx);
     cx.timer.every(FALLBACK_MS, (cx) => this.refresh(cx));
@@ -442,6 +444,8 @@ export default class Projects extends View {
       .cursor_pointer()
       .hover((el) => el.bg(t.hover).text_color(t.foreground))
       .tooltip(tip)
+      // Pressing a button in a project's header isn't the start of dragging the project.
+      .on_mouse_down("left", (e) => { this.buttonPress = e.position; })
       .on_click((_e, cx) => {
         cx.stop_propagation();
         onClick(cx);
@@ -613,7 +617,67 @@ export default class Projects extends View {
     return rows;
   }
 
-  projectRows(t, p, ctx) {
+  // ------------------------------------------------------------- order
+
+  // Projects in the person's order: the saved ones first, then any new ones as hcoord lists them.
+  // Saved slugs whose project is gone are skipped.
+  ordered(projects) {
+    const at = new Map(this.order.map((slug, i) => [slug, i]));
+    return projects
+      .map((p, i) => ({ p, i, o: at.get(p.slug) ?? Infinity }))
+      .sort((a, b) => a.o - b.o || a.i - b.i)
+      .map((r) => r.p);
+  }
+
+  // Dragging a project (its header, or its rail row) onto another: it takes that one's place.
+  // The line shows where it lands: under the one it's over when moving down, above when moving up.
+  draggable(el, t, p, list) {
+    const slugs = list.map((x) => x.slug);
+    const i = slugs.indexOf(p.slug);
+    const d = this.drag;
+    const from = d ? slugs.indexOf(d.from) : -1;
+    return el
+      .relative()
+      .when(!!d && d.from === p.slug && d.over !== p.slug, (el) => el.opacity(0.5))
+      .when(!!d && from >= 0 && d.over === p.slug && d.from !== p.slug, (el) => el.child(
+        div().absolute().left(0).right(0).h(2).rounded(1).bg(t.accent)
+          .when(from < i, (line) => line.bottom(0))
+          .when(from > i, (line) => line.top(0))))
+      .on_mouse_move((_e, cx) => {
+        if (this.drag && this.drag.over !== p.slug) {
+          this.drag.over = p.slug;
+          cx.notify();
+        }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        const d = this.drag;
+        this.drag = null;
+        if (d && d.from !== p.slug && slugs.includes(d.from)) {
+          const next = slugs.filter((s) => s !== d.from);
+          next.splice(i, 0, d.from);
+          this.order = next;
+          save("order", next);
+        }
+        cx.notify();
+      });
+  }
+
+  // A press on a project's header (not one of its buttons) that may become a drag.
+  // The button's handler runs first and leaves the press's position behind.
+  pressProject(p, e) {
+    const b = this.buttonPress;
+    this.buttonPress = null;
+    if (b && b.x === e.position.x && b.y === e.position.y) return;
+    this.drag = { from: p.slug, over: p.slug };
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null;
+    cx.notify();
+  }
+
+  projectRows(t, p, ctx, list) {
     const wts = this.worktrees(p);
     const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
     const hereHit = this.worktreeAt(ctx.herePlace);
@@ -636,6 +700,7 @@ export default class Projects extends View {
         save("open", this.open);
         cx.notify();
       })
+      .on_mouse_down("left", (e) => this.pressProject(p, e))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         this.menuFor({ kind: "project", project: p.slug, name: p.name, repo: p.repo });
@@ -644,7 +709,8 @@ export default class Projects extends View {
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
       .child(this.iconButton(`newwt-${p.slug}`, t, "plus", "New worktree (with its own coordinator)", () => this.newWorktree(p)));
-    if (!isOpen) return [head];
+    const block = (rows) => this.draggable(v_flex().id(`projblock-${p.slug}`).flex_none(), t, p, list).children(rows);
+    if (!isOpen) return block([head]);
     const rows = [head];
     if (p.trusted === false) {
       rows.push(h_flex()
@@ -657,14 +723,14 @@ export default class Projects extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`Claude doesn't trust ${tilde(p.repo)} yet`)));
     }
     for (const w of wts) rows.push(...this.worktreeRows(t, p, w, ctx));
-    return rows;
+    return block(rows);
   }
 
-  railRow(t, p, ctx) {
+  railRow(t, p, ctx, list) {
     const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
     const working = p.tasks.filter((x) => x.state === "working" || x.state === "starting").length;
     const main = this.worktrees(p).find((w) => w.main);
-    return h_flex()
+    return this.draggable(h_flex(), t, p, list)
       .id(`rail-${p.slug}`)
       .h(26)
       .px(8)
@@ -676,6 +742,7 @@ export default class Projects extends View {
       .on_click((_e, cx) => {
         if (main) cx.spawn(async (cx) => this.go(p, main, cx));
       })
+      .on_mouse_down("left", (e) => this.pressProject(p, e))
       .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_size(11).text_color(t.muted).child(p.prefix))
       .child(h_flex().w(14).flex_none().items_center().justify_center()
         .child(needs ? this.badge(t, String(needs), t.blocked)
@@ -698,7 +765,7 @@ export default class Projects extends View {
     const hereSpace = focused()?.space ?? null;
     const hs = spaces().find((s) => s.id === hereSpace);
     const ctx = { all, ags, ps, hereSpace, herePlace: hs ? this.placeOf(hs, ps) : null };
-    const projects = this.data?.projects ?? [];
+    const projects = this.ordered(this.data?.projects ?? []);
 
     const plus = div()
       .id("hc-new")
@@ -713,8 +780,8 @@ export default class Projects extends View {
       .child(svg(ICON("folder-plus")).size(14));
 
     const body = collapsed
-      ? projects.map((p) => this.railRow(t, p, ctx))
-      : projects.flatMap((p) => this.projectRows(t, p, ctx));
+      ? projects.map((p) => this.railRow(t, p, ctx, projects))
+      : projects.map((p) => this.projectRows(t, p, ctx, projects));
 
     return v_flex()
       .size_full()
@@ -745,7 +812,11 @@ export default class Projects extends View {
           .child(svg(ICON("chevron-right")).size(11).flex_none()))))
       .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
         div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
-      .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(body))
+      .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always")
+        // A drag let go off the projects, or taken out of the list, is dropped.
+        .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+        .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
+        .children(body))
       .when(collapsed, (el) => el.child(h_flex().h(28).items_center().justify_center().child(plus)));
   }
 
