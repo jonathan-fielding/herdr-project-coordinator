@@ -14,7 +14,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay,
+  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay, shared, setShared,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
@@ -92,6 +92,8 @@ export default class Projects extends View {
     this.seenSpaces = new Set(spaces().map((s) => s.id));
     this.born = {}; // space -> when this copy first saw it
     this.dismissed = new Set(load("dismissed", []));
+    this.order = load("order", []); // project slugs in the order the person dragged them to
+    this.drag = null; // { from, over }: a project header pressed, and the project it's over
     this.offer = null; // { repo } the last "make it a project?" toast is about
     this.refresh(cx);
     cx.timer.every(FALLBACK_MS, (cx) => this.refresh(cx));
@@ -102,6 +104,7 @@ export default class Projects extends View {
         const c = await nextCommand();
         if (c === "new") await this.newProject(cx);
         if (c === "adopt" && this.offer) await this.adopt(this.offer.repo, cx);
+        if (c === "raise-pr") await this.raisePrFromMenu(cx);
         cx.notify();
       }
     });
@@ -205,8 +208,10 @@ export default class Projects extends View {
     if (def && !def.checkedOut && !list.some((w) => w.branch === def.name || w.path === def.path)) {
       list.push({ path: def.path, branch: def.name, lane: null, main: false, virtual: true });
     }
-    // The main checkout first, then the default branch, then the rest by name.
-    const rank = (w) => (w.main ? 0 : def && w.branch === def.name ? 1 : 2);
+    // The default branch first (wherever it is: the main checkout, another worktree, or `virtual`),
+    // then the main checkout when it's on some other branch, then the rest by name.
+    // (Only the order on screen: the rail and `go` find the main checkout by `w.main`, not position.)
+    const rank = (w) => (def && w.branch === def.name ? 0 : w.main ? 1 : 2);
     return list.sort((a, b) => rank(a) - rank(b) || (a.branch ?? a.path).localeCompare(b.branch ?? b.path));
   }
 
@@ -239,8 +244,30 @@ export default class Projects extends View {
     return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session };
   }
 
-  /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there. */
-  async go(p, w, cx, { auto = false, space = null, restart = false } = {}) {
+  /** A worktree on some branch other than the default one, on disk: it can have a pull request. */
+  canRaisePr(p, w) {
+    return !w.virtual && !w.gone && !!w.branch && !!p.defaultBranch?.name && w.branch !== p.defaultBranch.name;
+  }
+
+  /** "Raise PR": the request the person would type to the worktree's coordinator (its skill says how). */
+  raisePr(p, w, cx) {
+    const say = `Raise a PR for this worktree's branch (${w.branch}) against ${p.defaultBranch.name}.`;
+    return this.go(p, w, cx, { say });
+  }
+
+  /** The right-click menu (another copy of this mod) leaves which worktree in shared state, then sends "raise-pr". */
+  async raisePrFromMenu(cx) {
+    const ask = shared("hcoord.raise-pr");
+    if (!ask?.path) return;
+    setShared("hcoord.raise-pr", null); // taken: a second Projects copy finds nothing
+    const p = this.data?.projects.find((x) => x.slug === ask.project);
+    const w = p && this.worktrees(p).find((x) => x.path === ask.path);
+    if (w && this.canRaisePr(p, w)) await this.raisePr(p, w, cx);
+  }
+
+  /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there.
+   *  With `say`, that text is then typed to the coordinator (`hcoord lane say`, which waits for a new one to be up). */
+  async go(p, w, cx, { auto = false, space = null, restart = false, say = null } = {}) {
     if (w.virtual) {
       // The default branch isn't checked out anywhere: make its worktree (where Herdr would), then go there.
       if (auto || this.busy.has(w.path)) return;
@@ -263,22 +290,23 @@ export default class Projects extends View {
     const c = this.coordinatorOf(w, terminals(), ags);
     if (c.live && c.agent && !restart) {
       if (!auto) run("agent.focus", { terminal: c.address });
-      return;
+      if (!say) return;
     }
     if (this.busy.has(w.path)) return;
     let s = space ? { id: space } : this.spaceOf(w, panes(), ags);
-    if (!auto) {
+    if (!auto && !(c.live && c.agent && say)) {
       if (s) run("space.select", { id: s.id });
       else run("space.new", { name: w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`, folder: w.path });
     }
     this.busy.add(w.path);
     cx.notify();
-    const args = ["lane", "open", w.path];
+    const args = say ? ["lane", "say", w.path, say] : ["lane", "open", w.path];
     if (s) args.push("--space", s.id);
-    if (restart) args.push("--restart");
+    if (restart && !say) args.push("--restart");
     const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
     this.busy.delete(w.path);
-    if (!r.ok) notify({ title: `Couldn't open ${p.name} · ${w.branch ?? base(w.path)}`, body: r.text, level: "error", timeout: 12000 });
+    if (!r.ok) notify({ title: `Couldn't ${say ? "ask" : "open"} ${p.name} · ${w.branch ?? base(w.path)}${say ? "'s coordinator" : ""}`, body: r.text, level: "error", timeout: 12000 });
+    else if (say) notify({ title: `Asked ${w.branch ?? base(w.path)}'s coordinator`, body: say, level: "info", timeout: 6000 });
     this.refresh(cx);
   }
 
@@ -440,6 +468,8 @@ export default class Projects extends View {
       .cursor_pointer()
       .hover((el) => el.bg(t.hover).text_color(t.foreground))
       .tooltip(tip)
+      // Pressing a button in a project's header isn't the start of dragging the project.
+      .on_mouse_down("left", (e) => { this.buttonPress = e.position; })
       .on_click((_e, cx) => {
         cx.stop_propagation();
         onClick(cx);
@@ -556,13 +586,14 @@ export default class Projects extends View {
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         if (w.virtual) return; // nothing on disk yet to act on
-        this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null });
+        this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null, pr: this.canRaisePr(p, w) });
       })
       .child(this.fold(t, key, isOpen))
       .child(svg(ICON(w.main ? "folder" : "git-branch")).size(12).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_color(w.gone ? t.dim : c.live || here ? t.foreground : t.muted).child(label))
       .when(!isOpen && working > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.working).child(String(working))))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .when(this.canRaisePr(p, w), (el) => el.child(this.iconButton(`pr-${w.path}`, t, "git-branch", `Raise PR: ask the coordinator to open a pull request for ${w.branch}`, (cx) => cx.spawn(async (cx) => this.raisePr(p, w, cx)))))
       .when(Boolean(c.session), (el) => el.child(this.iconButton(`clog-${w.path}`, t, "file-text", "The coordinator's log", () => this.openLog({ project: p.slug, lane: w.lane.key }))))
       .child(this.status(t, c, busy));
 
@@ -611,7 +642,67 @@ export default class Projects extends View {
     return rows;
   }
 
-  projectRows(t, p, ctx) {
+  // ------------------------------------------------------------- order
+
+  // Projects in the person's order: the saved ones first, then any new ones as hcoord lists them.
+  // Saved slugs whose project is gone are skipped.
+  ordered(projects) {
+    const at = new Map(this.order.map((slug, i) => [slug, i]));
+    return projects
+      .map((p, i) => ({ p, i, o: at.get(p.slug) ?? Infinity }))
+      .sort((a, b) => a.o - b.o || a.i - b.i)
+      .map((r) => r.p);
+  }
+
+  // Dragging a project (its header, or its rail row) onto another: it takes that one's place.
+  // The line shows where it lands: under the one it's over when moving down, above when moving up.
+  draggable(el, t, p, list) {
+    const slugs = list.map((x) => x.slug);
+    const i = slugs.indexOf(p.slug);
+    const d = this.drag;
+    const from = d ? slugs.indexOf(d.from) : -1;
+    return el
+      .relative()
+      .when(!!d && d.from === p.slug && d.over !== p.slug, (el) => el.opacity(0.5))
+      .when(!!d && from >= 0 && d.over === p.slug && d.from !== p.slug, (el) => el.child(
+        div().absolute().left(0).right(0).h(2).rounded(1).bg(t.accent)
+          .when(from < i, (line) => line.bottom(0))
+          .when(from > i, (line) => line.top(0))))
+      .on_mouse_move((_e, cx) => {
+        if (this.drag && this.drag.over !== p.slug) {
+          this.drag.over = p.slug;
+          cx.notify();
+        }
+      })
+      .on_mouse_up("left", (_e, cx) => {
+        const d = this.drag;
+        this.drag = null;
+        if (d && d.from !== p.slug && slugs.includes(d.from)) {
+          const next = slugs.filter((s) => s !== d.from);
+          next.splice(i, 0, d.from);
+          this.order = next;
+          save("order", next);
+        }
+        cx.notify();
+      });
+  }
+
+  // A press on a project's header (not one of its buttons) that may become a drag.
+  // The button's handler runs first and leaves the press's position behind.
+  pressProject(p, e) {
+    const b = this.buttonPress;
+    this.buttonPress = null;
+    if (b && b.x === e.position.x && b.y === e.position.y) return;
+    this.drag = { from: p.slug, over: p.slug };
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null;
+    cx.notify();
+  }
+
+  projectRows(t, p, ctx, list) {
     const wts = this.worktrees(p);
     const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
     const hereHit = this.worktreeAt(ctx.herePlace);
@@ -634,6 +725,7 @@ export default class Projects extends View {
         save("open", this.open);
         cx.notify();
       })
+      .on_mouse_down("left", (e) => this.pressProject(p, e))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         this.menuFor({ kind: "project", project: p.slug, name: p.name, repo: p.repo });
@@ -642,7 +734,8 @@ export default class Projects extends View {
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
       .child(this.iconButton(`newwt-${p.slug}`, t, "plus", "New worktree (with its own coordinator)", () => this.newWorktree(p)));
-    if (!isOpen) return [head];
+    const block = (rows) => this.draggable(v_flex().id(`projblock-${p.slug}`).flex_none(), t, p, list).children(rows);
+    if (!isOpen) return block([head]);
     const rows = [head];
     if (p.trusted === false) {
       rows.push(h_flex()
@@ -655,14 +748,14 @@ export default class Projects extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`Claude doesn't trust ${tilde(p.repo)} yet`)));
     }
     for (const w of wts) rows.push(...this.worktreeRows(t, p, w, ctx));
-    return rows;
+    return block(rows);
   }
 
-  railRow(t, p, ctx) {
+  railRow(t, p, ctx, list) {
     const needs = p.tasks.filter((x) => x.state === "needs_you" || (x.state === "done" && x.mergeError)).length;
     const working = p.tasks.filter((x) => x.state === "working" || x.state === "starting").length;
     const main = this.worktrees(p).find((w) => w.main);
-    return h_flex()
+    return this.draggable(h_flex(), t, p, list)
       .id(`rail-${p.slug}`)
       .h(26)
       .px(8)
@@ -674,6 +767,7 @@ export default class Projects extends View {
       .on_click((_e, cx) => {
         if (main) cx.spawn(async (cx) => this.go(p, main, cx));
       })
+      .on_mouse_down("left", (e) => this.pressProject(p, e))
       .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_size(11).text_color(t.muted).child(p.prefix))
       .child(h_flex().w(14).flex_none().items_center().justify_center()
         .child(needs ? this.badge(t, String(needs), t.blocked)
@@ -696,7 +790,7 @@ export default class Projects extends View {
     const hereSpace = focused()?.space ?? null;
     const hs = spaces().find((s) => s.id === hereSpace);
     const ctx = { all, ags, ps, hereSpace, herePlace: hs ? this.placeOf(hs, ps) : null };
-    const projects = this.data?.projects ?? [];
+    const projects = this.ordered(this.data?.projects ?? []);
 
     const plus = div()
       .id("hc-new")
@@ -711,8 +805,8 @@ export default class Projects extends View {
       .child(svg(ICON("folder-plus")).size(14));
 
     const body = collapsed
-      ? projects.map((p) => this.railRow(t, p, ctx))
-      : projects.flatMap((p) => this.projectRows(t, p, ctx));
+      ? projects.map((p) => this.railRow(t, p, ctx, projects))
+      : projects.map((p) => this.projectRows(t, p, ctx, projects));
 
     return v_flex()
       .size_full()
@@ -743,7 +837,11 @@ export default class Projects extends View {
           .child(svg(ICON("chevron-right")).size(11).flex_none()))))
       .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
         div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
-      .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(body))
+      .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always")
+        // A drag let go off the projects, or taken out of the list, is dropped.
+        .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+        .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
+        .children(body))
       .when(collapsed, (el) => el.child(h_flex().h(28).items_center().justify_center().child(plus)));
   }
 
@@ -822,6 +920,10 @@ export default class Projects extends View {
       ];
     }
     const items = [];
+    if (m.pr) items.push({ label: "Raise PR", icon: "git-branch", go: () => {
+      setShared("hcoord.raise-pr", { project: m.project, path: m.path });
+      run("hcoord.raise-pr");
+    } });
     if (m.log) items.push({ label: "Coordinator's log", icon: "file-text", go: () => run("pane.split", { direction: "right", mod: "hcoord", props: { log: m.log } }) });
     if (m.main) items.push({ label: "Main checkout: delete the project instead", icon: "folder", disabled: true });
     else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { ask: { ...m, what: "worktree" } } }) });
