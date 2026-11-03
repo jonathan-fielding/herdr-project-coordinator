@@ -4,7 +4,8 @@
 // Click a worktree to go to its coordinator (started if it isn't running), a task to peek
 // at its worker or read its log. Going to a project's worktree space starts its coordinator.
 // The same mod with props { log } is a pane showing one agent's log (its transcript); with
-// props { menu } a right-click menu, and with props { ask } a dialog asking before a delete.
+// props { menu } a right-click menu, with props { ask } a dialog asking before a delete, and with
+// props { info } a dialog explaining a warning (where hcoord keeps its data).
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
@@ -75,6 +76,7 @@ export default class Projects extends View {
     if (props()?.log) return this.initLog(cx);
     if (props()?.menu) return this.initMenu(cx);
     if (props()?.ask) return this.initAsk(cx);
+    if (props()?.info) return this.initInfo(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.loading = false;
@@ -654,6 +656,7 @@ export default class Projects extends View {
     if (props()?.log) return this.renderLog(t);
     if (props()?.menu) return this.renderMenu(t);
     if (props()?.ask) return this.renderAsk(t);
+    if (props()?.info) return this.renderInfo(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -700,8 +703,14 @@ export default class Projects extends View {
         .child(plus)))
       .when(Boolean(this.error) && !collapsed, (el) => el.child(div().px(16).pb(6).text_size(12).text_color(t.blocked).child(`hcoord: ${this.error}`)))
       .when(!collapsed && !!this.data?.warnings?.length, (el) => el.children(this.data.warnings.map((w, i) =>
-        div().id(`hc-warn-${i}`).mx(16).mb(6).truncate().text_size(12).text_color(t.blocked).tooltip(w)
-          .child(/temporary folder/.test(w) ? "Data folder is temporary: it may be emptied" : w))))
+        h_flex().id(`hc-warn-${i}`).mx(8).px(8).mb(6).h(24).flex_none().gap(6).items_center().rounded(6)
+          .text_size(12).text_color(t.blocked)
+          .cursor_pointer()
+          .hover((el) => el.bg(t.hover))
+          .tooltip("Click for more")
+          .on_click(() => openOverlay({ mod: "hcoord", kind: "dialog", width: 520, height: 400, props: { info: { warning: w, root: this.data.root, worktreeRoot: this.data.worktreeRoot } } }))
+          .child(div().flex_1().min_w(0).truncate().child(/temporary folder/.test(w) ? "Data folder is temporary: it may be emptied" : w))
+          .child(svg(ICON("chevron-right")).size(11).flex_none()))))
       .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
         div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
       .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(body))
@@ -952,5 +961,69 @@ export default class Projects extends View {
       .child(h_flex().justify_end().gap(8).text_size(12)
         .when(this.busyAsk, (el) => el.child(div().flex_1().text_color(t.dim).child("Deleting…")))
         .children(buttons));
+  }
+
+  // ------------------------------------------------------------- what a warning means
+
+  initInfo(cx) {
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+  }
+
+  infoText() {
+    const i = props().info;
+    if (!/temporary folder/.test(i.warning)) return i.warning;
+    return [
+      "hcoord keeps everything it knows about your projects in one data folder:",
+      "",
+      "```",
+      i.root,
+      "```",
+      "",
+      "It holds each project's tasks, the workers' reports, the coordinators' notes (`PROJECT.md`, `MEMORY.md`) and its settings (`config.json`). " +
+        `Workers' checkouts are in \`${i.worktreeRoot}\`.`,
+      "",
+      "**That folder is a temporary one.** macOS empties temporary folders on a restart or after they go unused for a while. " +
+        "If it does, hcoord forgets your projects and their task history. Your repos, worktrees and branches aren't in it and are safe.",
+      "",
+      "**How it got there:** the Projects section was installed with `HCOORD_HOME` pointing at a test folder, so it has used that ever since.",
+      "",
+      "**The fix:** move the folder to the usual place and install the section again without `HCOORD_HOME`, once no coordinator or worker is running:",
+      "",
+      "```sh",
+      `mv '${i.root}' ~/.herdr-coordinator`,
+      "hcoord mod install",
+      "```",
+      "",
+      "Then restart the coordinators (right-click a worktree, or click it), since running agents still write to the old folder.",
+    ].join("\n");
+  }
+
+  renderInfo(t) {
+    const i = props().info;
+    const button = (id, label, bg, fg, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "close" ? t.input : bg).bg(bg).text_color(fg)
+        .cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick).child(label);
+    return v_flex()
+      .id("hc-info")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key !== "escape" && e.key !== "enter") return;
+        closeOverlay(props().overlay);
+        cx.stop_propagation();
+      })
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child("Where hcoord keeps its data"))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(TextView.markdown("hc-info-text", this.infoText()).selectable(true).scrollable(true).flex_1().min_h(0).text_size(13))
+      .child(h_flex().justify_end().gap(8).text_size(12)
+        .child(button("finder", "Show in Finder", t.raised, t.foreground, () => exec("open", [i.root]).catch(() => null)))
+        .child(button("close", "Close", t.solid, t.solid_foreground, () => closeOverlay(props().overlay))));
   }
 }
