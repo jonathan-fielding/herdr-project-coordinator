@@ -94,3 +94,13 @@ A refresh is cheap, so refreshing more often or on more triggers is affordable. 
 6. **Make hcoord record outside-made worktrees under `projects/`** (low value). For example, a periodic `hcoord sync` could register new checkouts, so the existing watch fires. That just moves the polling somewhere else. Not recommended.
 
 Recommended: 1 + 2 together, about ten lines in `main.js`. They fix the common `+` flow completely, including the coordinator auto-start. Add 3 as a cheap cap on the worst case for terminal-made worktrees, and do 4 only if near-instant pickup of `git worktree add` from a terminal matters.
+
+## Implemented (HCM-6)
+
+Fixes 1, 2 and 3 are in `mod/hcoord/main.js`; fix 4 (watching `.git`) isn't.
+
+- **Fix 1:** `lookAtNewSpaces` calls `this.refresh(cx)` when a new space's repo is already a project but its folder isn't a known checkout. Rows for the `+` dialog show about 2 s after the space appears.
+- **Fix 2:** `followSpace` hands the space to `startFor()`. When the board doesn't know the space's worktree yet, it's kept as `this.pendingSpace`. `retryPendingSpace()` runs once after each board load. It starts the coordinator once the worktree is known, and drops the pending space when the focus has moved. Starting the coordinator clears it, so there's no loop.
+- **Fix 3:** the sidebar refreshes every `SIDEBAR_FALLBACK_MS = 8000`. The log pane keeps `FALLBACK_MS = 30000`.
+
+Tests: `tests/mod-sidebar.test.ts` loads the mod with stand-ins for Herdr's modules.
