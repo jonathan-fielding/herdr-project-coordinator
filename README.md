@@ -1,14 +1,16 @@
-# herdr-coordinator (hcoord)
+<h1 align="center">herdr-coordinator</h1>
 
-A project coordinator for the [Herdr](https://herdr.dev) desktop app. You talk to one coordinator agent per worktree in plain language. It splits your request into small tasks and starts one worker agent per task. Each worker gets its own branch and checkout, and its work is merged back into your worktree when it's done. You only hear about the things that need you.
+<h3 align="center">Hand a whole feature to a team of coding agents, and only hear about the parts that need you</h3>
 
-It has three parts:
+<p align="center">herdr-coordinator (<code>hcoord</code>) adds a <b>Projects</b> section to the <a href="https://herdr.dev">Herdr</a> sidebar. You talk to one coordinator agent per worktree. It splits your request into small tasks, starts a separate Claude Code worker for each one on its own branch and checkout, and merges each worker's branch back into your worktree when it's done. The sidebar shows which tasks need you, which are working and which have merged.</p>
 
-- **The Projects section** (`mod/hcoord`): a Herdr sidebar section beside Spaces and Agents. This is where you'll spend most of your time.
-- **The coordinator skill** (`plugin/`): a Claude Code plugin that tells the coordinator agent how to plan, start workers and react to their reports.
-- **The `hcoord` CLI** (`src/`): keeps tasks, starts workers through herdr-core (`hc`) and merges their branches. The section and the agents both use it. State is kept in plain files.
+<p align="center"><sub>✓&nbsp;Runs&nbsp;on&nbsp;your&nbsp;machine,&nbsp;no&nbsp;hosted&nbsp;service &nbsp; ✓&nbsp;State&nbsp;in&nbsp;plain&nbsp;files &nbsp; ✓&nbsp;Never&nbsp;pushes&nbsp;or&nbsp;deletes&nbsp;branches &nbsp; ✓&nbsp;macOS,&nbsp;Claude&nbsp;Code,&nbsp;Bun</sub></p>
 
-## How it fits together
+<br />
+
+## One conversation, many workers
+
+The coordinator never writes code itself, so it's always free to answer you. Each task runs in a worker: a separate Claude Code session in its own git checkout, on its own branch, with a self-contained brief. Workers report back when they finish, get stuck or have a question. The coordinator reads those reports, answers what it can from your standing instructions, and passes on only what needs you.
 
 ```
 Project (one git repo)
@@ -19,14 +21,21 @@ Project (one git repo)
  └─ …
 ```
 
-- A **project** is one git repo.
-- A **worktree** is a checkout of that repo: the main checkout, or a linked worktree (one of Herdr's worktree spaces). Each worktree has its own **coordinator**, a Claude Code session running in that folder.
-- A **task** belongs to one worktree. When it starts, hcoord makes a branch off the worktree's current HEAD and a separate checkout for it, then starts a **worker** there.
-- When a worker reports done, hcoord merges its branch into the worktree's branch (`git merge --no-ff`). If there's a conflict, or uncommitted changes in the way, the merge is aborted and the task stays in **Not merged** until it's resolved. Branches are never deleted or pushed.
+## Why not just run agents yourself?
 
-## Using it in Herdr
+| | **hcoord** | Briefing agents by hand | One long agent session |
+|---|:---:|:---:|:---:|
+| **Parallel tasks on separate branches** | ✅ | ✅ | ❌ |
+| **A conversation that stays free to answer** | ✅ | ❌ | ❌ |
+| **Finished work merged back for you** | ✅ | ❌ | n/a |
+| **Same standing instructions and memory for every task** | ✅ | ❌ | ✅ |
+| **Tasks grouped by what needs you, in the sidebar** | ✅ | ❌ | ❌ |
+| **Picks up after a reboot** | ✅ | ❌ | ❌ |
+| **Runs on your own machine** | ✅ | ✅ | ✅ |
 
-### The Projects section
+You keep your attention on decisions. hcoord starts and tracks the workers, Claude does the work, and you choose what to look at, answer or keep.
+
+## What it looks like in Herdr
 
 ```
 PROJECTS                                   📁
@@ -38,11 +47,45 @@ PROJECTS                                   📁
       Merged (3)
 ```
 
+### 📋 Every task, grouped by what it needs
+
+Under each project are its worktrees. Under each worktree are its tasks, grouped as **Needs you**, **Working**, **Queued**, **To do**, **Failed**, **Not merged** and **Merged**. A folded project shows a red count of what needs you. Click a running task to peek at its worker's terminal, or a finished one to read its log.
+
+### ⚡ Brief once
+
+Say what you want in the coordinator's pane. It decides which files each task owns, so two workers running at once never edit the same file, and chains tasks that depend on each other. Each worker starts with a brief that includes the task, the files it owns, how to test (from `PROJECT.md`) and how to report. Decisions worth keeping go into `MEMORY.md`, which every coordinator in the project reads.
+
+### 🔀 Work lands on your branch
+
+When a worker reports done, hcoord merges its branch into the worktree's branch with `git merge --no-ff`. If there's a conflict, or uncommitted changes of yours in the way, the merge is aborted and nothing in your worktree changes. The task shows up under **Not merged**, and the coordinator suggests how to resolve it.
+
+### 💬 Questions reach you, prompts don't hide
+
+A worker that has a question reports `needs_you`, and the question comes to you through the coordinator. A worker that stops without reporting, or sits silent at a prompt in its terminal, is caught as well and shows up under **Needs you** rather than looking busy.
+
+### 📜 Readable logs
+
+Every agent hcoord starts gets its own Claude session. The log icon opens its transcript in a Herdr pane, rendered as markdown: the agent's messages, each tool call with a short result, and the worker's reports. The pane updates as the agent works.
+
+## Get started in three steps
+
+<table>
+<tr>
+<td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install</b><br /><sub>In this repo, run <code>bun install</code>, <code>bun link</code> and <code>hcoord mod install</code>. Then add <code>{ "id": "projects", "type": "block", "content": { "mod": "hcoord" } }</code> to a Herdr layout you own.</sub></td>
+<td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Make a project</b><br /><sub>Click the folder button in the Projects header and pick a folder in a git repo. Its coordinator starts in that checkout. Put how to test and your conventions in the project's <code>PROJECT.md</code>.</sub></td>
+<td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane. It tells you the plan, starts the workers and ends its turn. The sidebar shows each task as it moves along.</sub></td>
+</tr>
+</table>
+
+You'll need macOS, the Herdr app with herdr-core (`hc`), [Claude Code](https://claude.com/claude-code), git and [Bun](https://bun.sh). Claude Code must trust the repo before workers can start in it: run `claude` there once and accept the "trust this folder?" prompt. The sidebar shows a red row for projects that aren't trusted yet, and clicking it does this for you.
+
+The installed section runs hcoord with this checkout's Bun and `cli.ts`, so keep the repo where it is. To change the section, edit `mod/hcoord/main.js` here and run `hcoord mod install` again; don't edit the installed copy.
+
+## Using the Projects section
+
 **Project rows**
-- Click to fold or unfold. A folded project shows a red count of tasks that need you.
-- `+` opens Herdr's New worktree dialog for the repo. Opening the new worktree's space starts a coordinator for it.
-- Right-click: **New worktree**, or **Delete project…**.
-- If Claude Code doesn't trust the repo yet, a red row says so. Its agents would stop at Claude's "trust this folder?" prompt. Click the row to open Claude in the repo and answer the prompt yourself.
+- Click to fold or unfold. `+` opens Herdr's New worktree dialog; opening the new worktree's space starts a coordinator for it.
+- Right-click for **New worktree** and **Delete project…**.
 
 **Worktree rows** show the branch and the coordinator's state:
 
@@ -54,87 +97,70 @@ PROJECTS                                   📁
 | filled dot | coordinator finished its turn |
 | **?** | the terminal runs but reports no status (a prompt, or a plain shell after a restart) |
 
-- Click to go to the worktree's space and coordinator. If no coordinator is running, one is started, resuming its previous conversation when there is one. If the worktree has no space, one is made.
-- The log icon opens the coordinator's transcript.
-- Right-click: **Coordinator's log**, or **Delete worktree…**. The main checkout can't be deleted on its own; delete the project instead.
-- **Coordinator reports no status: look at it** appears when the terminal is alive but silent. Click to peek at it. The button at the end replaces it with a fresh Claude that carries on the same conversation.
-- **N workers lost: carry on** appears when workers' terminals have gone (after a reboot, say). Click to restart each one in its existing checkout.
+- Click to go to the worktree's space and coordinator. If none is running, one starts, resuming its last conversation when there is one.
+- The log icon opens the coordinator's transcript. Right-click for **Coordinator's log** and **Delete worktree…**.
+- **Coordinator reports no status: look at it** lets you peek at a silent coordinator. The button at the end replaces it with a fresh Claude that carries on the same conversation.
+- **N workers lost: carry on** appears when workers' terminals have gone (after a reboot, say). Click to restart each one in its existing checkout, picking up from its commits.
 
-**Task rows** sit under their worktree, grouped by state:
+**Task groups**
 
 | Group | Meaning |
 |---|---|
 | Needs you | the worker asked a question, or is stuck at a prompt in its terminal |
 | Working | the worker is running |
-| Queued | waiting for a free slot (3 per project by default) or for the tasks it depends on to merge |
+| Queued | waiting for a free slot (3 per project by default) or for its dependencies to merge |
 | To do | added but not started |
-| Failed | the worker failed, stopped without reporting, or its terminal disappeared |
+| Failed | the worker failed, or its terminal disappeared |
 | Not merged | done, but the merge hit a conflict or local changes |
-| Merged | done and merged (cancelled tasks are here too); folded by default |
+| Merged | done and merged (cancelled tasks too); folded by default |
 
-- Click a running task to peek at its worker's terminal. Click a finished one to open its log.
-- The log icon opens the transcript in a pane to the right. It shows the agent's messages, each tool call with a short result, and the worker's reports, and it updates as the agent works.
+**Narrow sidebar.** When the sidebar is collapsed to a rail, each project becomes one line: its task prefix, then a red count, a spinner or a hollow dot. Click it to go to the main checkout's coordinator.
 
-**When the sidebar is narrow** (the rail), each project becomes one line: its task prefix, plus a red count, a spinner or a hollow dot. Clicking it goes to the main checkout's coordinator.
+**Things that happen without a click**
+- Going to a project's worktree space starts its coordinator if it isn't running, at most once a minute per worktree.
+- A new space in a git repo that isn't a project gets one notification offering to make it one.
+- When workers' terminals change, the section runs `hcoord sync`. That marks exited workers failed and blocked ones needs-you, and starts queued tasks that can now run.
+- The list refreshes when the data folder changes, and every 30 seconds otherwise.
 
-### Things that happen without a click
+**Deleting.** Both deletes ask first and list exactly what will happen.
+- **Delete project…**
+  - **Remove from Herdr** stops its coordinators, cancels unfinished tasks and moves its hcoord data to `~/.herdr-coordinator/deleted/`. The repo stays on disk.
+  - **Delete files too** also moves the repo, its worktrees and the workers' checkouts to the Trash. The dialog warns about uncommitted files and commits that haven't been pushed.
+- **Delete worktree…** stops its coordinator, cancels its unfinished tasks, closes its space and runs `git worktree remove`. The branch is kept.
 
-- **Going to a worktree's space starts its coordinator** if it isn't running. It won't retry the same worktree more than once a minute.
-- **A new space in a git repo that isn't a project** shows a notification offering to make it one. Each repo is offered once; after that, use the folder button.
-- **Worker terminals changing** (finishing, blocking, exiting) makes the section run `hcoord sync`. That marks vanished or exited workers as failed and blocked ones as needs-you, and starts queued tasks that can now run.
-- **The list refreshes** whenever the data folder changes, and every 30 seconds otherwise.
+**Warnings.** A red line under the header means something's wrong with the setup, such as a data folder macOS may empty. Click it for the cause and the fix.
 
-### Making a project
+## Questions
 
-Click the folder button in the section header and pick a folder inside a git repo. hcoord registers the repo as a project (named after the folder), opens the checkout you picked and starts its coordinator. Then tell the coordinator what you want done.
+### Will it touch my branches on its own?
 
-Each project's folder has a `PROJECT.md` for standing instructions, such as how to run the tests or which conventions to follow. Every coordinator and worker in the project reads it.
+Only to merge. When a worker reports done, hcoord merges that worker's branch into the worktree it belongs to, locally. If the merge can't go through cleanly it's aborted, and your worktree is left exactly as it was. hcoord never pushes, rebases or deletes a branch. `hcoord task clean` removes a worker's checkout only when git says it's clean and merged, and it keeps the branch. Deleting a worktree or a project from the sidebar always asks first.
 
-### Deleting
+### What can the coordinator do without asking?
 
-Both deletes ask first, and the dialog lists exactly what will happen before anything does.
+A coordinator starts with `hcoord` and the read-only herdr-core commands (`hc ls`, `hc get`, `hc read`) allowed. Some commands are denied even if your own Claude settings allow them: deleting projects or worktrees, and killing, typing into or starting terminals (`hc kill`, `hc rm`, `hc keys`, `hc send`, `hc run`). The coordinator skill also tells it never to edit code or change git state. Workers keep Claude's normal permission prompts, with only `hcoord report` allowed up front. Add flags such as `["--permission-mode", "acceptEdits"]` through `agent.workerArgs` in `config.json` if you want them to ask less.
 
-- **Delete project…** offers two choices:
-  - **Remove from Herdr** stops the project's coordinators and cancels unfinished tasks. Its hcoord data (tasks, reports, notes, logs) moves to `~/.herdr-coordinator/deleted/`. The repo and its worktrees stay on disk.
-  - **Delete files too** does that, then also moves the repo, its worktrees and the workers' checkouts to the Trash and closes their spaces. The dialog warns about uncommitted files and commits that haven't been pushed.
-- **Delete worktree…** stops its coordinator, cancels its unfinished tasks, closes its space and runs `git worktree remove`. The branch is kept. The dialog warns if uncommitted files would be lost.
+### How do I check it's working?
 
-### Warnings
+`hcoord board` lists every project and its tasks, and prints any setup warnings. `herdr-app check ~/.config/herdr-app/mods/hcoord` checks the installed section. If a worker seems stuck, `hcoord task show <id>` shows its terminal, and `hcoord log <id>` shows what it did.
 
-A red line under the header means something's wrong with the setup, for example that hcoord's data folder is somewhere macOS may empty. Click it for an explanation and the fix.
+### What happens after a reboot?
 
-## Talking to a coordinator
+Click a worktree to bring its coordinator back with its conversation intact, and click **N workers lost: carry on** to restart workers in their checkouts. `hcoord recover` does both for every project from a terminal.
 
-A coordinator plans and keeps track; workers write the code. A coordinator never edits code, runs builds, changes git state or presses keys in a worker's terminal. When you give it a request, it:
+### Does anything leave my machine?
 
-1. asks you first if the request is ambiguous in a way that changes the plan;
-2. splits it into small tasks, deciding which files each task owns so that tasks running at the same time never touch the same file (ones that must are chained with dependencies);
-3. starts them and tells you the plan in a few lines;
-4. ends its turn. It doesn't poll. hcoord wakes it when a worker reports.
+hcoord itself talks only to your local herdr-core and git. Claude Code still uses Anthropic's service as usual.
 
-When a worker reports, the coordinator tells you only about tasks that merged, failed or need you, one line each. It answers workers' questions itself when `PROJECT.md`, `MEMORY.md` or something you already said covers them, and asks you otherwise.
+### What does it cost?
 
-You can also ask it "what's going on?", "what did SHP-3 do?", or to cancel, retry or clean up a task. It saves lasting decisions and preferences to `MEMORY.md`, which every coordinator in the project reads.
+hcoord adds no fee. Each coordinator and worker is a full Claude Code session, so they use your Claude plan or API usage like any other session. `maxParallel` caps how many workers run at once per project.
 
-## Setup
+### Can I use another agent instead of Claude Code?
 
-Requirements: macOS, the Herdr app with herdr-core (`hc`), Claude Code, git and [Bun](https://bun.sh).
+Not fully yet. `agent.kind: "generic"` starts any program with the prompt as its last argument, but the coordinator skill, transcripts and the stop-without-reporting check are built for Claude Code. Codex isn't supported yet.
 
-```sh
-bun install
-bun link                      # puts `hcoord` on your PATH (or run `bun src/cli.ts`)
-hcoord mod install            # copies the Projects section to ~/.config/herdr-app/mods/hcoord
-```
-
-Then add the section to a Herdr layout you own:
-
-```json
-{ "id": "projects", "type": "block", "content": { "mod": "hcoord" } }
-```
-
-The installed mod runs hcoord with the same Bun and the `cli.ts` from this checkout, so don't move the repo after installing. Edit the mod here and run `hcoord mod install` again; don't edit the installed copy.
-
-Coordinators are started with this repo's `plugin/` loaded through `--plugin-dir`, so there's nothing extra to install for the skill.
+## Reference
 
 ### Data and settings
 
@@ -152,9 +178,7 @@ projects/<slug>/
 worktrees/<slug>/<ID>/      workers' checkouts
 ```
 
-`config.json` settings:
-
-| Key | Default | Meaning |
+| `config.json` key | Default | Meaning |
 |---|---|---|
 | `maxParallel` | `3` | workers running at once per project; more tasks wait as queued |
 | `worktreeRoot` | `~/.herdr-coordinator/worktrees` | where workers' checkouts go |
@@ -162,9 +186,9 @@ worktrees/<slug>/<ID>/      workers' checkouts
 | `agent.workerArgs` | | extra arguments for workers, e.g. `["--model", "sonnet"]` |
 | `agent.coordinatorArgs` | | extra arguments for coordinators |
 
-## The CLI
+### The CLI
 
-You rarely need it directly; the section and the coordinators drive it. `hcoord --help` lists everything. The main commands:
+The section and the coordinators drive it, so you rarely need it. `hcoord --help` lists everything.
 
 | Command | Does |
 |---|---|
@@ -179,11 +203,14 @@ You rarely need it directly; the section and the coordinators drive it. `hcoord 
 | `hcoord log <id>` | a worker's transcript and reports, as markdown |
 | `hcoord recover` | after a reboot: bring coordinators back and retry lost workers |
 
-## Development
+### How it's built
+
+- `mod/hcoord/`: the Projects section, a Herdr mod. It reads `hcoord board --json` and calls the CLI for everything else.
+- `plugin/`: the coordinator skill, loaded into each coordinator with `--plugin-dir`, so there's nothing extra to install.
+- `src/`: the `hcoord` CLI. It starts agents through herdr-core and keeps state in the data folder.
+- `docs/`: `discovery.md` covers how herdr-core behaves, and `design-worktrees.md` covers the worktree model.
 
 ```sh
 bun test
 bun run typecheck
 ```
-
-Design notes are in `docs/`: `discovery.md` covers how herdr-core behaves, and `design-worktrees.md` covers the worktree model.
