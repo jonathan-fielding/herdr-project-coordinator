@@ -85,24 +85,95 @@ export function herdrWorktreePath(repo: string, branch: string, home = process.e
  * would make it. A branch only on origin gets a local branch tracking it. Never makes a new branch
  * from nothing, never forced.
  */
-export function checkoutBranch(repo: string, branch: string): { path: string; created: boolean } {
+export function checkoutBranch(repo: string, branch: string): { path: string; created: boolean; warnings: string[] } {
+  const warnings: string[] = [];
   const have = listWorktrees(repo).find((w) => w.branch === branch);
-  if (have) return { path: have.path, created: false };
+  if (have) return { path: have.path, created: false, warnings };
   const path = herdrWorktreePath(repo, branch);
   if (existsSync(path)) throw new HcoordError(`${path} exists but isn't a checkout of ${branch}; move it away first`);
+  // About to track origin's: bring it up to date first (and find one pushed since the last fetch).
+  if (!branchExists(repo, branch)) {
+    const w = fetchBranch(repo, branch);
+    if (w) warnings.push(w);
+  }
   if (branchExists(repo, branch)) gitOk(repo, ["worktree", "add", path, branch], `checking out ${branch}`);
   else if (remoteBranchExists(repo, branch)) {
     gitOk(repo, ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`], `checking out ${branch}`);
   } else throw new HcoordError(`no branch ${branch} in ${repo} (or on origin)`);
-  return { path: realpathSync(path), created: true };
+  return { path: realpathSync(path), created: true, warnings };
+}
+
+/** How long a fetch may take before hcoord gives up on it and carries on with what's local. */
+const FETCH_TIMEOUT_MS = Number(process.env.HCOORD_FETCH_TIMEOUT_MS) || 15_000;
+
+/**
+ * Fetches `branch` from origin into refs/remotes/origin/<branch>, bounded by a timeout and never
+ * prompting. Returns a one-line warning when the fetch failed for a branch origin is known to have,
+ * null when it worked or there was nothing to fetch (no origin, or origin hasn't got the branch).
+ */
+export function fetchBranch(repo: string, branch: string): string | null {
+  if (git(repo, ["remote", "get-url", "origin"]).code !== 0) return null;
+  const known = remoteBranchExists(repo, branch);
+  const r = Bun.spawnSync(
+    ["git", "-C", repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      timeout: FETCH_TIMEOUT_MS,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
+    },
+  );
+  if (r.exitCode === 0) return null;
+  if (!known) return null; // not on origin (a local-only branch, or no such branch): nothing to warn about
+  const why = r.exitedDueToTimeout || r.signalCode
+    ? `timed out after ${FETCH_TIMEOUT_MS / 1000}s`
+    : r.stderr.toString().trim().split("\n").filter(Boolean)[0] || `git exit ${r.exitCode}`;
+  return `couldn't fetch ${branch} from origin (${why}); using the local copy`;
+}
+
+function isAncestor(repo: string, a: string, b: string): boolean {
+  return git(repo, ["merge-base", "--is-ancestor", a, b]).code === 0;
+}
+
+/**
+ * Where a new branch based on `from` should really start, after fetching origin's copy of it.
+ * A branch behind origin's (local is an ancestor) is fast-forwarded when nothing has it checked
+ * out, else origin's is used; a branch that is ahead or has diverged is used as it is. Anything
+ * that isn't a branch (a commit, a tag, HEAD) is used as given.
+ */
+function freshBase(repo: string, from: string, warnings: string[]): string {
+  let name: string;
+  if (from.startsWith("origin/") && !branchExists(repo, from)) name = from.slice("origin/".length);
+  else if (branchExists(repo, from) || remoteBranchExists(repo, from)) name = from;
+  else if (git(repo, ["rev-parse", "--verify", "--quiet", `${from}^{commit}`]).code !== 0 && git(repo, ["check-ref-format", "--branch", from]).code === 0) {
+    // Not anything git knows here: maybe a branch pushed to origin since the last fetch.
+    fetchBranch(repo, from);
+    return remoteBranchExists(repo, from) ? `origin/${from}` : from;
+  } else return from;
+  const w = fetchBranch(repo, name);
+  if (w) warnings.push(w);
+  if (from !== name) return from; // asked for origin/<name>: now fresh
+  if (!branchExists(repo, name)) return remoteBranchExists(repo, name) ? `origin/${name}` : from;
+  if (!remoteBranchExists(repo, name)) return name;
+  const local = git(repo, ["rev-parse", `refs/heads/${name}`]).out;
+  const remote = git(repo, ["rev-parse", `refs/remotes/origin/${name}`]).out;
+  if (local === remote || !isAncestor(repo, local, remote)) return name; // up to date, ahead, or diverged
+  if (!listWorktrees(repo).some((wt) => wt.branch === name)) {
+    // Fast-forward (the old value guards against a race); fall back to origin's if that fails.
+    if (git(repo, ["update-ref", "-m", "hcoord: fast-forward to origin", `refs/heads/${name}`, remote, local]).code === 0) return name;
+  }
+  return `origin/${name}`;
 }
 
 /**
  * A new branch and a worktree for it, where Herdr's New worktree would put it. The branch starts at
  * `base` (default: the repo's default branch, local else origin's, else the main checkout's HEAD)
- * and tracks nothing. Refuses a bad branch name, a branch that exists, and a path that exists.
+ * and tracks nothing. A base that is a branch on origin is fetched first, so the branch starts from
+ * up-to-date code (see freshBase); a failed fetch only warns. `base` in the result is what was
+ * used. Refuses a bad branch name, a branch that exists, and a path that exists.
  */
-export function newBranchWorktree(repo: string, branch: string, base?: string): { path: string; base: string } {
+export function newBranchWorktree(repo: string, branch: string, base?: string): { path: string; base: string; warnings: string[] } {
   if (!branch || git(repo, ["check-ref-format", "--branch", branch]).code !== 0 || branch.startsWith("-")) {
     throw new HcoordError(`${JSON.stringify(branch)} isn't a valid branch name`, 2);
   }
@@ -114,16 +185,18 @@ export function newBranchWorktree(repo: string, branch: string, base?: string): 
   }
   const path = herdrWorktreePath(repo, branch);
   if (existsSync(path)) throw new HcoordError(`${path} already exists; move it away or pick another branch name`);
+  const warnings: string[] = [];
   let from = base;
   if (!from) {
     const def = defaultBranch(repo);
     from = def ? (branchExists(repo, def) ? def : `origin/${def}`) : "HEAD";
   }
+  from = freshBase(repo, from, warnings);
   if (git(repo, ["rev-parse", "--verify", "--quiet", `${from}^{commit}`]).code !== 0) {
     throw new HcoordError(`no commit ${from} in ${repo} to start ${branch} from`);
   }
   gitOk(repo, ["worktree", "add", "--no-track", "-b", branch, path, from], `creating worktree for ${branch}`);
-  return { path: realpathSync(path), base: from };
+  return { path: realpathSync(path), base: from, warnings };
 }
 
 /** Worktree paths (realpath'd) and their branches. */
