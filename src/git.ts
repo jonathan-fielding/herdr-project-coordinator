@@ -36,6 +36,44 @@ function remoteBranchExists(repo: string, branch: string): boolean {
   return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).code === 0;
 }
 
+export interface BranchChoice {
+  /** The branch's name, as a person reads it ("main", "fix/login"). */
+  name: string;
+  /** What git resolves: the name for a local branch, origin/<name> for one only on origin. */
+  ref: string;
+  /** Only on origin (no local branch of that name). */
+  remote: boolean;
+}
+
+/**
+ * Branches a new one can start from: the local ones, plus origin's that have no local branch of
+ * the same name, sorted by name (case-insensitive). `selected` is the default branch's entry
+ * (its origin entry when it is only there), else null.
+ */
+export function listBranches(repo: string): { default: string | null; selected: string | null; branches: BranchChoice[] } {
+  const out = gitOk(repo, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"], "listing branches");
+  const byName = new Map<string, BranchChoice>();
+  const remote: string[] = [];
+  for (const ref of out.split("\n").filter(Boolean)) {
+    if (ref.startsWith("refs/heads/")) {
+      const name = ref.slice("refs/heads/".length);
+      byName.set(name, { name, ref: name, remote: false });
+    } else remote.push(ref.slice("refs/remotes/origin/".length));
+  }
+  for (const name of remote) {
+    if (name === "HEAD" || byName.has(name)) continue;
+    byName.set(name, { name, ref: `origin/${name}`, remote: true });
+  }
+  const branches = [...byName.values()].sort((a, b) => {
+    const x = a.name.toLowerCase();
+    const y = b.name.toLowerCase();
+    return x < y ? -1 : x > y ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+  const def = defaultBranch(repo);
+  const selected = def ? (byName.get(def)?.ref ?? null) : null;
+  return { default: def, selected, branches };
+}
+
 /** Where Herdr's New worktree puts a branch's checkout: ~/.herdr/worktrees/<repo>/<branch>. */
 export function herdrWorktreePath(repo: string, branch: string, home = process.env.HOME || homedir()): string {
   const slug = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
