@@ -21,19 +21,50 @@ const world = {
   boardRuns: 0,
   calls: [] as string[][],
   timers: [] as { ms: number; fn: (cx: any) => void }[],
+  props: {} as any,
+  runs: [] as [string, any][],
+  overlays: [] as any[],
+  closed: [] as string[],
+  notes: [] as any[],
+  /** Answers for hcoord commands by their first two words ("lane new"), else "{}". */
+  answers: {} as Record<string, { code: number; stdout: string; stderr: string }>,
 };
 
+/** A stand-in text field: a value, and handlers the test can fire. */
+class FakeInput {
+  text: string;
+  handlers: Record<string, (e: any, cx: any) => void> = {};
+  constructor(o: { value?: string }) {
+    this.text = o.value ?? "";
+  }
+  static new(o: { value?: string }) {
+    const i = new FakeInput(o);
+    inputs.push(i);
+    return i;
+  }
+  value() {
+    return this.text;
+  }
+  on(ev: string, fn: (e: any, cx: any) => void) {
+    this.handlers[ev] = fn;
+  }
+  focus() {}
+}
+const inputs: FakeInput[] = [];
+
 mock.module("gpui-kit", () => ({ View: class {}, div: () => ({}), svg: () => ({}) }));
-mock.module("gpui-base", () => ({ v_flex: () => ({}), h_flex: () => ({}), TextView: class {} }));
+mock.module("gpui-base", () => ({ v_flex: () => ({}), h_flex: () => ({}), TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => world.agents,
   terminals: () => world.terminals,
   panes: () => world.panes,
   spaces: () => world.spaces,
   focused: () => (world.focused ? { space: world.focused } : null),
-  run: () => {},
+  run: (name: string, args: any) => void world.runs.push([name, args]),
   exec: async (cmd: string, args: string[]) => {
     world.calls.push([cmd, ...args]);
+    const answer = world.answers[args.slice(0, 2).join(" ")];
+    if (answer) return answer;
     if (args[0] === "board") {
       world.boardRuns++;
       return { code: 0, stdout: JSON.stringify(world.board), stderr: "" };
@@ -42,15 +73,15 @@ mock.module("herdr", () => ({
     return { code: 0, stdout: "{}", stderr: "" };
   },
   theme: () => ({}),
-  notify: () => {},
+  notify: (n: any) => void world.notes.push(n),
   nextCommand: () => new Promise(() => {}),
   pickFolder: async () => null,
   watchFolder: () => new Promise(() => {}),
   layout: () => null,
   home: () => "/home",
-  props: () => ({}),
-  openOverlay: () => {},
-  closeOverlay: () => {},
+  props: () => world.props,
+  openOverlay: (o: any) => void world.overlays.push(o),
+  closeOverlay: (id: string) => void world.closed.push(id),
 }));
 (globalThis as any).localStorage ??= { getItem: () => null, setItem: () => {} };
 
@@ -62,7 +93,8 @@ function makeCx() {
   const cx: any = {
     spawn: (fn: (cx: any) => Promise<unknown>) => void Promise.resolve().then(() => fn(cx)),
     notify: () => {},
-    timer: { every: (ms: number, fn: (cx: any) => void) => world.timers.push({ ms, fn }) },
+    timer: { every: (ms: number, fn: (cx: any) => void) => world.timers.push({ ms, fn }), after: () => {} },
+    focus_handle: () => ({ focus() {} }),
     async settle() {
       for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 1));
     },
@@ -88,6 +120,13 @@ beforeEach(() => {
   world.boardRuns = 0;
   world.calls = [];
   world.timers = [];
+  world.props = {};
+  world.runs = [];
+  world.overlays = [];
+  world.closed = [];
+  world.notes = [];
+  world.answers = {};
+  inputs.length = 0;
 });
 
 async function start() {
@@ -170,5 +209,97 @@ describe("sidebar refresh", () => {
     await cx.settle();
     expect(v.pendingSpace).toBe(null);
     expect(laneOpens().some((c) => c.includes("/home/wt/feature"))).toBe(false);
+  });
+});
+
+describe("new worktree", () => {
+  const p = () => world.board.projects[0];
+  const made = (branch: string) => ({
+    code: 0,
+    stdout: JSON.stringify({ project: "r", lane: branch, path: `/home/.herdr/worktrees/r/${branch}`, branch, base: "main", created: true }),
+    stderr: "",
+  });
+
+  /** The dialog, as Herdr opens it from the sidebar's openOverlay call. */
+  function dialog(overlay: any) {
+    world.props = { ...overlay.props, overlay: "ov1" };
+    const cx = makeCx();
+    const v: any = new Projects();
+    v.init({}, cx);
+    const [branch, from] = inputs.slice(-2);
+    return { d: v, cx, branch, from };
+  }
+
+  test("the + button and the project menu's New worktree open hcoord's own dialog, not Herdr's", async () => {
+    world.board.projects[0].defaultBranch = { name: "main", path: "/home/.herdr/worktrees/r/main", checkedOut: true };
+    const { v } = await start();
+    v.newWorktree(p());
+    expect(world.overlays).toHaveLength(1);
+    expect(world.overlays[0]).toMatchObject({ mod: "hcoord", kind: "dialog", props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+
+    world.props = { menu: { kind: "project", project: "r", name: "r", repo: "/r", defaultBranch: "main" }, overlay: "menu1" };
+    const m: any = new Projects();
+    m.init({}, makeCx());
+    expect(m.menuItems()[0].label).toBe("New worktree");
+    m.choose(0);
+    expect(world.overlays[1]).toEqual(world.overlays[0]);
+    expect(world.overlays.some((o) => o.mod === "worktree")).toBe(false);
+  });
+
+  test("Create makes the branch with hcoord lane new, then its coordinator in a new space, with no shell space first", async () => {
+    const { v } = await start();
+    v.newWorktree(p());
+    world.calls = [];
+    world.answers["lane new"] = made("feature");
+    const { d, cx, branch, from } = dialog(world.overlays[0]);
+    branch.text = " feature ";
+    from.text = "develop";
+    branch.handlers.submit(null, cx); // Enter
+    await cx.settle();
+
+    expect(world.calls).toContainEqual(["hcoord", "lane", "new", "feature", "r", "--base", "develop", "--json"]);
+    expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/.herdr/worktrees/r/feature", "--new-space", "r · feature"]]);
+    expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
+    expect(world.closed).toEqual(["ov1"]);
+    expect(d.busyNew).toBe(null);
+    expect(world.notes).toHaveLength(0);
+  });
+
+  test("without a base hcoord picks it; it is busy while it runs and can't be sent twice", async () => {
+    world.answers["lane new"] = made("fix");
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    branch.text = "fix";
+    const running = d.createWorktree(cx);
+    expect(d.busyNew).toBeTruthy();
+    await d.createWorktree(cx); // a second Enter while busy: ignored
+    await running;
+    expect(world.calls.filter((c) => c[1] === "lane" && c[2] === "new")).toEqual([["hcoord", "lane", "new", "fix", "r", "--json"]]);
+  });
+
+  test("an error shows in the dialog, which stays open; an empty name isn't sent", async () => {
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    await d.createWorktree(cx);
+    expect(d.error).toContain("Type a name");
+    expect(world.calls).toHaveLength(0);
+
+    world.answers["lane new"] = { code: 1, stdout: "", stderr: "hcoord: branch fix already exists; to open it: hcoord lane checkout fix\n" };
+    branch.text = "fix";
+    await d.createWorktree(cx);
+    expect(d.error).toBe("branch fix already exists; to open it: hcoord lane checkout fix");
+    expect(d.busyNew).toBe(null);
+    expect(laneOpens()).toHaveLength(0);
+    expect(world.closed).toHaveLength(0);
+
+    branch.handlers.change(null, cx); // typing clears it
+    expect(d.error).toBe(null);
+  });
+
+  test("going to a worktree with no space opens its coordinator in a new space rather than space.new", async () => {
+    world.board = project(["/r", "/home/wt/feature"]);
+    const { v, cx } = await start();
+    const w = v.worktrees(p()).find((x: any) => x.path === "/home/wt/feature");
+    await v.go(p(), w, cx);
+    expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
+    expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/feature", "--new-space", "r · feature"]]);
   });
 });

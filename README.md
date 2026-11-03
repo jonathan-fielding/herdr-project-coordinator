@@ -162,7 +162,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 ## Using the Projects section
 
 **Project rows**
-- Click to fold or unfold. `+` opens Herdr's New worktree dialog; opening the new worktree's space starts a coordinator for it.
+- Click to fold or unfold. `+` asks for a new branch name (and, optionally, where it starts: the default branch unless you say otherwise), makes the branch and its worktree in `~/.herdr/worktrees/<repo>/`, and opens it in a space of its own with its coordinator already in it. Worktrees made elsewhere (Herdr's own New worktree, `git worktree add`) get a coordinator when you open their space.
 - Right-click for **New worktree** and **Delete project…**.
 
 **Worktree rows** show the branch and the coordinator's state:
@@ -272,6 +272,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 |---|---|
 | `hcoord project new <name> --repo <path>` | make a project |
 | `hcoord lane open [<path>]` | start or show the coordinator of the worktree at `<path>` |
+| `hcoord lane new <branch> [<slug>] [--base <ref>]` | a new branch (from the default branch, or `<ref>`) and its worktree, registered |
 | `hcoord board` | every project and its tasks |
 | `hcoord task list` / `task show <id>` | tasks and their state |
 | `hcoord task add` / `task start <id>` | add a task and start its worker |
