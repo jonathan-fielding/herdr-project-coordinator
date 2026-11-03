@@ -71,15 +71,85 @@ Every agent hcoord starts gets its own Claude session. The log icon opens its tr
 
 <table>
 <tr>
-<td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install</b><br /><sub>In this repo, run <code>bun install</code>, <code>bun link</code> and <code>hcoord mod install</code>. Then add <code>{ "id": "projects", "type": "block", "content": { "mod": "hcoord" } }</code> to a Herdr layout you own.</sub></td>
+<td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install</b><br /><sub>Clone this repo, install the <code>hcoord</code> command and the Projects section, and add the section to your Herdr sidebar. See <a href="#install">Install</a> below.</sub></td>
 <td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Make a project</b><br /><sub>Click the folder button in the Projects header and pick a folder in a git repo. Its coordinator starts in that checkout. Put how to test and your conventions in the project's <code>PROJECT.md</code>.</sub></td>
 <td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane. It tells you the plan, starts the workers and ends its turn. The sidebar shows each task as it moves along.</sub></td>
 </tr>
 </table>
 
-You'll need macOS, the Herdr app with herdr-core (`hc`), [Claude Code](https://claude.com/claude-code), git and [Bun](https://bun.sh). Claude Code must trust the repo before workers can start in it: run `claude` there once and accept the "trust this folder?" prompt. The sidebar shows a red row for projects that aren't trusted yet, and clicking it does this for you.
+## Install
 
-The installed section runs hcoord with this checkout's Bun and `cli.ts`, so keep the repo where it is. To change the section, edit `mod/hcoord/main.js` here and run `hcoord mod install` again; don't edit the installed copy.
+### 1. Check you have the prerequisites
+
+- macOS
+- the Herdr app, with herdr-core (`hc`) on your `PATH`
+- [Claude Code](https://claude.com/claude-code) (`claude`), signed in
+- git
+- [Bun](https://bun.sh): `curl -fsSL https://bun.sh/install | bash`
+
+### 2. Get the code and the `hcoord` command
+
+```sh
+git clone https://github.com/jonathan-fielding/herdr-project-coordinator.git
+cd herdr-project-coordinator
+bun install
+
+# put `hcoord` on your PATH: a small shim that runs this checkout's CLI with Bun
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec %s %s/src/cli.ts "$@"\n' "$(command -v bun)" "$PWD" > ~/.local/bin/hcoord
+chmod +x ~/.local/bin/hcoord
+hcoord --version
+```
+
+If `hcoord` isn't found, add `~/.local/bin` to your `PATH` (herdr-core's `hc` usually lives there too).
+
+Keep the clone where it is. The Projects section and every agent run hcoord from this folder, and coordinators load the skill from `plugin/` here, so there's no separate plugin to install.
+
+### 3. Install the Projects section
+
+```sh
+hcoord mod install
+herdr-app check ~/.config/herdr-app/mods/hcoord
+```
+
+This copies the section to `~/.config/herdr-app/mods/hcoord`. Run `hcoord mod install` again after you pull changes or edit `mod/hcoord/`. Don't edit the installed copy: the next install overwrites it.
+
+### 4. Add the section to your sidebar
+
+Herdr doesn't place the section by itself, so you add it to a layout. Herdr's shipped layouts are replaced on update, so make your own copy of `main` first (skip this if you already have one):
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"main-plus"}'
+```
+
+That switches Herdr to the copy. Open `~/.config/herdr-app/layouts/main-plus.json`, find the sidebar column that holds the `spaces` and `agents` blocks, and add this block between them:
+
+```json
+{
+  "id": "projects",
+  "type": "block",
+  "content": { "mod": "hcoord" },
+  "size": { "weight": 1 },
+  "min": 90
+}
+```
+
+Herdr picks up the change within a second, and **Projects** appears in the sidebar.
+
+### 5. Trust your repos in Claude Code
+
+Workers can't start in a repo Claude Code hasn't been told to trust, because they'd wait at its "trust this folder?" prompt. Run `claude` in each repo once and choose "Yes, I trust this folder". The Projects section shows a red row on any project that isn't trusted yet; clicking it opens Claude there for you.
+
+### Updating
+
+```sh
+cd herdr-project-coordinator
+git pull
+bun install
+hcoord mod install
+```
+
+Running coordinators and workers keep going. A coordinator picks up a changed skill when it restarts: `hcoord lane open <worktree path> --restart` replaces it with a fresh Claude that carries on the same conversation.
 
 ## Using the Projects section
 
