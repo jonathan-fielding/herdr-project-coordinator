@@ -190,7 +190,8 @@ export default class Projects extends View {
     return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
   }
 
-  /** A project's worktrees: every checkout git knows, plus registered ones that are gone but still have work. */
+  /** A project's worktrees: every checkout git knows, plus registered ones that are gone but still have work,
+   *  plus the default branch when nothing has it checked out (`virtual`: clicking it makes the checkout). */
   worktrees(p) {
     const list = p.checkouts.map((c) => {
       const lane = p.lanes.find((l) => l.path === c.path) ?? null;
@@ -200,7 +201,13 @@ export default class Projects extends View {
       if (list.some((w) => w.path === l.path)) continue;
       if (p.tasks.some((t) => t.lane === l.key && ACTIVE.includes(t.state))) list.push({ path: l.path, branch: l.branch, lane: l, main: false, gone: !l.present });
     }
-    return list.sort((a, b) => (a.main ? -1 : b.main ? 1 : (a.branch ?? a.path).localeCompare(b.branch ?? b.path)));
+    const def = p.defaultBranch;
+    if (def && !def.checkedOut && !list.some((w) => w.branch === def.name || w.path === def.path)) {
+      list.push({ path: def.path, branch: def.name, lane: null, main: false, virtual: true });
+    }
+    // The main checkout first, then the default branch, then the rest by name.
+    const rank = (w) => (w.main ? 0 : def && w.branch === def.name ? 1 : 2);
+    return list.sort((a, b) => rank(a) - rank(b) || (a.branch ?? a.path).localeCompare(b.branch ?? b.path));
   }
 
   /** The project and worktree a folder is in (the deepest checkout containing it). */
@@ -234,6 +241,24 @@ export default class Projects extends View {
 
   /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there. */
   async go(p, w, cx, { auto = false, space = null, restart = false } = {}) {
+    if (w.virtual) {
+      // The default branch isn't checked out anywhere: make its worktree (where Herdr would), then go there.
+      if (auto || this.busy.has(w.path)) return;
+      this.busy.add(w.path);
+      cx.notify();
+      const r = await hcoord(["lane", "checkout", w.branch, p.slug, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+      this.busy.delete(w.path);
+      let made = null;
+      try {
+        made = r.ok ? JSON.parse(r.stdout) : null;
+      } catch {}
+      if (!made) {
+        notify({ title: `Couldn't check out ${w.branch}`, body: r.text, level: "error", timeout: 12000 });
+        this.refresh(cx);
+        return;
+      }
+      w = { path: made.path, branch: w.branch, lane: { key: made.lane, path: made.path }, main: false };
+    }
     const ags = agents();
     const c = this.coordinatorOf(w, terminals(), ags);
     if (c.live && c.agent && !restart) {
@@ -522,12 +547,15 @@ export default class Projects extends View {
       .when(Boolean(here), (el) => el.bg(t.selected))
       .cursor_pointer()
       .hover((el) => el.bg(t.hover))
-      .tooltip(`${tilde(w.path)}\n${c.live ? "Click: show its coordinator" : w.gone ? "This worktree is gone" : "Click: start its coordinator"}`)
+      .tooltip(w.virtual
+        ? `The default branch, not checked out anywhere.\nClick: check it out in ${tilde(w.path)} and start its coordinator`
+        : `${tilde(w.path)}\n${c.live ? "Click: show its coordinator" : w.gone ? "This worktree is gone" : "Click: start its coordinator"}`)
       .on_click((_e, cx) => {
         if (!w.gone) cx.spawn(async (cx) => this.go(p, w, cx));
       })
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
+        if (w.virtual) return; // nothing on disk yet to act on
         this.menuFor({ kind: "worktree", project: p.slug, name: p.name, path: w.path, branch: label, main: w.main, gone: !!w.gone, log: c.session ? { project: p.slug, lane: w.lane.key } : null });
       })
       .child(this.fold(t, key, isOpen))
@@ -567,7 +595,9 @@ export default class Projects extends View {
     }
     if (!tasks.length) {
       rows.push(div().pl(44).pr(8).py(3).text_size(11.5).text_color(t.dim)
-        .child(c.live ? "No tasks yet: tell the coordinator what to do." : w.lane ? "No tasks yet." : "No coordinator yet: click to start one."));
+        .child(c.live ? "No tasks yet: tell the coordinator what to do."
+          : w.virtual ? "Not checked out: click to check it out and start a coordinator."
+          : w.lane ? "No tasks yet." : "No coordinator yet: click to start one."));
     }
     for (const g of GROUPS) {
       const members = tasks.filter((x) => g.states.includes(x.state));

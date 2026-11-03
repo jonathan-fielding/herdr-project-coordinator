@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { claudeTrusts } from "./agents.ts";
 import { loadConfig } from "./config.ts";
-import { listWorktrees } from "./git.ts";
+import { defaultBranch, herdrWorktreePath, listWorktrees } from "./git.ts";
 import { depMet, ROOT_LANE, type Task, type TaskState } from "./model.ts";
 import { paths, root, rootWarning } from "./paths.ts";
 import { byNumber } from "./render.ts";
@@ -49,6 +49,9 @@ export interface BoardProject {
   /** Every checkout of the repo (git worktree list), hcoord's worker checkouts left out:
    *  the section matches Herdr spaces against these. */
   checkouts: { path: string; branch: string | null }[];
+  /** The repo's default branch, and where it's checked out (or would be: Herdr's worktree folder).
+   *  `checkedOut` false: no checkout has it, so the section offers a row that makes one. */
+  defaultBranch: { name: string; path: string; checkedOut: boolean } | null;
   /** Claude trusts the repo (true), doesn't (false), can't tell (null); null for other agents too. */
   trusted: boolean | null;
   tasks: BoardTask[];
@@ -93,6 +96,14 @@ export function board(): Board {
     } catch {
       // The repo is gone or unreadable: no checkouts to match.
     }
+    let def: BoardProject["defaultBranch"] = null;
+    try {
+      const name = defaultBranch(meta.repo);
+      const have = name ? checkouts.find((c) => c.branch === name) : undefined;
+      if (name) def = { name, path: have?.path ?? herdrWorktreePath(meta.repo, name), checkedOut: !!have };
+    } catch {
+      // Can't read the repo: no default branch to offer.
+    }
     const lanes = Object.entries(meta.lanes)
       .sort(([a], [b]) => (a === ROOT_LANE ? -1 : b === ROOT_LANE ? 1 : a.localeCompare(b)))
       .map(([key, l]): BoardLane => ({
@@ -110,6 +121,7 @@ export function board(): Board {
       dir: paths.project(meta.slug),
       lanes,
       checkouts,
+      defaultBranch: def,
       trusted: config.agent.kind === "claude" ? claudeTrusts(meta.repo) : null,
       tasks: tasks.map((t) => boardTask(t, all)),
     };

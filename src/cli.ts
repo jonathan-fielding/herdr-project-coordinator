@@ -34,6 +34,7 @@ import {
 } from "./workers.ts";
 import { addMemory, laneForPath, openLane, recoverProject } from "./coordinator.ts";
 import { renderLog } from "./log.ts";
+import { checkoutBranch } from "./git.ts";
 import { depMet, ROOT_LANE } from "./model.ts";
 import { board, type BoardProject } from "./board.ts";
 import { installMod } from "./modinstall.ts";
@@ -53,6 +54,9 @@ Projects and worktrees
                                                   start (or show) the coordinator of the worktree at
                                                   <path> (default: here), registering it the first time
   hcoord lane list [<slug>] [--json]
+  hcoord lane checkout <branch> [<slug>] [--json]  a worktree for an existing branch (where Herdr puts
+                                                  them), registered; prints its path. Reuses the
+                                                  checkout git already has for it
   hcoord lane remove <path> [--force] [--dry-run]  remove a linked worktree: its coordinator and
                                                   unfinished tasks stop, git worktree remove (--force:
                                                   even with uncommitted changes); its branch is kept
@@ -214,6 +218,16 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       return report_(await deleteProject(positionals[0], { files: values.files }));
+    }
+    case "lane checkout": {
+      const { positionals, values } = parse(rest, {}, 2);
+      if (!positionals[0]) throw new UsageError("hcoord lane checkout <branch> [<slug>]");
+      const meta = loadProject(positionals[1] ?? defaultProjectSlug());
+      const co = checkoutBranch(meta.repo, positionals[0]);
+      const { lane } = await laneForPath(co.path);
+      if (values.json) json({ project: meta.slug, lane, path: co.path, branch: positionals[0], created: co.created });
+      else out(`${co.created ? "checked out" : "already checked out:"} ${positionals[0]} at ${co.path} (worktree ${lane})`);
+      return 0;
     }
     case "lane list": {
       const { positionals, values } = parse(rest, {}, 1);

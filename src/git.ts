@@ -1,5 +1,6 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { HcoordError } from "./errors.ts";
 
 function git(cwd: string, args: string[]): { code: number; out: string; err: string } {
@@ -15,6 +16,47 @@ function gitOk(cwd: string, args: string[], what: string): string {
 
 export function branchExists(repo: string, branch: string): boolean {
   return git(repo, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).code === 0;
+}
+
+/**
+ * The repo's default branch: what origin/HEAD points at, else init.defaultBranch, main or master
+ * when that branch exists (locally or on origin). null when none can be told.
+ */
+export function defaultBranch(repo: string): string | null {
+  const head = git(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  if (head.code === 0 && head.out.startsWith("origin/")) return head.out.slice("origin/".length);
+  const configured = git(repo, ["config", "--get", "init.defaultBranch"]).out;
+  for (const b of [configured, "main", "master"]) {
+    if (b && (branchExists(repo, b) || remoteBranchExists(repo, b))) return b;
+  }
+  return null;
+}
+
+function remoteBranchExists(repo: string, branch: string): boolean {
+  return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).code === 0;
+}
+
+/** Where Herdr's New worktree puts a branch's checkout: ~/.herdr/worktrees/<repo>/<branch>. */
+export function herdrWorktreePath(repo: string, branch: string, home = process.env.HOME || homedir()): string {
+  const slug = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return join(home, ".herdr", "worktrees", basename(repo), slug);
+}
+
+/**
+ * A checkout of an existing branch: the one git already has, else a new worktree where Herdr
+ * would make it. A branch only on origin gets a local branch tracking it. Never makes a new branch
+ * from nothing, never forced.
+ */
+export function checkoutBranch(repo: string, branch: string): { path: string; created: boolean } {
+  const have = listWorktrees(repo).find((w) => w.branch === branch);
+  if (have) return { path: have.path, created: false };
+  const path = herdrWorktreePath(repo, branch);
+  if (existsSync(path)) throw new HcoordError(`${path} exists but isn't a checkout of ${branch}; move it away first`);
+  if (branchExists(repo, branch)) gitOk(repo, ["worktree", "add", path, branch], `checking out ${branch}`);
+  else if (remoteBranchExists(repo, branch)) {
+    gitOk(repo, ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`], `checking out ${branch}`);
+  } else throw new HcoordError(`no branch ${branch} in ${repo} (or on origin)`);
+  return { path: realpathSync(path), created: true };
 }
 
 /** Worktree paths (realpath'd) and their branches. */
