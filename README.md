@@ -198,7 +198,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 - Going to a project's worktree space starts its coordinator if it isn't running, at most once a minute per worktree.
 - A new space in a git repo that isn't a project gets one notification offering to make it one.
 - When workers' terminals change, the section runs `hcoord sync`. That marks exited workers failed and blocked ones needs-you, and starts queued tasks that can now run.
-- The list refreshes when the data folder changes, and every 30 seconds otherwise.
+- The list refreshes when the data folder changes or a new space opens in a known repo, and every 8 seconds otherwise.
 
 **Deleting.** Both deletes ask first and list exactly what will happen.
 - **Delete project…**
