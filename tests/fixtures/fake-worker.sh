@@ -10,6 +10,9 @@
 #   MODE=exit              exit 7 without reporting
 #   MODE=block             report "blocked" over OSC 7501, then hang
 #   MODE=ask               report needs_you, read the answer from the terminal, then finish
+#   MODE=dirty             report done with an uncommitted file (refused: noted in refused-<id>.txt),
+#                          then commit it and report done again
+#   MODE=nothing           report done without changing anything
 #   MODE=trustprompt       show something like Claude's folder-trust dialog and hang, silent
 for p; do :; done # p = last argument
 field() { printf '%s\n' "$p" | sed -n "s/^$1=//p" | head -1; }
@@ -38,6 +41,19 @@ case "$(field MODE)" in
     ;;
   block)
     printf '\033]7501;state=blocked:kind=permission\007'
+    sleep 600
+    ;;
+  dirty)
+    echo "work for $id" > "work-$id.txt"
+    if printf 'Done.\n' | hcoord report "$id" --state done --file - > /dev/null 2> "../refused-$id.txt"; then
+      echo accepted > "../refused-$id.txt"
+    fi
+    commit "fake work"
+    printf 'Done, committed.\n' | hcoord report "$id" --state done --file -
+    sleep 600
+    ;;
+  nothing)
+    printf 'Looked; nothing needed changing.\n' | hcoord report "$id" --state done --file -
     sleep 600
     ;;
   ask)

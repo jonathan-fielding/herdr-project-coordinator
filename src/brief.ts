@@ -49,7 +49,8 @@ ${picked}${notes ? `\n## Project notes (from PROJECT.md)\n\n${notes}\n` : ""}
 
 ## Reporting back (required)
 
-When you have finished and committed, report with a short markdown report: what changed,
+When you have finished and committed everything (hcoord refuses a done report while your
+checkout has uncommitted changes), report with a short markdown report: what changed,
 how you tested it, and open questions. Pass it on stdin:
 
     hcoord report ${id} --state done --file - <<'REPORT'

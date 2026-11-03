@@ -699,6 +699,9 @@ export default class Projects extends View {
         .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Projects"))
         .child(plus)))
       .when(Boolean(this.error) && !collapsed, (el) => el.child(div().px(16).pb(6).text_size(12).text_color(t.blocked).child(`hcoord: ${this.error}`)))
+      .when(!collapsed && !!this.data?.warnings?.length, (el) => el.children(this.data.warnings.map((w, i) =>
+        div().id(`hc-warn-${i}`).mx(16).mb(6).truncate().text_size(12).text_color(t.blocked).tooltip(w)
+          .child(/temporary folder/.test(w) ? "Data folder is temporary: it may be emptied" : w))))
       .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
         div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
       .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(body))

@@ -40,8 +40,15 @@ describe("agent argv", () => {
     expect(again.at(-1)).toContain("You were restarted");
     expect(argv[argv.indexOf("--plugin-dir") + 1]).toBe(PLUGIN_DIR);
     const i = argv.indexOf("--allowedTools");
-    expect(argv.slice(i + 1, i + 3)).toEqual(["Bash(hcoord *)", "Bash(hc *)"]);
-    expect(argv[i + 3]!.startsWith("--")).toBe(true);
+    expect(argv.slice(i + 1, i + 5)).toEqual(["Bash(hcoord *)", "Bash(hc ls *)", "Bash(hc get *)", "Bash(hc read *)"]);
+    // Deleting and driving terminals are blocked outright; the variadic list ends at another option.
+    const d = argv.indexOf("--disallowedTools");
+    expect(d).toBe(i + 5);
+    const denied = argv.slice(d + 1, argv.findIndex((a, k) => k > d && a.startsWith("--")));
+    expect(denied).toContain("Bash(hcoord project delete *)");
+    expect(denied).toContain("Bash(hcoord lane remove *)");
+    expect(denied).toContain("Bash(hc kill *)");
+    expect(denied).not.toContain("Bash(hcoord *)");
   });
 
   test("generic agents get the env prefix, their command and the prompt", () => {

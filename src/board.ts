@@ -4,7 +4,7 @@ import { claudeTrusts } from "./agents.ts";
 import { loadConfig } from "./config.ts";
 import { listWorktrees } from "./git.ts";
 import { depMet, ROOT_LANE, type Task, type TaskState } from "./model.ts";
-import { paths, root } from "./paths.ts";
+import { paths, root, rootWarning } from "./paths.ts";
 import { byNumber } from "./render.ts";
 import { listProjects, loadTasks, type CoordinatorRef } from "./store.ts";
 
@@ -59,6 +59,8 @@ export interface Board {
   root: string;
   worktreeRoot: string;
   agent: string;
+  /** Things wrong with hcoord itself (a data folder the system may empty). */
+  warnings: string[];
   projects: BoardProject[];
 }
 
@@ -112,5 +114,6 @@ export function board(): Board {
       tasks: tasks.map((t) => boardTask(t, all)),
     };
   });
-  return { version: 2, root: root(), worktreeRoot: config.worktreeRoot, agent: config.agent.kind, projects };
+  const warning = rootWarning();
+  return { version: 2, root: root(), worktreeRoot: config.worktreeRoot, agent: config.agent.kind, warnings: warning ? [warning] : [], projects };
 }

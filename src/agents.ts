@@ -8,6 +8,23 @@ import { HcoordError } from "./errors.ts";
 export const PLUGIN_DIR = resolve(import.meta.dir, "..", "plugin");
 const CLI = resolve(import.meta.dir, "cli.ts");
 
+/** What a coordinator may run without asking: hcoord, and herdr-core only to look. */
+export const COORDINATOR_ALLOWED = ["Bash(hcoord *)", "Bash(hc ls *)", "Bash(hc get *)", "Bash(hc read *)"];
+/**
+ * Never, even if the person's own settings allow it: deleting (that's the person's call, from the
+ * Projects section or a terminal), and driving terminals or starting agents behind hcoord's back.
+ * Deny rules win over allow rules.
+ */
+export const COORDINATOR_DENIED = [
+  "Bash(hcoord project delete *)",
+  "Bash(hcoord lane remove *)",
+  "Bash(hc kill *)",
+  "Bash(hc rm *)",
+  "Bash(hc keys *)",
+  "Bash(hc send *)",
+  "Bash(hc run *)",
+];
+
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /**
@@ -73,8 +90,9 @@ export function coordinatorArgv(
     ...envPrefix(slug, lane),
     ...a.command,
     "--allowedTools",
-    "Bash(hcoord *)",
-    "Bash(hc *)",
+    ...COORDINATOR_ALLOWED,
+    "--disallowedTools",
+    ...COORDINATOR_DENIED,
     "--plugin-dir",
     PLUGIN_DIR,
     "--name",

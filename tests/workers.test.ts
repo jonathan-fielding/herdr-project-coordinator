@@ -240,6 +240,42 @@ describe("workers", () => {
     core.hc("kill", laneCoord);
   }, 60_000);
 
+  test("done is refused while the checkout has uncommitted work; nothing committed says so", async () => {
+    setup(3);
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    await addTask("Dirty", { MODE: "dirty" });
+    await addTask("Nothing", { MODE: "nothing" });
+    await ok("task", "start", "DM-1", "--parent", coord);
+    await ok("task", "start", "DM-2", "--parent", coord);
+    await until("both merged", () => tasks().every((t) => t.state === "merged"));
+    // The first done report was refused, so the work was committed and then merged.
+    const refused = readFileSync(join(home, "wt", "demo", "refused-DM-1.txt"), "utf8");
+    expect(refused).toContain("uncommitted changes");
+    expect(existsSync(join(repo, "work-DM-1.txt"))).toBe(true);
+    // DM-2 committed nothing: merged, but said plainly, with no merge commit claimed.
+    expect(task("DM-2").mergeCommit).toBeUndefined();
+    await until("the coordinator told", () => existsSync(inbox) && readFileSync(inbox, "utf8").includes("DM-2 done (nothing to merge"));
+  }, 60_000);
+
+  test("a merge that can't even be tried still tells the coordinator and leaves the task done", async () => {
+    setup(3);
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    const wtPath = join(home, "feature");
+    git(repo, "worktree", "add", "-q", "-b", "feature/x", wtPath);
+    const pj = join(home, "projects", "demo", "project.json");
+    const meta = JSON.parse(readFileSync(pj, "utf8"));
+    meta.lanes["feature-x"] = { path: wtPath, branch: "feature/x", createdAt: "2026-11-03T00:00:00Z" };
+    writeFileSync(pj, JSON.stringify(meta));
+    await addTask("Form", { GATE: join(home, "gate") }, "--lane", "feature-x");
+    await ok("task", "start", "DM-1", "--parent", coord);
+    // Its worktree goes while the worker works.
+    git(repo, "worktree", "remove", "--force", wtPath);
+    writeFileSync(join(home, "gate"), "");
+    await until("DM-1 done, not merged", () => task("DM-1").state === "done" && !!task("DM-1").mergeError);
+    expect(task("DM-1").mergeError).toContain("is gone");
+    await until("the coordinator told", () => existsSync(inbox) && readFileSync(inbox, "utf8").includes("DM-1 done (NOT merged:"));
+  }, 60_000);
+
   test("cancel stops the worker, keeps the worktree, and frees the slot", async () => {
     setup(1);
     await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");

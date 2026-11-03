@@ -34,6 +34,8 @@ describe("board", () => {
 
     const b = JSON.parse(await ok("board", "--json"));
     expect(b).toMatchObject({ version: 2, root: home, agent: "generic" });
+    // Tests run in a temp folder: the board says it isn't a safe place for data.
+    expect(b.warnings).toEqual([expect.stringContaining("temporary folder")]);
     expect(b.projects).toHaveLength(1);
     const p = b.projects[0];
     expect(p).toMatchObject({ slug: "demo", prefix: "DM", repo, trusted: null });
@@ -98,7 +100,11 @@ describe("mod install", () => {
     app = tempDir("herdr-app");
     mkdirSync(join(app, "mods"));
     const env = { ...process.env, HERDR_APP_HOME: app };
-    const r = await cli(home, ["mod", "install"], undefined, env);
+    // A temp data root (every test's) is refused unless it's said to be a throwaway.
+    const refused = await cli(home, ["mod", "install"], undefined, env);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("temporary folder");
+    const r = await cli(home, ["mod", "install", "--temp"], undefined, env);
     expect(r.code).toBe(0);
     const dest = join(app, "mods", "hcoord");
     for (const f of ["main.js", "mod.json", "hcoord-path.js", ".hcoord-installed"]) expect(existsSync(join(dest, f))).toBe(true);
@@ -109,9 +115,9 @@ describe("mod install", () => {
     expect(JSON.parse(readFileSync(join(dest, "mod.json"), "utf8")).place).toBe("none");
 
     // Again: fine (it's ours). Someone else's folder: refused.
-    expect((await cli(home, ["mod", "install"], undefined, env)).code).toBe(0);
+    expect((await cli(home, ["mod", "install", "--temp"], undefined, env)).code).toBe(0);
     rmSync(join(dest, ".hcoord-installed"));
-    const again = await cli(home, ["mod", "install"], undefined, env);
+    const again = await cli(home, ["mod", "install", "--temp"], undefined, env);
     expect(again.code).toBe(1);
     expect(again.stderr).toContain("wasn't installed by hcoord");
   });

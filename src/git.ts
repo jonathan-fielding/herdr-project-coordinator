@@ -73,11 +73,18 @@ export function mergedInto(repo: string, branch: string): { target: string; merg
 
 /**
  * Merges `branch` into whatever `checkout` has checked out (`git merge --no-ff --no-edit`).
- * On a conflict the merge is aborted, leaving the checkout as it was. Never forced.
+ * On a conflict the merge is aborted, leaving the checkout as it was. Never forced. A branch with
+ * nothing new on it is `nothing: true` and changes nothing.
  */
-export function mergeBranch(checkout: string, branch: string): { ok: true; commit: string; into: string } | { ok: false; error: string } {
+export function mergeBranch(
+  checkout: string,
+  branch: string,
+): { ok: true; commit: string; into: string; nothing?: boolean } | { ok: false; error: string } {
   const into = git(checkout, ["rev-parse", "--abbrev-ref", "HEAD"]).out || "HEAD";
   if (into === "HEAD") return { ok: false, error: `${checkout} is on a detached HEAD; check out a branch to merge into` };
+  // Nothing on the branch that isn't already there (no commits made): say so rather than "merged".
+  const already = git(checkout, ["merge-base", "--is-ancestor", branch, "HEAD"]);
+  if (already.code === 0) return { ok: true, commit: git(checkout, ["rev-parse", "--short", "HEAD"]).out, into, nothing: true };
   if (existsSync(join(gitDir(checkout), "MERGE_HEAD"))) return { ok: false, error: `${checkout} is in the middle of another merge` };
   const r = git(checkout, ["-c", "user.name=hcoord", "-c", "user.email=hcoord@localhost", "merge", "--no-ff", "--no-edit", branch]);
   if (r.code === 0) return { ok: true, commit: git(checkout, ["rev-parse", "--short", "HEAD"]).out, into };

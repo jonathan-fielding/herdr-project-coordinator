@@ -65,7 +65,7 @@ Projects and worktrees
   hcoord recover [<slug>] [--no-show]             after a reboot: coordinators back, lost workers retried
 
 Herdr
-  hcoord mod install                              put the Projects section in ~/.config/herdr-app/mods/hcoord
+  hcoord mod install [--temp]                     put the Projects section in ~/.config/herdr-app/mods/hcoord
   hcoord memory [<slug>] <text>                   add a dated note to its MEMORY.md
 
 Tasks
@@ -339,6 +339,7 @@ async function main(argv: string[]): Promise<number> {
       if (group === "board") {
         const { values } = parse(cmd === undefined ? rest : [cmd, ...rest], {}, 0);
         const b = board();
+        if (!values.json) for (const w of b.warnings) process.stderr.write(`warning: ${w}\n`);
         if (values.json) json(b);
         else if (!b.projects.length) out("no projects yet: hcoord project new <name> --repo <path>");
         else for (const p of b.projects) out(boardLine(p));
@@ -368,8 +369,8 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       if (group === "mod" && cmd === "install") {
-        parse(rest, {}, 0);
-        return report_(installMod());
+        const { values } = parse(rest, { temp: { type: "boolean" } }, 0);
+        return report_(installMod({ temp: values.temp }));
       }
       if (group === "recover") {
         const { positionals, values } = parse(cmd === undefined ? rest : [cmd, ...rest], { "no-show": { type: "boolean" } }, 1);

@@ -344,6 +344,20 @@ export async function report(
   const { meta, task } = findTask(idArg);
   const slug = meta.slug;
   const id = task.id;
+  // Only commits are merged: uncommitted work would be left behind without anyone knowing.
+  if (state === "done" && task.worktree && existsSync(task.worktree)) {
+    let dirty = "";
+    try {
+      dirty = dirtyFiles(task.worktree);
+    } catch {
+      // Can't tell: let the merge speak for itself.
+    }
+    if (dirty) {
+      throw new HcoordError(
+        `${task.worktree} has uncommitted changes; commit them to ${task.branch} (or remove them), then report done again:\n${dirty}`,
+      );
+    }
+  }
   const line = summaryOf(text);
   const reportPath = join(paths.reports(slug), `${id}.md`);
 
@@ -375,9 +389,24 @@ export async function report(
   // Done work goes into its worktree's branch at once, so the next task starts from it.
   let merged = "";
   if (state === "done") {
-    const m = await mergeTask(id, { quiet: true });
+    // Whatever happens here, the coordinator is still told and the queue still moves.
+    let m: Outcome & { nothing?: boolean };
+    try {
+      m = await mergeTask(id, { quiet: true });
+    } catch (e) {
+      const error = errText(e);
+      await mutate(slug, ({ file, now }) => {
+        const t = get(file, id);
+        if (t.state !== "done") return { result: null, events: [] };
+        t.mergeError = error;
+        t.updatedAt = now;
+        return { result: null, events: [{ type: "task.merge_failed", task: id, data: { error } }] };
+      });
+      m = { ok: false, lines: [error] };
+    }
     out.lines.push(...m.lines);
-    merged = m.ok ? ` (merged into ${laneOf(meta, task.lane).branch ?? task.lane})` : ` (NOT merged: ${m.lines.at(-1)})`;
+    const into = meta.lanes[task.lane]?.branch ?? task.lane;
+    merged = !m.ok ? ` (NOT merged: ${m.lines.at(-1)})` : m.nothing ? ` (nothing to merge: no commits that ${into} doesn't already have)` : ` (merged into ${into})`;
   }
   if (opts.notify !== false) {
     if (!parent) {
@@ -418,7 +447,7 @@ export async function replyTask(idArg: string, text: string): Promise<Outcome> {
  * Merges a done task's branch into its worktree's branch (in the worktree). One merge per worktree
  * at a time. A conflict leaves everything as it was and the task done with `mergeError`.
  */
-export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): Promise<Outcome> {
+export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): Promise<Outcome & { nothing?: boolean }> {
   const { meta, task } = findTask(idArg);
   const id = task.id;
   if (task.state === "merged") return { ok: true, lines: [`${id} is already merged`] };
@@ -430,20 +459,25 @@ export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): 
     const t = get(file, id);
     if (t.state !== "done") return { result: null, events: [] };
     if (result.ok) {
-      t.mergeCommit = result.commit;
-      return { result: null, events: [transition(t, "merged", now, { into: result.into, commit: result.commit })] };
+      if (result.nothing) delete t.mergeCommit;
+      else t.mergeCommit = result.commit;
+      return { result: null, events: [transition(t, "merged", now, { into: result.into, commit: result.nothing ? null : result.commit, nothing: !!result.nothing })] };
     }
     t.mergeError = result.error;
     t.updatedAt = now;
     return { result: null, events: [{ type: "task.merge_failed", task: id, data: { error: result.error } }] };
   });
   if (result.ok) {
-    const lines = [`merged ${task.branch} into ${result.into} (${result.commit}) in ${lane.path}`];
+    const lines = [
+      result.nothing
+        ? `nothing to merge: ${task.branch} has no commits that ${result.into} doesn't already have`
+        : `merged ${task.branch} into ${result.into} (${result.commit}) in ${lane.path}`,
+    ];
     if (!opts.quiet) {
       const s = await schedule(meta.slug);
       lines.push(...s.lines);
     }
-    return { ok: true, lines };
+    return { ok: true, lines, nothing: !!result.nothing };
   }
   return { ok: false, lines: [result.error] };
 }

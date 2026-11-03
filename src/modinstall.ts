@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { HcoordError } from "./errors.ts";
+import { root, rootWarning } from "./paths.ts";
 import type { Outcome } from "./workers.ts";
 
 export const MOD_NAME = "hcoord";
@@ -28,8 +29,12 @@ export function pathModule(): string {
   return `// Written by \`hcoord mod install\`: how this mod runs hcoord.\nexport const HCOORD = ${JSON.stringify(argv)};\n`;
 }
 
-export function installMod(): Outcome {
+export function installMod(opts: { temp?: boolean } = {}): Outcome {
   const dest = modDir();
+  // The mod would keep using that folder long after it's gone (that happened once already).
+  if (rootWarning() && !opts.temp) {
+    throw new HcoordError(`not installing the mod for ${root()}: it's a temporary folder the system may empty. Install it without HCOORD_HOME, or pass --temp for a throwaway test`);
+  }
   if (!existsSync(join(herdrAppHome(), "mods"))) {
     throw new HcoordError(`no Herdr mods folder at ${join(herdrAppHome(), "mods")}: is the Herdr app installed? ($HERDR_APP_HOME overrides)`);
   }
