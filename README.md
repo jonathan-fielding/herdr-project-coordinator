@@ -276,7 +276,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 | `hcoord project new <name> --repo <path>` | make a project |
 | `hcoord lane open [<path>] [--no-focus]` | start or show the coordinator of the worktree at `<path>`; `--no-focus` leaves the focus where it is (with `--json`, prints the coordinator's terminal) |
 | `hcoord lane say <path> <text>` | tell the worktree's coordinator something, as if typed to it (started first if it isn't running) |
-| `hcoord lane new <branch> [<slug>] [--base <ref>]` | a new branch (from the default branch, or `<ref>`) and its worktree, registered |
+| `hcoord lane new <branch> [<slug>] [--base <ref>]` | a new branch (from the default branch, or `<ref>`) and its worktree, registered. A base branch on origin is fetched first, so the branch starts from up-to-date code (a failed fetch warns and uses the local copy) |
 | `hcoord lane branches [<slug>] [--json]` | the branches a new one can start from: local ones, plus origin's with no local branch, by name, the default marked |
 | `hcoord board` | every project and its tasks |
 | `hcoord task list` / `task show <id>` | tasks and their state |

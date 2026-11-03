@@ -95,6 +95,51 @@ describe("default branch", () => {
     expect(git(made.path, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
   });
 
+  test("a branch only on origin is fetched before it is checked out, found even if pushed since the last fetch", async () => {
+    const upstream = repoOnFeature();
+    git(upstream, "checkout", "-q", "main");
+    const clone = tempDir("clone");
+    dirs.push(clone);
+    rmSync(clone, { recursive: true });
+    Bun.spawnSync(["git", "clone", "-q", upstream, clone]);
+    git(clone, "checkout", "-q", "-b", "work");
+    git(clone, "branch", "-q", "-D", "main");
+    // Origin moves on after the clone: main gets a commit, and a new branch appears.
+    writeFileSync(join(upstream, "b.txt"), "b\n");
+    git(upstream, "add", "b.txt");
+    git(upstream, "commit", "-q", "-m", "later");
+    git(upstream, "branch", "-q", "release");
+    const fresh = git(upstream, "rev-parse", "main");
+
+    const { ok } = setup();
+    await ok("project", "new", "app", "--repo", clone, "--prefix", "AP");
+    const main = JSON.parse(await ok("lane", "checkout", "main", "--json"));
+    expect(git(main.path, "rev-parse", "HEAD")).toBe(fresh);
+    expect(git(main.path, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
+    const release = JSON.parse(await ok("lane", "checkout", "release", "--json"));
+    expect(git(release.path, "rev-parse", "HEAD")).toBe(fresh);
+    expect(git(release.path, "rev-parse", "--abbrev-ref", "release@{upstream}")).toBe("origin/release");
+  });
+
+  test("checking out an origin branch while origin can't be reached warns and uses what was fetched before", async () => {
+    const upstream = repoOnFeature();
+    git(upstream, "checkout", "-q", "main");
+    const clone = tempDir("clone");
+    dirs.push(clone);
+    rmSync(clone, { recursive: true });
+    Bun.spawnSync(["git", "clone", "-q", upstream, clone]);
+    git(clone, "checkout", "-q", "-b", "work");
+    git(clone, "branch", "-q", "-D", "main");
+    git(clone, "remote", "set-url", "origin", join(clone, "gone"));
+
+    const { home, env, ok } = setup();
+    await ok("project", "new", "app", "--repo", clone, "--prefix", "AP");
+    const r = await cli(home, ["lane", "checkout", "main", "--json"], undefined, env);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("warning: couldn't fetch main from origin");
+    expect(git(JSON.parse(r.stdout).path, "rev-parse", "HEAD")).toBe(git(clone, "rev-parse", "origin/main"));
+  });
+
   test("an unknown branch is refused and nothing is made", async () => {
     const repo = repoOnFeature();
     const { user, home, env } = setup();
