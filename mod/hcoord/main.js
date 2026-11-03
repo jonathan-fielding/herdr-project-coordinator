@@ -21,8 +21,11 @@ import { HCOORD } from "./hcoord-path.js";
 const ICON = (name) => `mods/workspace-chrome/${name}.svg`;
 // How long after one try a worktree's coordinator isn't started again by itself.
 const RETRY_MS = 60000;
-// Changes the folder watch can't see (Claude's trust list, new git worktrees): looked for this often.
+// How often a coordinator's log pane reloads.
 const FALLBACK_MS = 30000;
+// Changes the sidebar's folder watch can't see (Claude's trust list, new git worktrees, branch switches):
+// looked for this often. A board run is ~50 ms, so this is cheap.
+const SIDEBAR_FALLBACK_MS = 8000;
 const ACTIVE = ["starting", "working", "needs_you"];
 
 function find(node, id) {
@@ -89,12 +92,13 @@ export default class Projects extends View {
     this.tried = {}; // worktree path -> when its coordinator was last started by itself
     this.busy = new Set(); // worktree paths being opened
     this.space = focused()?.space ?? null;
+    this.pendingSpace = null; // the focused space, when it wasn't a known worktree yet: looked at again after each refresh
     this.seenSpaces = new Set(spaces().map((s) => s.id));
     this.born = {}; // space -> when this copy first saw it
     this.dismissed = new Set(load("dismissed", []));
     this.offer = null; // { repo } the last "make it a project?" toast is about
     this.refresh(cx);
-    cx.timer.every(FALLBACK_MS, (cx) => this.refresh(cx));
+    cx.timer.every(SIDEBAR_FALLBACK_MS, (cx) => this.refresh(cx));
     // New spaces settle (their first terminal's folder) for a moment before they're asked about.
     cx.timer.every(1500, (cx) => this.lookAtNewSpaces(cx));
     cx.spawn(async (cx) => {
@@ -127,6 +131,7 @@ export default class Projects extends View {
         } catch (e) {
           this.error = String(e?.message ?? e);
         }
+        this.retryPendingSpace(cx);
         cx.notify();
       } while (this.again);
       this.loading = false;
@@ -287,11 +292,34 @@ export default class Projects extends View {
     const now = focused()?.space ?? null;
     if (now === this.space) return;
     this.space = now;
-    if (!now || !this.data) return;
+    this.pendingSpace = null;
+    this.startFor(now, cx);
+  }
+
+  /** After a refresh: the focused space that wasn't a known worktree may be one now (a worktree just made). */
+  retryPendingSpace(cx) {
+    const s = this.pendingSpace;
+    if (!s) return;
+    if (s !== this.space || s !== (focused()?.space ?? null)) {
+      this.pendingSpace = null;
+      return;
+    }
+    this.startFor(s, cx);
+  }
+
+  /** Starts the coordinator of the worktree a space is in, if it isn't running. A space that isn't in a
+   *  known worktree (yet) stays pending, and is looked at again after the next refresh. */
+  startFor(now, cx) {
+    if (!now) return;
     const s = spaces().find((x) => x.id === now);
     if (!s || s.machine) return;
-    const hit = this.worktreeAt(this.placeOf(s, panes()));
-    if (!hit || hit.w.gone) return;
+    const hit = this.data ? this.worktreeAt(this.placeOf(s, panes())) : null;
+    if (!hit) {
+      this.pendingSpace = now;
+      return;
+    }
+    this.pendingSpace = null;
+    if (hit.w.gone) return;
     if (this.coordinatorOf(hit.w, terminals(), agents()).live) return;
     if (Date.now() - (this.tried[hit.w.path] ?? 0) < RETRY_MS) return;
     this.tried[hit.w.path] = Date.now();
@@ -368,7 +396,10 @@ export default class Projects extends View {
         const common = r.stdout.trim();
         if (!common.endsWith("/.git")) return;
         const repo = common.slice(0, -5);
-        if (this.dismissed.has(repo) || this.data.projects.some((p) => p.repo === repo)) return;
+        // A known project's repo but no known checkout: a new worktree (Herdr's New worktree dialog, or a
+        // space opened on one). Load it now rather than at the fallback timer; followSpace then catches up.
+        if (this.data.projects.some((p) => p.repo === repo)) return this.refresh(cx);
+        if (this.dismissed.has(repo)) return;
         this.offer = { repo: at };
         this.dismissed.add(repo); // asked once; the folder button still makes it a project later
         save("dismissed", [...this.dismissed]);
