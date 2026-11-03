@@ -1,6 +1,6 @@
 # herdr-coordinator (hcoord)
 
-A project coordinator for the Herdr desktop app. You talk to one coordinator agent per worktree in plain language. It splits your request into small tasks and starts one worker agent per task. Each worker gets its own branch and checkout, and its work is merged back into your worktree when it's done. You only hear about the things that need you.
+A project coordinator for the [Herdr](https://herdr.dev) desktop app. You talk to one coordinator agent per worktree in plain language. It splits your request into small tasks and starts one worker agent per task. Each worker gets its own branch and checkout, and its work is merged back into your worktree when it's done. You only hear about the things that need you.
 
 It has three parts:
 
