@@ -205,8 +205,10 @@ export default class Projects extends View {
     if (def && !def.checkedOut && !list.some((w) => w.branch === def.name || w.path === def.path)) {
       list.push({ path: def.path, branch: def.name, lane: null, main: false, virtual: true });
     }
-    // The main checkout first, then the default branch, then the rest by name.
-    const rank = (w) => (w.main ? 0 : def && w.branch === def.name ? 1 : 2);
+    // The default branch first (wherever it is: the main checkout, another worktree, or `virtual`),
+    // then the main checkout when it's on some other branch, then the rest by name.
+    // (Only the order on screen: the rail and `go` find the main checkout by `w.main`, not position.)
+    const rank = (w) => (def && w.branch === def.name ? 0 : w.main ? 1 : 2);
     return list.sort((a, b) => rank(a) - rank(b) || (a.branch ?? a.path).localeCompare(b.branch ?? b.path));
   }
 
