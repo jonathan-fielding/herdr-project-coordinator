@@ -4,14 +4,15 @@
 // Click a worktree to go to its coordinator (started if it isn't running), a task to peek
 // at its worker or read its log. Going to a project's worktree space starts its coordinator.
 // The same mod with props { log } is a pane showing one agent's log (its transcript); with
-// props { menu } a right-click menu, with props { ask } a dialog asking before a delete, and with
-// props { info } a dialog explaining a warning (where hcoord keeps its data).
+// props { menu } a right-click menu, with props { ask } a dialog asking before a delete, with
+// props { info } a dialog explaining a warning (where hcoord keeps its data), and with props { newWorktree }
+// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator).
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView } from "gpui-base";
+import { v_flex, h_flex, TextView, InputState, Input, Scrollbar } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
   pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay, shared, setShared,
@@ -21,8 +22,11 @@ import { HCOORD } from "./hcoord-path.js";
 const ICON = (name) => `mods/workspace-chrome/${name}.svg`;
 // How long after one try a worktree's coordinator isn't started again by itself.
 const RETRY_MS = 60000;
-// Changes the folder watch can't see (Claude's trust list, new git worktrees): looked for this often.
+// How often a coordinator's log pane reloads.
 const FALLBACK_MS = 30000;
+// Changes the sidebar's folder watch can't see (Claude's trust list, new git worktrees, branch switches):
+// looked for this often. A board run is ~50 ms, so this is cheap.
+const SIDEBAR_FALLBACK_MS = 8000;
 const ACTIVE = ["starting", "working", "needs_you"];
 
 function find(node, id) {
@@ -71,12 +75,48 @@ async function hcoord(args) {
   return { ok: r.code === 0, text: (r.stdout + r.stderr).trim(), stdout: r.stdout };
 }
 
+/** Makes a checkout with `hcoord lane checkout|new … --json`: { w } the worktree to go to, or { error }. */
+async function makeCheckout(args) {
+  const r = await hcoord([...args, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+  let made = null;
+  try {
+    made = r.ok ? JSON.parse(r.stdout) : null;
+  } catch {}
+  if (!made?.path) return { error: (r.text || "hcoord failed").replace(/^hcoord: /, "") };
+  return { w: { path: made.path, branch: made.branch, lane: { key: made.lane, path: made.path }, main: false } };
+}
+
+/** hcoord's New worktree dialog for a project: { project, name, defaultBranch }. */
+const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 420, props: { newWorktree: n } });
+
+/** What a worktree's own space is called. */
+const spaceName = (p, w) => (w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`);
+
+/** Starts (or shows) a worktree's coordinator: in `space`, else (`fresh`) in a new space Herdr makes around it,
+ *  so its first tab is the coordinator, not a shell, else wherever hcoord puts it. `noFocus`: hcoord leaves the
+ *  focus alone and the result's `terminal` is the coordinator's, for the caller to focus (once) itself. */
+async function openLane(p, w, { space = null, fresh = false, restart = false, noFocus = false } = {}) {
+  const args = ["lane", "open", w.path];
+  if (space) args.push("--space", space);
+  else if (fresh) args.push("--new-space", spaceName(p, w));
+  if (restart) args.push("--restart");
+  if (noFocus) args.push("--no-focus", "--json");
+  const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+  if (!noFocus) return r;
+  let out = null;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {}
+  return { ...r, terminal: out?.terminal ?? null, text: out?.lines ? out.lines.join("\n") : r.text };
+}
+
 export default class Projects extends View {
   init(_props, cx) {
     if (props()?.log) return this.initLog(cx);
     if (props()?.menu) return this.initMenu(cx);
     if (props()?.ask) return this.initAsk(cx);
     if (props()?.info) return this.initInfo(cx);
+    if (props()?.newWorktree) return this.initNew(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.loading = false;
@@ -89,6 +129,7 @@ export default class Projects extends View {
     this.tried = {}; // worktree path -> when its coordinator was last started by itself
     this.busy = new Set(); // worktree paths being opened
     this.space = focused()?.space ?? null;
+    this.pendingSpace = null; // the focused space, when it wasn't a known worktree yet: looked at again after each refresh
     this.seenSpaces = new Set(spaces().map((s) => s.id));
     this.born = {}; // space -> when this copy first saw it
     this.dismissed = new Set(load("dismissed", []));
@@ -96,7 +137,7 @@ export default class Projects extends View {
     this.drag = null; // { from, over }: a project header pressed, and the project it's over
     this.offer = null; // { repo } the last "make it a project?" toast is about
     this.refresh(cx);
-    cx.timer.every(FALLBACK_MS, (cx) => this.refresh(cx));
+    cx.timer.every(SIDEBAR_FALLBACK_MS, (cx) => this.refresh(cx));
     // New spaces settle (their first terminal's folder) for a moment before they're asked about.
     cx.timer.every(1500, (cx) => this.lookAtNewSpaces(cx));
     cx.spawn(async (cx) => {
@@ -130,6 +171,7 @@ export default class Projects extends View {
         } catch (e) {
           this.error = String(e?.message ?? e);
         }
+        this.retryPendingSpace(cx);
         cx.notify();
       } while (this.again);
       this.loading = false;
@@ -273,18 +315,14 @@ export default class Projects extends View {
       if (auto || this.busy.has(w.path)) return;
       this.busy.add(w.path);
       cx.notify();
-      const r = await hcoord(["lane", "checkout", w.branch, p.slug, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+      const m = await makeCheckout(["lane", "checkout", w.branch, p.slug]);
       this.busy.delete(w.path);
-      let made = null;
-      try {
-        made = r.ok ? JSON.parse(r.stdout) : null;
-      } catch {}
-      if (!made) {
-        notify({ title: `Couldn't check out ${w.branch}`, body: r.text, level: "error", timeout: 12000 });
+      if (m.error) {
+        notify({ title: `Couldn't check out ${w.branch}`, body: m.error, level: "error", timeout: 12000 });
         this.refresh(cx);
         return;
       }
-      w = { path: made.path, branch: w.branch, lane: { key: made.lane, path: made.path }, main: false };
+      w = m.w;
     }
     const ags = agents();
     const c = this.coordinatorOf(w, terminals(), ags);
@@ -293,19 +331,23 @@ export default class Projects extends View {
       if (!say) return;
     }
     if (this.busy.has(w.path)) return;
-    let s = space ? { id: space } : this.spaceOf(w, panes(), ags);
-    if (!auto && !(c.live && c.agent && say)) {
-      if (s) run("space.select", { id: s.id });
-      else run("space.new", { name: w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`, folder: w.path });
-    }
+    const s = space ? { id: space } : this.spaceOf(w, panes(), ags);
+    const live = c.live && c.agent;
+    // No space yet: Herdr makes one around the coordinator (space.new would show a shell first).
+    if (!auto && s && !(live && say)) run("space.select", { id: s.id });
     this.busy.add(w.path);
     cx.notify();
-    const args = say ? ["lane", "say", w.path, say] : ["lane", "open", w.path];
-    if (s) args.push("--space", s.id);
-    if (restart && !say) args.push("--restart");
-    const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+    let r;
+    if (say) {
+      const args = ["lane", "say", w.path, say];
+      if (s) args.push("--space", s.id);
+      else if (!live) args.push("--new-space", spaceName(p, w));
+      r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+    } else {
+      r = await openLane(p, w, { space: s?.id, fresh: !auto, restart });
+    }
     this.busy.delete(w.path);
-    if (!r.ok) notify({ title: `Couldn't ${say ? "ask" : "open"} ${p.name} · ${w.branch ?? base(w.path)}${say ? "'s coordinator" : ""}`, body: r.text, level: "error", timeout: 12000 });
+    if (!r.ok) notify({ title: `Couldn't ${say ? "ask" : "open"} ${spaceName(p, w)}${say ? "'s coordinator" : ""}`, body: r.text, level: "error", timeout: 12000 });
     else if (say) notify({ title: `Asked ${w.branch ?? base(w.path)}'s coordinator`, body: say, level: "info", timeout: 6000 });
     this.refresh(cx);
   }
@@ -315,11 +357,34 @@ export default class Projects extends View {
     const now = focused()?.space ?? null;
     if (now === this.space) return;
     this.space = now;
-    if (!now || !this.data) return;
+    this.pendingSpace = null;
+    this.startFor(now, cx);
+  }
+
+  /** After a refresh: the focused space that wasn't a known worktree may be one now (a worktree just made). */
+  retryPendingSpace(cx) {
+    const s = this.pendingSpace;
+    if (!s) return;
+    if (s !== this.space || s !== (focused()?.space ?? null)) {
+      this.pendingSpace = null;
+      return;
+    }
+    this.startFor(s, cx);
+  }
+
+  /** Starts the coordinator of the worktree a space is in, if it isn't running. A space that isn't in a
+   *  known worktree (yet) stays pending, and is looked at again after the next refresh. */
+  startFor(now, cx) {
+    if (!now) return;
     const s = spaces().find((x) => x.id === now);
     if (!s || s.machine) return;
-    const hit = this.worktreeAt(this.placeOf(s, panes()));
-    if (!hit || hit.w.gone) return;
+    const hit = this.data ? this.worktreeAt(this.placeOf(s, panes())) : null;
+    if (!hit) {
+      this.pendingSpace = now;
+      return;
+    }
+    this.pendingSpace = null;
+    if (hit.w.gone) return;
     if (this.coordinatorOf(hit.w, terminals(), agents()).live) return;
     if (Date.now() - (this.tried[hit.w.path] ?? 0) < RETRY_MS) return;
     this.tried[hit.w.path] = Date.now();
@@ -327,9 +392,7 @@ export default class Projects extends View {
   }
 
   newWorktree(p) {
-    const s = this.spaceOf({ path: p.repo, lane: p.lanes.find((l) => l.key === "root") }, panes(), agents());
-    // Herdr's own dialog: it makes the checkout and a space for it; going there starts its coordinator.
-    openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: s?.id, folder: p.repo, action: "new" } });
+    openNewWorktree({ project: p.slug, name: p.name, defaultBranch: p.defaultBranch?.name ?? null });
   }
 
   menuFor(target) {
@@ -396,7 +459,10 @@ export default class Projects extends View {
         const common = r.stdout.trim();
         if (!common.endsWith("/.git")) return;
         const repo = common.slice(0, -5);
-        if (this.dismissed.has(repo) || this.data.projects.some((p) => p.repo === repo)) return;
+        // A known project's repo but no known checkout: a new worktree (Herdr's New worktree dialog, or a
+        // space opened on one). Load it now rather than at the fallback timer; followSpace then catches up.
+        if (this.data.projects.some((p) => p.repo === repo)) return this.refresh(cx);
+        if (this.dismissed.has(repo)) return;
         this.offer = { repo: at };
         this.dismissed.add(repo); // asked once; the folder button still makes it a project later
         save("dismissed", [...this.dismissed]);
@@ -728,7 +794,7 @@ export default class Projects extends View {
       .on_mouse_down("left", (e) => this.pressProject(p, e))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
-        this.menuFor({ kind: "project", project: p.slug, name: p.name, repo: p.repo });
+        this.menuFor({ kind: "project", project: p.slug, name: p.name, repo: p.repo, defaultBranch: p.defaultBranch?.name ?? null });
       })
       .child(this.fold(t, key, isOpen))
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
@@ -781,6 +847,7 @@ export default class Projects extends View {
     if (props()?.menu) return this.renderMenu(t);
     if (props()?.ask) return this.renderAsk(t);
     if (props()?.info) return this.renderInfo(t);
+    if (props()?.newWorktree) return this.renderNew(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -915,7 +982,7 @@ export default class Projects extends View {
     const m = props().menu;
     if (m.kind === "project") {
       return [
-        { label: "New worktree", icon: "git-branch", go: () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { folder: m.repo, action: "new" } }) },
+        { label: "New worktree", icon: "git-branch", go: () => openNewWorktree({ project: m.project, name: m.name, defaultBranch: m.defaultBranch ?? null }) },
         { label: "Delete project…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 480, height: 360, props: { ask: { ...m, what: "project" } } }) },
       ];
     }
@@ -1157,5 +1224,240 @@ export default class Projects extends View {
       .child(h_flex().justify_end().gap(8).text_size(12)
         .child(button("finder", "Show in Finder", t.raised, t.foreground, () => exec("open", [i.root]).catch(() => null)))
         .child(button("close", "Close", t.solid, t.solid_foreground, () => closeOverlay(props().overlay))));
+  }
+
+  // ------------------------------------------------------------- a new worktree
+
+  initNew(cx) {
+    const n = props().newWorktree;
+    this.error = null;
+    this.busyNew = null; // what it's doing, while it runs
+    this.focusedField = "branch";
+    // Start from: the repo's branches once `hcoord lane branches` answers (null: loading, false: it failed,
+    // and the field is a text box as before); `base` the chosen one's ref (null: hcoord picks, the default).
+    this.branches = null;
+    this.base = null;
+    this.picking = false; // the branch list is open
+    this.at = 0; // the highlighted row of the open list
+    this.branchInput = InputState.new({ value: "", placeholder: "new branch name" });
+    this.baseInput = InputState.new({ value: "", placeholder: n.defaultBranch ?? "the main checkout's HEAD" });
+    this.filterInput = InputState.new({ value: "", placeholder: "filter branches" });
+    for (const [field, input] of [["branch", this.branchInput], ["base", this.baseInput]]) {
+      input.on("change", (_e, cx) => {
+        this.error = null;
+        cx.notify();
+      });
+      input.on("submit", (_e, cx) => cx.spawn(async (cx) => this.createWorktree(cx)));
+      input.on("focus", (_e, cx) => {
+        this.focusedField = field;
+        if (this.picking) this.closePicker();
+        cx.notify();
+      });
+    }
+    this.filterInput.on("change", (_e, cx) => {
+      this.at = 0;
+      cx.notify();
+    });
+    this.filterInput.on("submit", (_e, cx) => this.pick(this.shownBranches()[this.at], cx));
+    this.filterInput.on("focus", (_e, cx) => {
+      this.focusedField = "filter";
+      cx.notify();
+    });
+    this.handle = cx.focus_handle();
+    this.branchInput.focus();
+    cx.timer.after(600, () => this.focusedField === "branch" && this.branchInput.focus());
+    cx.spawn(async (cx) => this.loadBranches(cx));
+  }
+
+  /** `hcoord lane branches --json`: { default, selected, branches: [{ name, ref, remote }] }. */
+  async loadBranches(cx) {
+    const n = props().newWorktree;
+    const r = await hcoord(["lane", "branches", n.project, "--json"]).catch(() => ({ ok: false }));
+    let list = null;
+    try {
+      list = r.ok ? JSON.parse(r.stdout) : null;
+    } catch {}
+    if (Array.isArray(list?.branches) && list.branches.length) {
+      this.branches = list;
+      this.base = list.selected ?? null;
+    } else this.branches = false;
+    cx.notify();
+  }
+
+  /** The open list's rows: the branches whose name has the filter's text. */
+  shownBranches() {
+    const f = this.filterInput.value().trim().toLowerCase();
+    return (this.branches?.branches ?? []).filter((b) => !f || b.name.toLowerCase().includes(f));
+  }
+
+  openPicker() {
+    if (!this.branches || this.busyNew) return;
+    this.picking = true;
+    const rows = this.shownBranches();
+    this.at = Math.max(0, rows.findIndex((b) => b.ref === this.base));
+    this.filterInput.focus();
+  }
+
+  closePicker() {
+    this.picking = false;
+    this.filterInput.set_value("");
+  }
+
+  pick(b, cx) {
+    if (b) this.base = b.ref;
+    this.closePicker();
+    this.error = null;
+    this.branchInput.focus();
+    cx.notify();
+  }
+
+  /** What `lane new` gets as --base: nothing for the default (hcoord picks local, else origin's). */
+  chosenBase() {
+    if (this.branches === false) return this.baseInput.value().trim() || null;
+    if (!this.branches || !this.base || this.base === this.branches.selected) return null;
+    return this.base;
+  }
+
+  /** Keys on the dialog: Esc closes the list if it's open, else the dialog; ↑ ↓ move in the open list
+   *  (↓ in the Branch field opens it). */
+  keyNew(e, cx) {
+    if (e.key === "escape") {
+      if (this.picking) {
+        this.closePicker();
+        this.branchInput.focus();
+        cx.notify();
+      } else closeOverlay(props().overlay);
+      cx.stop_propagation();
+      return;
+    }
+    if (!this.picking && e.key === "down" && this.focusedField === "branch" && this.branches) {
+      this.openPicker(); // ↓ from the Branch field opens the list
+      cx.stop_propagation();
+      cx.notify();
+      return;
+    }
+    if (!this.picking || (e.key !== "down" && e.key !== "up")) return;
+    const n = this.shownBranches().length;
+    if (n) this.at = (this.at + (e.key === "down" ? 1 : n - 1)) % n;
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  /** Create: `hcoord lane new`, then its coordinator in a space of its own (as go() opens any worktree). */
+  async createWorktree(cx) {
+    if (this.busyNew) return;
+    const n = props().newWorktree;
+    const branch = this.branchInput.value().trim();
+    const from = this.chosenBase();
+    if (!branch) {
+      this.error = "Type a name for the new branch.";
+      cx.notify();
+      return;
+    }
+    this.closePicker();
+    this.busyNew = "Creating the branch and its checkout…";
+    this.error = null;
+    cx.notify();
+    const m = await makeCheckout(["lane", "new", branch, n.project, ...(from ? ["--base", from] : [])]);
+    if (m.error) {
+      this.busyNew = null;
+      this.error = m.error;
+      cx.notify();
+      return;
+    }
+    this.busyNew = "Starting its coordinator…";
+    cx.notify();
+    const p = { slug: n.project, name: n.name };
+    // hcoord makes the space around the coordinator and names it, but doesn't go there: the dialog closes
+    // first, then one agent.focus goes to the new space, so the only switch is to it, once it's ready.
+    const r = await openLane(p, m.w, { fresh: true, noFocus: true });
+    this.busyNew = null;
+    closeOverlay(props().overlay);
+    if (r.terminal) run("agent.focus", { terminal: r.terminal });
+    if (!r.ok) notify({ title: `Couldn't start ${spaceName(p, m.w)}'s coordinator`, body: r.text, level: "error", timeout: 12000 });
+  }
+
+  /** Start from: a button showing the chosen branch, which opens the list (and its filter) below it. */
+  baseField(t) {
+    const list = this.branches;
+    const chosen = list?.branches.find((b) => b.ref === this.base);
+    const label = !list ? "Loading branches…" : chosen ? chosen.name : "the main checkout's HEAD";
+    return v_flex().gap(4)
+      .child(div().text_size(11.5).text_color(t.dim).child("Start from"))
+      .child(h_flex().id("hc-base").h(32).px(10).gap(8).items_center().rounded(6).border(1)
+        .border_color(this.picking ? t.accent : t.input).bg(t.background)
+        .when(Boolean(list), (el) => el.cursor_pointer().on_click((_e, cx) => {
+          if (this.picking) {
+            this.closePicker();
+            this.branchInput.focus();
+          } else this.openPicker();
+          cx.notify();
+        }))
+        .child(div().flex_1().min_w(0).truncate().text_color(list ? t.foreground : t.dim).child(label))
+        .when(Boolean(chosen?.remote), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("origin")))
+        .when(Boolean(chosen && chosen.name === list?.default), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("default")))
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(this.picking ? "▴" : "▾")));
+  }
+
+  /** The open branch list: a filter (type to narrow, ↑ ↓ to move, Enter to choose, Esc to close) and the rows. */
+  branchList(t) {
+    const rows = this.shownBranches();
+    const row = (b, i) => {
+      const on = i === this.at;
+      return h_flex().id(`hc-br-${i}`).flex_none().h(28).px(10).gap(8).items_center().rounded(6).cursor_pointer()
+        .when(on, (el) => el.bg(t.selected))
+        .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+        .on_click((_e, cx) => this.pick(b, cx))
+        .child(div().flex_1().min_w(0).truncate().text_color(b.ref === this.base ? t.accent : t.foreground).child(b.name))
+        .when(b.remote, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("origin")))
+        .when(b.name === this.branches.default, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("default")));
+    };
+    return v_flex().flex_1().min_h(0).gap(6)
+      .child(Input.new(this.filterInput).h(30).px(10).items_center().rounded(6).border(1)
+        .border_color(this.focusedField === "filter" ? t.accent : t.input).bg(t.background).text_color(t.foreground))
+      .child(div().relative().flex_1().min_h(0).rounded(6).border(1).border_color(t.input)
+        .child(v_flex().id("hc-br-list").size_full().p(3).overflow_y_scroll()
+          .children(rows.map(row))
+          .when(rows.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child("No matching branches."))))
+        .child(Scrollbar.vertical("hc-br-list").absolute().inset_0()));
+  }
+
+  renderNew(t) {
+    const n = props().newWorktree;
+    const field = (id, label, input) =>
+      v_flex().gap(4)
+        .child(div().text_size(11.5).text_color(t.dim).child(label))
+        .child(Input.new(input).h(32).px(10).items_center().rounded(6).border(1)
+          .border_color(this.focusedField === id ? t.accent : t.input).bg(t.background).text_color(t.foreground));
+    const ready = !this.busyNew;
+    const button = (id, label, bg, fg, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "cancel" ? t.input : bg).bg(bg).text_color(fg)
+        .when(ready || id === "cancel", (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick))
+        .when(!ready && id !== "cancel", (el) => el.opacity(0.5))
+        .child(label);
+    return v_flex()
+      .id("hc-new")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.keyNew(e, cx))
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child(`New worktree of ${n.name}`))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(div().text_color(t.muted).child("A new branch, checked out in a space of its own with its coordinator."))
+      .child(field("branch", "Branch", this.branchInput))
+      .when(this.branches === false, (el) => el.child(field("base", "Start from", this.baseInput)))
+      .when(this.branches !== false, (el) => el.child(this.baseField(t)))
+      .when(this.picking, (el) => el.child(this.branchList(t)))
+      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
+      .when(!this.picking, (el) => el.child(div().flex_1()))
+      .child(h_flex().justify_end().gap(8).text_size(12)
+        .when(Boolean(this.busyNew), (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.busyNew)))
+        .child(button("cancel", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay)))
+        .child(button("create", "Create", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.createWorktree(cx)))));
   }
 }

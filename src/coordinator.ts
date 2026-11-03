@@ -47,6 +47,9 @@ function pickSpace(path: string): string | null {
   return status?.space ?? local[0]?.id ?? null;
 }
 
+/** A space id Herdr hasn't seen (its own are "sp" and 32 hex digits). */
+const newSpaceId = () => `sp${crypto.randomUUID().replace(/-/g, "")}`;
+
 function tabOf(address: string): string | null {
   const ls = app(["ls"]);
   for (const s of ls?.spaces ?? []) {
@@ -102,17 +105,33 @@ export interface OpenOptions {
   show?: boolean;
   /** The Herdr space for it (default: the one whose folder is the worktree, else the shown one). */
   space?: string;
+  /**
+   * Show it in a new Herdr space of its own, with this name. Herdr makes a space for a labelled
+   * terminal whose space id it doesn't know, so the coordinator is the space's first and only tab:
+   * no shell shows before it, as it would in a space made with space.new.
+   */
+  newSpace?: string;
   /** A coordinator that came back from a reboot as a plain shell is replaced (resuming its session). */
   restart?: boolean;
   /** Start a new conversation even when an earlier session could be resumed. */
   fresh?: boolean;
+  /**
+   * Show it in Herdr (its tab, its new space named) but leave the focus where it is: the caller then
+   * focuses `terminal` itself, once, when it's ready (hcoord's New worktree dialog closes first).
+   */
+  noFocus?: boolean;
+}
+
+/** What openLane did, and the coordinator's terminal (when there is one) for a caller to focus. */
+export interface LaneOutcome extends Outcome {
+  terminal?: string;
 }
 
 /**
  * Starts a worktree's coordinator agent (or shows the running one) in a Herdr tab named
  * "coord <worktree>", in that worktree's folder. Without a Herdr window it runs headless.
  */
-export async function openLane(project: string, laneKey: string, opts: OpenOptions = {}): Promise<Outcome> {
+export async function openLane(project: string, laneKey: string, opts: OpenOptions = {}): Promise<LaneOutcome> {
   let meta = loadProject(project);
   const slug = meta.slug;
   const lane = laneOf(meta, laneKey);
@@ -138,10 +157,10 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
     };
   }
   if (live) {
-    const shown = opts.show !== false && app(["do", "agent.focus", "--terminal", live.address]) !== null;
-    lines.push(`coordinator ${name} (${live.address}) is already running${shown ? "; showing it" : ""}`);
+    const shown = opts.show !== false && (opts.noFocus || app(["do", "agent.focus", "--terminal", live.address]) !== null);
+    lines.push(`coordinator ${name} (${live.address}) is already running${shown && !opts.noFocus ? "; showing it" : ""}`);
     if (!shown) lines.push(`attach with: hc attach ${live.address}`);
-    return { ok: true, lines };
+    return { ok: true, lines, terminal: live.address };
   }
   const holder = hcGet(name);
   if (holder?.state === "live") {
@@ -158,10 +177,10 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
       lines.push(`stopped ${name} (${holder.address}): an earlier coordinator of this worktree, now a plain shell`);
     } else {
       await saveCoordinator(slug, laneKey, { address: holder.address, name });
-      const shown = opts.show !== false && app(["do", "agent.focus", "--terminal", holder.address]) !== null;
-      lines.push(`took back the running coordinator ${name} (${holder.address})${shown ? "; showing it" : ""}`);
+      const shown = opts.show !== false && (opts.noFocus || app(["do", "agent.focus", "--terminal", holder.address]) !== null);
+      lines.push(`took back the running coordinator ${name} (${holder.address})${shown && !opts.noFocus ? "; showing it" : ""}`);
       if (!shown) lines.push(`attach with: hc attach ${holder.address}`);
-      return { ok: true, lines };
+      return { ok: true, lines, terminal: holder.address };
     }
   }
 
@@ -170,7 +189,8 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
   const resume = claude && !opts.fresh && !!earlier && !!findTranscript(earlier);
   const session = claude ? (resume ? earlier! : crypto.randomUUID()) : undefined;
 
-  const space = opts.show === false ? null : (opts.space ?? pickSpace(lane.path));
+  const newSpace = opts.show !== false && !!opts.newSpace && app(["status"]) !== null;
+  const space = opts.show === false ? null : newSpace ? newSpaceId() : (opts.space ?? pickSpace(lane.path));
   const tab = space ? `tbhcoord${(slug + laneKey).replace(/[^a-z0-9]/g, "")}${Date.now().toString(36)}` : null;
   const labels: Record<string, string> = { "hcoord.project": slug, "hcoord.lane": laneKey, "hcoord.role": "coordinator" };
   if (space && tab) Object.assign(labels, { "herdr.space": space, "herdr.tab": tab });
@@ -190,9 +210,14 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
       if (!adopted) await Bun.sleep(150);
     }
     if (adopted) {
+      // Name the space and the tab before anything shows them, then (unless the caller focuses it) go there.
+      if (newSpace) app(["do", "space.rename", "--id", space, "--name", opts.newSpace!]);
       app(["do", "tab.rename", "--id", tab, "--name", `coord ${laneKey}`]);
-      app(["do", "agent.focus", "--terminal", term.address]);
-      lines.push(`showing it in the tab "coord ${laneKey}"`);
+      if (!opts.noFocus) {
+        if (newSpace) app(["do", "space.select", "--id", space]);
+        app(["do", "agent.focus", "--terminal", term.address]);
+      }
+      lines.push(`${opts.noFocus ? "in" : "showing it in"} the tab "coord ${laneKey}"`);
     } else {
       lines.push(`Herdr didn't show it yet; attach with: hc attach ${term.address}`);
     }
@@ -202,7 +227,7 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
   }
   meta = loadProject(slug);
   lines.push(...trustWarnings(meta));
-  return { ok: true, lines };
+  return { ok: true, lines, terminal: term.address };
 }
 
 /** Appends a dated bullet to the project's MEMORY.md (the coordinators' shared notes). */

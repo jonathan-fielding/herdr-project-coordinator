@@ -36,6 +36,44 @@ function remoteBranchExists(repo: string, branch: string): boolean {
   return git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]).code === 0;
 }
 
+export interface BranchChoice {
+  /** The branch's name, as a person reads it ("main", "fix/login"). */
+  name: string;
+  /** What git resolves: the name for a local branch, origin/<name> for one only on origin. */
+  ref: string;
+  /** Only on origin (no local branch of that name). */
+  remote: boolean;
+}
+
+/**
+ * Branches a new one can start from: the local ones, plus origin's that have no local branch of
+ * the same name, sorted by name (case-insensitive). `selected` is the default branch's entry
+ * (its origin entry when it is only there), else null.
+ */
+export function listBranches(repo: string): { default: string | null; selected: string | null; branches: BranchChoice[] } {
+  const out = gitOk(repo, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"], "listing branches");
+  const byName = new Map<string, BranchChoice>();
+  const remote: string[] = [];
+  for (const ref of out.split("\n").filter(Boolean)) {
+    if (ref.startsWith("refs/heads/")) {
+      const name = ref.slice("refs/heads/".length);
+      byName.set(name, { name, ref: name, remote: false });
+    } else remote.push(ref.slice("refs/remotes/origin/".length));
+  }
+  for (const name of remote) {
+    if (name === "HEAD" || byName.has(name)) continue;
+    byName.set(name, { name, ref: `origin/${name}`, remote: true });
+  }
+  const branches = [...byName.values()].sort((a, b) => {
+    const x = a.name.toLowerCase();
+    const y = b.name.toLowerCase();
+    return x < y ? -1 : x > y ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+  const def = defaultBranch(repo);
+  const selected = def ? (byName.get(def)?.ref ?? null) : null;
+  return { default: def, selected, branches };
+}
+
 /** Where Herdr's New worktree puts a branch's checkout: ~/.herdr/worktrees/<repo>/<branch>. */
 export function herdrWorktreePath(repo: string, branch: string, home = process.env.HOME || homedir()): string {
   const slug = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -57,6 +95,35 @@ export function checkoutBranch(repo: string, branch: string): { path: string; cr
     gitOk(repo, ["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`], `checking out ${branch}`);
   } else throw new HcoordError(`no branch ${branch} in ${repo} (or on origin)`);
   return { path: realpathSync(path), created: true };
+}
+
+/**
+ * A new branch and a worktree for it, where Herdr's New worktree would put it. The branch starts at
+ * `base` (default: the repo's default branch, local else origin's, else the main checkout's HEAD)
+ * and tracks nothing. Refuses a bad branch name, a branch that exists, and a path that exists.
+ */
+export function newBranchWorktree(repo: string, branch: string, base?: string): { path: string; base: string } {
+  if (!branch || git(repo, ["check-ref-format", "--branch", branch]).code !== 0 || branch.startsWith("-")) {
+    throw new HcoordError(`${JSON.stringify(branch)} isn't a valid branch name`, 2);
+  }
+  if (branchExists(repo, branch)) {
+    throw new HcoordError(`branch ${branch} already exists; to open it: hcoord lane checkout ${branch}`);
+  }
+  if (remoteBranchExists(repo, branch)) {
+    throw new HcoordError(`branch ${branch} already exists on origin; to open it: hcoord lane checkout ${branch}`);
+  }
+  const path = herdrWorktreePath(repo, branch);
+  if (existsSync(path)) throw new HcoordError(`${path} already exists; move it away or pick another branch name`);
+  let from = base;
+  if (!from) {
+    const def = defaultBranch(repo);
+    from = def ? (branchExists(repo, def) ? def : `origin/${def}`) : "HEAD";
+  }
+  if (git(repo, ["rev-parse", "--verify", "--quiet", `${from}^{commit}`]).code !== 0) {
+    throw new HcoordError(`no commit ${from} in ${repo} to start ${branch} from`);
+  }
+  gitOk(repo, ["worktree", "add", "--no-track", "-b", branch, path, from], `creating worktree for ${branch}`);
+  return { path: realpathSync(path), base: from };
 }
 
 /** Worktree paths (realpath'd) and their branches. */
