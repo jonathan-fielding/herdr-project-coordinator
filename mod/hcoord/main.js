@@ -12,7 +12,7 @@
 // Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, TextView, InputState, Input, Scrollbar } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
   pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay,
@@ -87,7 +87,7 @@ async function makeCheckout(args) {
 }
 
 /** hcoord's New worktree dialog for a project: { project, name, defaultBranch }. */
-const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { newWorktree: n } });
+const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 420, props: { newWorktree: n } });
 
 /** What a worktree's own space is called. */
 const spaceName = (p, w) => (w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`);
@@ -1122,8 +1122,15 @@ export default class Projects extends View {
     this.error = null;
     this.busyNew = null; // what it's doing, while it runs
     this.focusedField = "branch";
+    // Start from: the repo's branches once `hcoord lane branches` answers (null: loading, false: it failed,
+    // and the field is a text box as before); `base` the chosen one's ref (null: hcoord picks, the default).
+    this.branches = null;
+    this.base = null;
+    this.picking = false; // the branch list is open
+    this.at = 0; // the highlighted row of the open list
     this.branchInput = InputState.new({ value: "", placeholder: "new branch name" });
     this.baseInput = InputState.new({ value: "", placeholder: n.defaultBranch ?? "the main checkout's HEAD" });
+    this.filterInput = InputState.new({ value: "", placeholder: "filter branches" });
     for (const [field, input] of [["branch", this.branchInput], ["base", this.baseInput]]) {
       input.on("change", (_e, cx) => {
         this.error = null;
@@ -1132,12 +1139,97 @@ export default class Projects extends View {
       input.on("submit", (_e, cx) => cx.spawn(async (cx) => this.createWorktree(cx)));
       input.on("focus", (_e, cx) => {
         this.focusedField = field;
+        if (this.picking) this.closePicker();
         cx.notify();
       });
     }
+    this.filterInput.on("change", (_e, cx) => {
+      this.at = 0;
+      cx.notify();
+    });
+    this.filterInput.on("submit", (_e, cx) => this.pick(this.shownBranches()[this.at], cx));
+    this.filterInput.on("focus", (_e, cx) => {
+      this.focusedField = "filter";
+      cx.notify();
+    });
     this.handle = cx.focus_handle();
     this.branchInput.focus();
     cx.timer.after(600, () => this.focusedField === "branch" && this.branchInput.focus());
+    cx.spawn(async (cx) => this.loadBranches(cx));
+  }
+
+  /** `hcoord lane branches --json`: { default, selected, branches: [{ name, ref, remote }] }. */
+  async loadBranches(cx) {
+    const n = props().newWorktree;
+    const r = await hcoord(["lane", "branches", n.project, "--json"]).catch(() => ({ ok: false }));
+    let list = null;
+    try {
+      list = r.ok ? JSON.parse(r.stdout) : null;
+    } catch {}
+    if (Array.isArray(list?.branches) && list.branches.length) {
+      this.branches = list;
+      this.base = list.selected ?? null;
+    } else this.branches = false;
+    cx.notify();
+  }
+
+  /** The open list's rows: the branches whose name has the filter's text. */
+  shownBranches() {
+    const f = this.filterInput.value().trim().toLowerCase();
+    return (this.branches?.branches ?? []).filter((b) => !f || b.name.toLowerCase().includes(f));
+  }
+
+  openPicker() {
+    if (!this.branches || this.busyNew) return;
+    this.picking = true;
+    const rows = this.shownBranches();
+    this.at = Math.max(0, rows.findIndex((b) => b.ref === this.base));
+    this.filterInput.focus();
+  }
+
+  closePicker() {
+    this.picking = false;
+    this.filterInput.set_value("");
+  }
+
+  pick(b, cx) {
+    if (b) this.base = b.ref;
+    this.closePicker();
+    this.error = null;
+    this.branchInput.focus();
+    cx.notify();
+  }
+
+  /** What `lane new` gets as --base: nothing for the default (hcoord picks local, else origin's). */
+  chosenBase() {
+    if (this.branches === false) return this.baseInput.value().trim() || null;
+    if (!this.branches || !this.base || this.base === this.branches.selected) return null;
+    return this.base;
+  }
+
+  /** Keys on the dialog: Esc closes the list if it's open, else the dialog; ↑ ↓ move in the open list
+   *  (↓ in the Branch field opens it). */
+  keyNew(e, cx) {
+    if (e.key === "escape") {
+      if (this.picking) {
+        this.closePicker();
+        this.branchInput.focus();
+        cx.notify();
+      } else closeOverlay(props().overlay);
+      cx.stop_propagation();
+      return;
+    }
+    if (!this.picking && e.key === "down" && this.focusedField === "branch" && this.branches) {
+      this.openPicker(); // ↓ from the Branch field opens the list
+      cx.stop_propagation();
+      cx.notify();
+      return;
+    }
+    if (!this.picking || (e.key !== "down" && e.key !== "up")) return;
+    const n = this.shownBranches().length;
+    if (n) this.at = (this.at + (e.key === "down" ? 1 : n - 1)) % n;
+    cx.stop_propagation();
+    cx.notify();
   }
 
   /** Create: `hcoord lane new`, then its coordinator in a space of its own (as go() opens any worktree). */
@@ -1145,12 +1237,13 @@ export default class Projects extends View {
     if (this.busyNew) return;
     const n = props().newWorktree;
     const branch = this.branchInput.value().trim();
-    const from = this.baseInput.value().trim();
+    const from = this.chosenBase();
     if (!branch) {
       this.error = "Type a name for the new branch.";
       cx.notify();
       return;
     }
+    this.closePicker();
     this.busyNew = "Creating the branch and its checkout…";
     this.error = null;
     cx.notify();
@@ -1173,6 +1266,51 @@ export default class Projects extends View {
     if (!r.ok) notify({ title: `Couldn't start ${spaceName(p, m.w)}'s coordinator`, body: r.text, level: "error", timeout: 12000 });
   }
 
+  /** Start from: a button showing the chosen branch, which opens the list (and its filter) below it. */
+  baseField(t) {
+    const list = this.branches;
+    const chosen = list?.branches.find((b) => b.ref === this.base);
+    const label = !list ? "Loading branches…" : chosen ? chosen.name : "the main checkout's HEAD";
+    return v_flex().gap(4)
+      .child(div().text_size(11.5).text_color(t.dim).child("Start from"))
+      .child(h_flex().id("hc-base").h(32).px(10).gap(8).items_center().rounded(6).border(1)
+        .border_color(this.picking ? t.accent : t.input).bg(t.background)
+        .when(Boolean(list), (el) => el.cursor_pointer().on_click((_e, cx) => {
+          if (this.picking) {
+            this.closePicker();
+            this.branchInput.focus();
+          } else this.openPicker();
+          cx.notify();
+        }))
+        .child(div().flex_1().min_w(0).truncate().text_color(list ? t.foreground : t.dim).child(label))
+        .when(Boolean(chosen?.remote), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("origin")))
+        .when(Boolean(chosen && chosen.name === list?.default), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("default")))
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(this.picking ? "▴" : "▾")));
+  }
+
+  /** The open branch list: a filter (type to narrow, ↑ ↓ to move, Enter to choose, Esc to close) and the rows. */
+  branchList(t) {
+    const rows = this.shownBranches();
+    const row = (b, i) => {
+      const on = i === this.at;
+      return h_flex().id(`hc-br-${i}`).flex_none().h(28).px(10).gap(8).items_center().rounded(6).cursor_pointer()
+        .when(on, (el) => el.bg(t.selected))
+        .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+        .on_click((_e, cx) => this.pick(b, cx))
+        .child(div().flex_1().min_w(0).truncate().text_color(b.ref === this.base ? t.accent : t.foreground).child(b.name))
+        .when(b.remote, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("origin")))
+        .when(b.name === this.branches.default, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child("default")));
+    };
+    return v_flex().flex_1().min_h(0).gap(6)
+      .child(Input.new(this.filterInput).h(30).px(10).items_center().rounded(6).border(1)
+        .border_color(this.focusedField === "filter" ? t.accent : t.input).bg(t.background).text_color(t.foreground))
+      .child(div().relative().flex_1().min_h(0).rounded(6).border(1).border_color(t.input)
+        .child(v_flex().id("hc-br-list").size_full().p(3).overflow_y_scroll()
+          .children(rows.map(row))
+          .when(rows.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child("No matching branches."))))
+        .child(Scrollbar.vertical("hc-br-list").absolute().inset_0()));
+  }
+
   renderNew(t) {
     const n = props().newWorktree;
     const field = (id, label, input) =>
@@ -1189,11 +1327,7 @@ export default class Projects extends View {
     return v_flex()
       .id("hc-new")
       .track_focus(this.handle)
-      .on_key_down((e, cx) => {
-        if (e.key !== "escape") return;
-        closeOverlay(props().overlay);
-        cx.stop_propagation();
-      })
+      .on_key_down((e, cx) => this.keyNew(e, cx))
       .size_full()
       .min_h(0)
       .p(18)
@@ -1205,9 +1339,11 @@ export default class Projects extends View {
         .child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(div().text_color(t.muted).child("A new branch, checked out in a space of its own with its coordinator."))
       .child(field("branch", "Branch", this.branchInput))
-      .child(field("base", "Start from", this.baseInput))
+      .when(this.branches === false, (el) => el.child(field("base", "Start from", this.baseInput)))
+      .when(this.branches !== false, (el) => el.child(this.baseField(t)))
+      .when(this.picking, (el) => el.child(this.branchList(t)))
       .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
-      .child(div().flex_1())
+      .when(!this.picking, (el) => el.child(div().flex_1()))
       .child(h_flex().justify_end().gap(8).text_size(12)
         .when(Boolean(this.busyNew), (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.busyNew)))
         .child(button("cancel", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay)))

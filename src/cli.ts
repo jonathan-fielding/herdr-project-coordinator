@@ -34,7 +34,7 @@ import {
 } from "./workers.ts";
 import { addMemory, laneForPath, openLane, recoverProject } from "./coordinator.ts";
 import { renderLog } from "./log.ts";
-import { checkoutBranch, newBranchWorktree } from "./git.ts";
+import { checkoutBranch, listBranches, newBranchWorktree } from "./git.ts";
 import { depMet, ROOT_LANE } from "./model.ts";
 import { board, type BoardProject } from "./board.ts";
 import { installMod } from "./modinstall.ts";
@@ -56,6 +56,8 @@ Projects and worktrees
                                                   --new-space: in a new Herdr space of its own, so named;
                                                   --no-focus: shown, but the focus stays (--json: its terminal)
   hcoord lane list [<slug>] [--json]
+  hcoord lane branches [<slug>] [--json]          the branches a new one can start from: local ones and
+                                                  origin's with no local branch, by name; * the default
   hcoord lane checkout <branch> [<slug>] [--json]  a worktree for an existing branch (where Herdr puts
                                                   them), registered; prints its path. Reuses the
                                                   checkout git already has for it
@@ -254,6 +256,14 @@ async function main(argv: string[]): Promise<number> {
       const { lane } = await laneForPath(made.path);
       if (values.json) json({ project: meta.slug, lane, path: made.path, branch: positionals[0], base: made.base, created: true });
       else out(`made branch ${positionals[0]} (from ${made.base}) at ${made.path} (worktree ${lane})`);
+      return 0;
+    }
+    case "lane branches": {
+      const { positionals, values } = parse(rest, {}, 1);
+      const meta = loadProject(positionals[0] ?? defaultProjectSlug());
+      const list = listBranches(meta.repo);
+      if (values.json) json(list);
+      else for (const b of list.branches) out(`${b.ref === list.selected ? "*" : " "} ${b.ref}`);
       return 0;
     }
     case "lane list": {

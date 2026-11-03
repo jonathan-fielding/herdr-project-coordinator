@@ -50,12 +50,15 @@ class FakeInput {
   on(ev: string, fn: (e: any, cx: any) => void) {
     this.handlers[ev] = fn;
   }
+  set_value(v: string) {
+    this.text = v;
+  }
   focus() {}
 }
 const inputs: FakeInput[] = [];
 
 mock.module("gpui-kit", () => ({ View: class {}, div: () => ({}), svg: () => ({}) }));
-mock.module("gpui-base", () => ({ v_flex: () => ({}), h_flex: () => ({}), TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) } }));
+mock.module("gpui-base", () => ({ v_flex: () => ({}), h_flex: () => ({}), TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => world.agents,
   terminals: () => world.terminals,
@@ -223,6 +226,7 @@ describe("sidebar refresh", () => {
 });
 
 describe("new worktree", () => {
+  const laneNews = () => world.calls.filter((c) => c[1] === "lane" && c[2] === "new");
   const p = () => world.board.projects[0];
   const made = (branch: string) => ({
     code: 0,
@@ -236,8 +240,7 @@ describe("new worktree", () => {
     const cx = makeCx();
     const v: any = new Projects();
     v.init({}, cx);
-    const [branch, from] = inputs.slice(-2);
-    return { d: v, cx, branch, from };
+    return { d: v, cx, branch: v.branchInput as FakeInput, from: v.baseInput as FakeInput, filter: v.filterInput as FakeInput };
   }
 
   test("the + button and the project menu's New worktree open hcoord's own dialog, not Herdr's", async () => {
@@ -261,7 +264,10 @@ describe("new worktree", () => {
     v.newWorktree(p());
     world.calls = [];
     world.answers["lane new"] = made("feature");
+    world.answers["lane branches"] = { code: 1, stdout: "", stderr: "hcoord: listing branches: boom\n" }; // Start from is a text box then
     const { d, cx, branch, from } = dialog(world.overlays[0]);
+    await cx.settle();
+    expect(d.branches).toBe(false);
     branch.text = " feature ";
     from.text = "develop";
     branch.handlers.submit(null, cx); // Enter
@@ -319,7 +325,7 @@ describe("new worktree", () => {
     const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
     await d.createWorktree(cx);
     expect(d.error).toContain("Type a name");
-    expect(world.calls).toHaveLength(0);
+    expect(laneNews()).toHaveLength(0);
 
     world.answers["lane new"] = { code: 1, stdout: "", stderr: "hcoord: branch fix already exists; to open it: hcoord lane checkout fix\n" };
     branch.text = "fix";
@@ -331,6 +337,89 @@ describe("new worktree", () => {
 
     branch.handlers.change(null, cx); // typing clears it
     expect(d.error).toBe(null);
+  });
+
+  const branchList = {
+    default: "main",
+    selected: "main",
+    branches: [
+      { name: "alpha", ref: "origin/alpha", remote: true },
+      { name: "Beta", ref: "Beta", remote: false },
+      { name: "main", ref: "main", remote: false },
+      { name: "release/2", ref: "origin/release/2", remote: true },
+    ],
+  };
+  const listed = (list = branchList) => ({ code: 0, stdout: JSON.stringify(list), stderr: "" });
+
+  test("Start from loads the repo's branches when it opens, the default chosen; Create with it leaves the base to hcoord", async () => {
+    world.answers["lane branches"] = listed();
+    world.answers["lane new"] = made("fix");
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    expect(d.branches).toBe(null); // loading
+    await cx.settle();
+    expect(world.calls).toContainEqual(["hcoord", "lane", "branches", "r", "--json"]);
+    expect(d.branches.branches.map((b: any) => b.name)).toEqual(["alpha", "Beta", "main", "release/2"]);
+    expect(d.base).toBe("main");
+    branch.text = "fix";
+    branch.handlers.submit(null, cx); // Enter in the Branch field still creates
+    await cx.settle();
+    expect(laneNews()).toEqual([["hcoord", "lane", "new", "fix", "r", "--json"]]);
+  });
+
+  test("a branch chosen from the list (filtered, ↑ ↓, Enter) is passed as --base, by the ref git resolves", async () => {
+    world.answers["lane branches"] = listed();
+    world.answers["lane new"] = made("fix");
+    const { d, cx, branch, filter } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    await cx.settle();
+    const key = (k: string) => d.keyNew({ key: k }, { ...cx, stop_propagation() {} });
+
+    key("down"); // ↓ in the Branch field opens the list, on the chosen branch
+    expect(d.picking).toBe(true);
+    expect(d.shownBranches()[d.at].ref).toBe("main");
+    key("up");
+    key("up");
+    expect(d.shownBranches()[d.at].ref).toBe("origin/alpha");
+    filter.text = "re";
+    filter.handlers.change(null, cx);
+    expect(d.shownBranches().map((b: any) => b.ref)).toEqual(["origin/release/2"]);
+    filter.handlers.submit(null, cx); // Enter in the filter chooses
+    expect(d.picking).toBe(false);
+    expect(d.base).toBe("origin/release/2");
+    expect(filter.text).toBe("");
+
+    branch.text = "fix";
+    await d.createWorktree(cx);
+    expect(laneNews()).toEqual([["hcoord", "lane", "new", "fix", "r", "--base", "origin/release/2", "--json"]]);
+  });
+
+  test("a click on a row chooses it; Esc with the list open closes the list, not the dialog", async () => {
+    world.answers["lane branches"] = listed();
+    world.answers["lane new"] = made("fix");
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    await cx.settle();
+    d.openPicker();
+    d.keyNew({ key: "escape" }, { ...cx, stop_propagation() {} });
+    expect(d.picking).toBe(false);
+    expect(world.closed).toEqual([]);
+    d.openPicker();
+    d.pick(d.branches.branches[1], cx); // Beta, a local branch: its name is its ref
+    branch.text = "fix";
+    await d.createWorktree(cx);
+    expect(laneNews()).toEqual([["hcoord", "lane", "new", "fix", "r", "--base", "Beta", "--json"]]);
+    d.keyNew({ key: "escape" }, { ...cx, stop_propagation() {} });
+    expect(world.closed).toEqual(["ov1", "ov1"]); // closed once by Create, then by Esc with the list shut
+  });
+
+  test("a default branch only on origin is preselected as origin's and still left to hcoord", async () => {
+    const list = { default: "main", selected: "origin/main", branches: [{ name: "dev", ref: "dev", remote: false }, { name: "main", ref: "origin/main", remote: true }] };
+    world.answers["lane branches"] = listed(list);
+    world.answers["lane new"] = made("fix");
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    await cx.settle();
+    expect(d.base).toBe("origin/main");
+    branch.text = "fix";
+    await d.createWorktree(cx);
+    expect(laneNews()).toEqual([["hcoord", "lane", "new", "fix", "r", "--json"]]);
   });
 
   test("going to a worktree with no space opens its coordinator in a new space rather than space.new", async () => {
