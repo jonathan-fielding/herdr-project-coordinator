@@ -50,10 +50,11 @@ Projects and worktrees
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
   hcoord project open [<slug>] [...]              the main checkout's coordinator (lane open for root)
-  hcoord lane open [<path>] [--space <id> | --new-space <name>] [--no-show] [--restart] [--fresh]
+  hcoord lane open [<path>] [--space <id> | --new-space <name>] [--no-show] [--no-focus] [--restart] [--fresh] [--json]
                                                   start (or show) the coordinator of the worktree at
                                                   <path> (default: here), registering it the first time;
-                                                  --new-space: in a new Herdr space of its own, so named
+                                                  --new-space: in a new Herdr space of its own, so named;
+                                                  --no-focus: shown, but the focus stays (--json: its terminal)
   hcoord lane list [<slug>] [--json]
   hcoord lane checkout <branch> [<slug>] [--json]  a worktree for an existing branch (where Herdr puts
                                                   them), registered; prints its path. Reuses the
@@ -202,12 +203,16 @@ async function main(argv: string[]): Promise<number> {
           "new-space": { type: "string" },
           restart: { type: "boolean" },
           fresh: { type: "boolean" },
+          "no-focus": { type: "boolean" },
         },
         1,
       );
       if (values.space !== undefined && values["new-space"] !== undefined) throw new UsageError("use --space or --new-space, not both");
       const { meta, lane } = await laneForPath(positionals[0] ?? process.cwd());
-      return report_(await openLane(meta.slug, lane, openOpts(values)));
+      const o = await openLane(meta.slug, lane, { ...openOpts(values), noFocus: !!values["no-focus"] });
+      if (!values.json) return report_(o);
+      json({ project: meta.slug, lane, ok: o.ok, terminal: o.terminal ?? null, lines: o.lines });
+      return o.ok ? 0 : 1;
     }
     case "lane remove": {
       const { positionals, values } = parse(rest, { force: { type: "boolean" }, "dry-run": { type: "boolean" } }, 1);
