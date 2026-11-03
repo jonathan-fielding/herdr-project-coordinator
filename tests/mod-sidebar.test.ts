@@ -94,6 +94,8 @@ mock.module("herdr", () => ({
     world.closed.push(id);
     world.events.push(`close ${id}`);
   },
+  shared: () => null,
+  setShared: () => {},
 }));
 (globalThis as any).localStorage ??= { getItem: () => null, setItem: () => {} };
 

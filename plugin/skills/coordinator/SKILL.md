@@ -119,6 +119,23 @@ about tasks still working unless asked. Then end your turn.
 - Clean up: `hcoord task clean ID`. This removes a merged task's checkout only if git says it's
   clean and merged; branches are kept.
 - Details: `hcoord task show ID`, or read `reports/ID.md`.
+- "Raise a PR for this worktree's branch (B) against D" (the Projects section's Raise PR button
+  sends this): you still never push. If tasks of yours are still working or not merged, ask
+  first whether to wait for them. Otherwise add and start one task:
+
+  ```sh
+  hcoord task add --title "Raise PR for B" --brief-file - <<'BRIEF'
+  Goal: a pull request for branch B against D. This task overrides the "do not push" rule
+  for branch B only; push nothing else, and make no commits.
+  1. If `gh pr view B` finds an open PR for B, just report its URL.
+  2. Otherwise `git push -u origin B`, then `gh pr create --base D --head B` with a clear
+     title and a description summarising the branch's commits (`git log D..B`).
+  Done when: the report's first line has the PR's URL.
+  BRIEF
+  hcoord task start QHQ-7
+  ```
+
+  When it reports, give the person the URL in one line.
 
 ## Memory
 

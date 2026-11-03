@@ -164,6 +164,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 **Project rows**
 - Click to fold or unfold. `+` asks for a new branch name (and, optionally, where it starts: the default branch unless you say otherwise), makes the branch and its worktree in `~/.herdr/worktrees/<repo>/`, and opens it in a space of its own with its coordinator already in it. Worktrees made elsewhere (Herdr's own New worktree, `git worktree add`) get a coordinator when you open their space.
 - Right-click for **New worktree** and **Delete project…**.
+- Drag a project's row up or down to reorder projects; the order is kept.
 
 **Worktree rows** show the branch and the coordinator's state:
 
@@ -175,7 +176,9 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 | filled dot | coordinator finished its turn |
 | **?** | the terminal runs but reports no status (a prompt, or a plain shell after a restart) |
 
+- The default branch comes first, above the main checkout, even when nothing has it checked out (clicking it then makes its worktree).
 - Click to go to the worktree's space and coordinator. If none is running, one starts, resuming its last conversation when there is one.
+- **Raise PR** (on a row whose branch isn't the default one, and in its right-click menu) asks the worktree's coordinator to raise a PR against the default branch.
 - The log icon opens the coordinator's transcript. Right-click for **Coordinator's log** and **Delete worktree…**.
 - **Coordinator reports no status: look at it** lets you peek at a silent coordinator. The button at the end replaces it with a fresh Claude that carries on the same conversation.
 - **N workers lost: carry on** appears when workers' terminals have gone (after a reboot, say). Click to restart each one in its existing checkout, picking up from its commits.
@@ -272,6 +275,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 |---|---|
 | `hcoord project new <name> --repo <path>` | make a project |
 | `hcoord lane open [<path>] [--no-focus]` | start or show the coordinator of the worktree at `<path>`; `--no-focus` leaves the focus where it is (with `--json`, prints the coordinator's terminal) |
+| `hcoord lane say <path> <text>` | tell the worktree's coordinator something, as if typed to it (started first if it isn't running) |
 | `hcoord lane new <branch> [<slug>] [--base <ref>]` | a new branch (from the default branch, or `<ref>`) and its worktree, registered |
 | `hcoord lane branches [<slug>] [--json]` | the branches a new one can start from: local ones, plus origin's with no local branch, by name, the default marked |
 | `hcoord board` | every project and its tasks |
