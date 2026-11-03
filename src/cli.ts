@@ -34,7 +34,7 @@ import {
 } from "./workers.ts";
 import { addMemory, laneForPath, openLane, recoverProject } from "./coordinator.ts";
 import { renderLog } from "./log.ts";
-import { checkoutBranch } from "./git.ts";
+import { checkoutBranch, newBranchWorktree } from "./git.ts";
 import { depMet, ROOT_LANE } from "./model.ts";
 import { board, type BoardProject } from "./board.ts";
 import { installMod } from "./modinstall.ts";
@@ -50,13 +50,18 @@ Projects and worktrees
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
   hcoord project open [<slug>] [...]              the main checkout's coordinator (lane open for root)
-  hcoord lane open [<path>] [--space <id>] [--no-show] [--restart] [--fresh]
+  hcoord lane open [<path>] [--space <id> | --new-space <name>] [--no-show] [--restart] [--fresh]
                                                   start (or show) the coordinator of the worktree at
-                                                  <path> (default: here), registering it the first time
+                                                  <path> (default: here), registering it the first time;
+                                                  --new-space: in a new Herdr space of its own, so named
   hcoord lane list [<slug>] [--json]
   hcoord lane checkout <branch> [<slug>] [--json]  a worktree for an existing branch (where Herdr puts
                                                   them), registered; prints its path. Reuses the
                                                   checkout git already has for it
+  hcoord lane new <branch> [<slug>] [--base <ref>] [--json]
+                                                  a new branch (from the default branch, or <ref>) and
+                                                  a worktree for it where Herdr puts them, registered;
+                                                  prints its path
   hcoord lane remove <path> [--force] [--dry-run]  remove a linked worktree: its coordinator and
                                                   unfinished tasks stop, git worktree remove (--force:
                                                   even with uncommitted changes); its branch is kept
@@ -191,9 +196,16 @@ async function main(argv: string[]): Promise<number> {
     case "lane open": {
       const { positionals, values } = parse(
         rest,
-        { "no-show": { type: "boolean" }, space: { type: "string" }, restart: { type: "boolean" }, fresh: { type: "boolean" } },
+        {
+          "no-show": { type: "boolean" },
+          space: { type: "string" },
+          "new-space": { type: "string" },
+          restart: { type: "boolean" },
+          fresh: { type: "boolean" },
+        },
         1,
       );
+      if (values.space !== undefined && values["new-space"] !== undefined) throw new UsageError("use --space or --new-space, not both");
       const { meta, lane } = await laneForPath(positionals[0] ?? process.cwd());
       return report_(await openLane(meta.slug, lane, openOpts(values)));
     }
@@ -227,6 +239,16 @@ async function main(argv: string[]): Promise<number> {
       const { lane } = await laneForPath(co.path);
       if (values.json) json({ project: meta.slug, lane, path: co.path, branch: positionals[0], created: co.created });
       else out(`${co.created ? "checked out" : "already checked out:"} ${positionals[0]} at ${co.path} (worktree ${lane})`);
+      return 0;
+    }
+    case "lane new": {
+      const { positionals, values } = parse(rest, { base: { type: "string" } }, 2);
+      if (!positionals[0]) throw new UsageError("hcoord lane new <branch> [<slug>] [--base <ref>]");
+      const meta = loadProject(positionals[1] ?? defaultProjectSlug());
+      const made = newBranchWorktree(meta.repo, positionals[0], values.base);
+      const { lane } = await laneForPath(made.path);
+      if (values.json) json({ project: meta.slug, lane, path: made.path, branch: positionals[0], base: made.base, created: true });
+      else out(`made branch ${positionals[0]} (from ${made.base}) at ${made.path} (worktree ${lane})`);
       return 0;
     }
     case "lane list": {
@@ -450,7 +472,7 @@ function boardLine(p: BoardProject): string {
 }
 
 function openOpts(values: Record<string, any>) {
-  return { show: !values["no-show"], space: values.space, restart: values.restart, fresh: values.fresh };
+  return { show: !values["no-show"], space: values.space, newSpace: values["new-space"], restart: values.restart, fresh: values.fresh };
 }
 
 /** Prints an outcome's lines; exit 1 if any part failed. */

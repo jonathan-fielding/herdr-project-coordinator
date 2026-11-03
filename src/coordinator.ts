@@ -47,6 +47,9 @@ function pickSpace(path: string): string | null {
   return status?.space ?? local[0]?.id ?? null;
 }
 
+/** A space id Herdr hasn't seen (its own are "sp" and 32 hex digits). */
+const newSpaceId = () => `sp${crypto.randomUUID().replace(/-/g, "")}`;
+
 function tabOf(address: string): string | null {
   const ls = app(["ls"]);
   for (const s of ls?.spaces ?? []) {
@@ -102,6 +105,12 @@ export interface OpenOptions {
   show?: boolean;
   /** The Herdr space for it (default: the one whose folder is the worktree, else the shown one). */
   space?: string;
+  /**
+   * Show it in a new Herdr space of its own, with this name. Herdr makes a space for a labelled
+   * terminal whose space id it doesn't know, so the coordinator is the space's first and only tab:
+   * no shell shows before it, as it would in a space made with space.new.
+   */
+  newSpace?: string;
   /** A coordinator that came back from a reboot as a plain shell is replaced (resuming its session). */
   restart?: boolean;
   /** Start a new conversation even when an earlier session could be resumed. */
@@ -170,7 +179,8 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
   const resume = claude && !opts.fresh && !!earlier && !!findTranscript(earlier);
   const session = claude ? (resume ? earlier! : crypto.randomUUID()) : undefined;
 
-  const space = opts.show === false ? null : (opts.space ?? pickSpace(lane.path));
+  const newSpace = opts.show !== false && !!opts.newSpace && app(["status"]) !== null;
+  const space = opts.show === false ? null : newSpace ? newSpaceId() : (opts.space ?? pickSpace(lane.path));
   const tab = space ? `tbhcoord${(slug + laneKey).replace(/[^a-z0-9]/g, "")}${Date.now().toString(36)}` : null;
   const labels: Record<string, string> = { "hcoord.project": slug, "hcoord.lane": laneKey, "hcoord.role": "coordinator" };
   if (space && tab) Object.assign(labels, { "herdr.space": space, "herdr.tab": tab });
@@ -190,6 +200,10 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
       if (!adopted) await Bun.sleep(150);
     }
     if (adopted) {
+      if (newSpace) {
+        app(["do", "space.rename", "--id", space, "--name", opts.newSpace!]);
+        app(["do", "space.select", "--id", space]);
+      }
       app(["do", "tab.rename", "--id", tab, "--name", `coord ${laneKey}`]);
       app(["do", "agent.focus", "--terminal", term.address]);
       lines.push(`showing it in the tab "coord ${laneKey}"`);

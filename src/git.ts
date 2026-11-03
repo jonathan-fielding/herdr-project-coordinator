@@ -59,6 +59,35 @@ export function checkoutBranch(repo: string, branch: string): { path: string; cr
   return { path: realpathSync(path), created: true };
 }
 
+/**
+ * A new branch and a worktree for it, where Herdr's New worktree would put it. The branch starts at
+ * `base` (default: the repo's default branch, local else origin's, else the main checkout's HEAD)
+ * and tracks nothing. Refuses a bad branch name, a branch that exists, and a path that exists.
+ */
+export function newBranchWorktree(repo: string, branch: string, base?: string): { path: string; base: string } {
+  if (!branch || git(repo, ["check-ref-format", "--branch", branch]).code !== 0 || branch.startsWith("-")) {
+    throw new HcoordError(`${JSON.stringify(branch)} isn't a valid branch name`, 2);
+  }
+  if (branchExists(repo, branch)) {
+    throw new HcoordError(`branch ${branch} already exists; to open it: hcoord lane checkout ${branch}`);
+  }
+  if (remoteBranchExists(repo, branch)) {
+    throw new HcoordError(`branch ${branch} already exists on origin; to open it: hcoord lane checkout ${branch}`);
+  }
+  const path = herdrWorktreePath(repo, branch);
+  if (existsSync(path)) throw new HcoordError(`${path} already exists; move it away or pick another branch name`);
+  let from = base;
+  if (!from) {
+    const def = defaultBranch(repo);
+    from = def ? (branchExists(repo, def) ? def : `origin/${def}`) : "HEAD";
+  }
+  if (git(repo, ["rev-parse", "--verify", "--quiet", `${from}^{commit}`]).code !== 0) {
+    throw new HcoordError(`no commit ${from} in ${repo} to start ${branch} from`);
+  }
+  gitOk(repo, ["worktree", "add", "--no-track", "-b", branch, path, from], `creating worktree for ${branch}`);
+  return { path: realpathSync(path), base: from };
+}
+
 /** Worktree paths (realpath'd) and their branches. */
 export function listWorktrees(repo: string): { path: string; branch: string | null }[] {
   const out = gitOk(repo, ["worktree", "list", "--porcelain"], "listing worktrees");
