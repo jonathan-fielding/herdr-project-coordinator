@@ -33,6 +33,9 @@ import {
   type ReportState,
 } from "./workers.ts";
 import { addMemory, laneForPath, openLane, recoverProject } from "./coordinator.ts";
+import { hcGet, hcSend } from "./hc.ts";
+import { liveCoordinator } from "./workers.ts";
+import { loadConfig } from "./config.ts";
 import { renderLog } from "./log.ts";
 import { checkoutBranch, listBranches, newBranchWorktree } from "./git.ts";
 import { depMet, ROOT_LANE } from "./model.ts";
@@ -55,6 +58,9 @@ Projects and worktrees
                                                   <path> (default: here), registering it the first time;
                                                   --new-space: in a new Herdr space of its own, so named;
                                                   --no-focus: shown, but the focus stays (--json: its terminal)
+  hcoord lane say <path> (<text> | --file <file|->) [--space <id> | --new-space <name>] [--no-show]
+                                                  tell the worktree's coordinator something, as if typed
+                                                  to it (started first when it isn't running)
   hcoord lane list [<slug>] [--json]
   hcoord lane branches [<slug>] [--json]          the branches a new one can start from: local ones and
                                                   origin's with no local branch, by name; * the default
@@ -215,6 +221,20 @@ async function main(argv: string[]): Promise<number> {
       if (!values.json) return report_(o);
       json({ project: meta.slug, lane, ok: o.ok, terminal: o.terminal ?? null, lines: o.lines });
       return o.ok ? 0 : 1;
+    }
+    case "lane say": {
+      const { positionals, values } = parse(
+        rest,
+        { file: { type: "string" }, "no-show": { type: "boolean" }, space: { type: "string" }, "new-space": { type: "string" } },
+        Infinity,
+      );
+      if (values.space !== undefined && values["new-space"] !== undefined) throw new UsageError("use --space or --new-space, not both");
+      const [path, ...words] = positionals;
+      if (!path) throw new UsageError("hcoord lane say <path> <text>");
+      if (words.length && values.file !== undefined) throw new UsageError("give the text or --file, not both");
+      const text = (values.file !== undefined ? await readFileArg(values.file) : words.join(" ")).trim();
+      if (!text) throw new UsageError("hcoord lane say <path> <text>: the text is empty");
+      return report_(await sayToLane(path, text, openOpts(values)));
     }
     case "lane remove": {
       const { positionals, values } = parse(rest, { force: { type: "boolean" }, "dry-run": { type: "boolean" } }, 1);
@@ -484,6 +504,35 @@ function boardLine(p: BoardProject): string {
   for (const t of p.tasks) counts[t.state] = (counts[t.state] ?? 0) + 1;
   const summary = Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ") || "no tasks";
   return `${p.slug.padEnd(24)} ${summary}${p.trusted === false ? `  (Claude doesn't trust ${p.repo})` : ""}`;
+}
+
+/**
+ * Delivers text to a worktree's coordinator as if the person typed it. A coordinator that isn't
+ * running is started first (as lane open does); the text goes once it reports an agent status,
+ * i.e. Claude is up rather than its terminal still starting.
+ */
+async function sayToLane(path: string, text: string, opts: ReturnType<typeof openOpts>): Promise<Outcome> {
+  const { meta, lane } = await laneForPath(path);
+  const lines: string[] = [];
+  let c = liveCoordinator(meta, lane);
+  if (!c) {
+    const o = await openLane(meta.slug, lane, opts);
+    lines.push(...o.lines);
+    if (!o.ok) return { ok: false, lines };
+    c = liveCoordinator(loadProject(meta.slug), lane);
+    if (!c) return { ok: false, lines: [...lines, `worktree ${lane}'s coordinator didn't start; nothing sent`] };
+  }
+  if (loadConfig().agent.kind === "claude") {
+    for (const end = Date.now() + 60000; !hcGet(c.address)?.status && Date.now() < end; ) await Bun.sleep(250);
+    if (!hcGet(c.address)?.status) {
+      lines.push(`${c.name} (${c.address}) reports no agent status (at a prompt? Claude's trust question?); nothing sent`);
+      return { ok: false, lines };
+    }
+  }
+  const r = hcSend(c.address, text);
+  if (!r.ok) return { ok: false, lines: [...lines, `couldn't send to ${c.name} (${c.address}): ${r.error}`] };
+  lines.push(`sent to ${c.name} (${c.address})`);
+  return { ok: true, lines };
 }
 
 function openOpts(values: Record<string, any>) {
