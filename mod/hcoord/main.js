@@ -93,13 +93,21 @@ const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", widt
 const spaceName = (p, w) => (w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`);
 
 /** Starts (or shows) a worktree's coordinator: in `space`, else (`fresh`) in a new space Herdr makes around it,
- *  so its first tab is the coordinator, not a shell, else wherever hcoord puts it. */
-function openLane(p, w, { space = null, fresh = false, restart = false } = {}) {
+ *  so its first tab is the coordinator, not a shell, else wherever hcoord puts it. `noFocus`: hcoord leaves the
+ *  focus alone and the result's `terminal` is the coordinator's, for the caller to focus (once) itself. */
+async function openLane(p, w, { space = null, fresh = false, restart = false, noFocus = false } = {}) {
   const args = ["lane", "open", w.path];
   if (space) args.push("--space", space);
   else if (fresh) args.push("--new-space", spaceName(p, w));
   if (restart) args.push("--restart");
-  return hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+  if (noFocus) args.push("--no-focus", "--json");
+  const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+  if (!noFocus) return r;
+  let out = null;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {}
+  return { ...r, terminal: out?.terminal ?? null, text: out?.lines ? out.lines.join("\n") : r.text };
 }
 
 export default class Projects extends View {
@@ -1156,9 +1164,12 @@ export default class Projects extends View {
     this.busyNew = "Starting its coordinator…";
     cx.notify();
     const p = { slug: n.project, name: n.name };
-    const r = await openLane(p, m.w, { fresh: true });
+    // hcoord makes the space around the coordinator and names it, but doesn't go there: the dialog closes
+    // first, then one agent.focus goes to the new space, so the only switch is to it, once it's ready.
+    const r = await openLane(p, m.w, { fresh: true, noFocus: true });
     this.busyNew = null;
     closeOverlay(props().overlay);
+    if (r.terminal) run("agent.focus", { terminal: r.terminal });
     if (!r.ok) notify({ title: `Couldn't start ${spaceName(p, m.w)}'s coordinator`, body: r.text, level: "error", timeout: 12000 });
   }
 

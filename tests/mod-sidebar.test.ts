@@ -26,6 +26,8 @@ const world = {
   overlays: [] as any[],
   closed: [] as string[],
   notes: [] as any[],
+  /** Everything the mod asked of Herdr and hcoord, in order: "run <name>", "close <id>", "hcoord <args…>". */
+  events: [] as string[],
   /** Answers for hcoord commands by their first two words ("lane new"), else "{}". */
   answers: {} as Record<string, { code: number; stdout: string; stderr: string }>,
 };
@@ -60,9 +62,13 @@ mock.module("herdr", () => ({
   panes: () => world.panes,
   spaces: () => world.spaces,
   focused: () => (world.focused ? { space: world.focused } : null),
-  run: (name: string, args: any) => void world.runs.push([name, args]),
+  run: (name: string, args: any) => {
+    world.runs.push([name, args]);
+    world.events.push(`run ${name} ${JSON.stringify(args)}`);
+  },
   exec: async (cmd: string, args: string[]) => {
     world.calls.push([cmd, ...args]);
+    world.events.push([cmd, ...args].join(" "));
     const answer = world.answers[args.slice(0, 2).join(" ")];
     if (answer) return answer;
     if (args[0] === "board") {
@@ -81,7 +87,10 @@ mock.module("herdr", () => ({
   home: () => "/home",
   props: () => world.props,
   openOverlay: (o: any) => void world.overlays.push(o),
-  closeOverlay: (id: string) => void world.closed.push(id),
+  closeOverlay: (id: string) => {
+    world.closed.push(id);
+    world.events.push(`close ${id}`);
+  },
 }));
 (globalThis as any).localStorage ??= { getItem: () => null, setItem: () => {} };
 
@@ -125,6 +134,7 @@ beforeEach(() => {
   world.overlays = [];
   world.closed = [];
   world.notes = [];
+  world.events = [];
   world.answers = {};
   inputs.length = 0;
 });
@@ -258,11 +268,40 @@ describe("new worktree", () => {
     await cx.settle();
 
     expect(world.calls).toContainEqual(["hcoord", "lane", "new", "feature", "r", "--base", "develop", "--json"]);
-    expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/.herdr/worktrees/r/feature", "--new-space", "r · feature"]]);
+    expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/.herdr/worktrees/r/feature", "--new-space", "r · feature", "--no-focus", "--json"]]);
     expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
     expect(world.closed).toEqual(["ov1"]);
     expect(d.busyNew).toBe(null);
     expect(world.notes).toHaveLength(0);
+  });
+
+  test("it lands on the new space once: hcoord doesn't focus, the dialog closes, then one agent.focus of the new coordinator", async () => {
+    world.focused = "s1"; // the project's space, focused when the dialog opened
+    world.answers["lane new"] = made("feature");
+    world.answers["lane open"] = { code: 0, stdout: JSON.stringify({ project: "r", lane: "feature", ok: true, terminal: "t9", lines: ["started coordinator"] }), stderr: "" };
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    branch.text = "feature";
+    await d.createWorktree(cx);
+    await cx.settle();
+
+    const at = (prefix: string) => world.events.findIndex((e) => e.startsWith(prefix));
+    expect(at("hcoord lane open")).toBeGreaterThan(-1);
+    expect(at("close ov1")).toBeGreaterThan(at("hcoord lane open"));
+    expect(world.events.slice(at("close ov1"))).toEqual(["close ov1", `run agent.focus {"terminal":"t9"}`]);
+    // Nothing goes to any other space, the one it was opened from included.
+    expect(world.runs.filter(([name]) => name === "space.select" || name === "agent.focus")).toEqual([["agent.focus", { terminal: "t9" }]]);
+    expect(world.notes).toHaveLength(0);
+  });
+
+  test("if the coordinator couldn't start, the dialog closes without moving the focus and says why", async () => {
+    world.answers["lane new"] = made("feature");
+    world.answers["lane open"] = { code: 1, stdout: "", stderr: "hcoord: worktree feature is gone\n" };
+    const { d, cx, branch } = dialog({ props: { newWorktree: { project: "r", name: "r", defaultBranch: "main" } } });
+    branch.text = "feature";
+    await d.createWorktree(cx);
+    expect(world.closed).toEqual(["ov1"]);
+    expect(world.runs).toHaveLength(0);
+    expect(world.notes[0]?.body).toContain("is gone");
   });
 
   test("without a base hcoord picks it; it is busy while it runs and can't be sent twice", async () => {
