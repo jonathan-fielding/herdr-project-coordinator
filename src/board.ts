@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { claudeTrusts } from "./agents.ts";
 import { loadConfig } from "./config.ts";
 import { defaultBranch, herdrWorktreePath, listWorktrees } from "./git.ts";
-import { depMet, ROOT_LANE, type Task, type TaskState } from "./model.ts";
+import { depMet, isWorkerBranch, ROOT_LANE, type Task, type TaskState } from "./model.ts";
 import { paths, root, rootWarning } from "./paths.ts";
 import { byNumber } from "./render.ts";
 import { listProjects, loadTasks, type CoordinatorRef } from "./store.ts";
@@ -92,7 +92,9 @@ export function board(): Board {
     const all = new Map(tasks.map((t) => [t.id, t]));
     let checkouts: { path: string; branch: string | null }[] = [];
     try {
-      checkouts = listWorktrees(meta.repo).filter((w) => !w.path.startsWith(config.worktreeRoot + "/"));
+      checkouts = listWorktrees(meta.repo).filter(
+        (w) => !w.path.startsWith(config.worktreeRoot + "/") && (w.path === meta.repo || !isWorkerBranch(w.branch)),
+      );
     } catch {
       // The repo is gone or unreadable: no checkouts to match.
     }

@@ -95,6 +95,59 @@ describe("project open", () => {
     await until("DM-1 merged", () => tasks()[0]!.state === "merged");
     await until("the report in the coordinator", () => inbox().includes("DM-1 done (merged into"));
   }, 60_000);
+
+  const holder = (labels: Record<string, string>) =>
+    core.hc("run", "--bg", "--no-parent", "--name", "coord-dm-root", "--cwd", repo,
+      ...Object.entries(labels).flatMap(([k, v]) => ["--label", `${k}=${v}`]), "--", "sleep", "300").address as string;
+  const OURS = { "hcoord.project": "demo", "hcoord.lane": "root", "hcoord.role": "coordinator" };
+
+  test("an earlier coordinator of the same worktree that hcoord lost track of is taken back", async () => {
+    setup();
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    const address = holder(OURS);
+    expect(await ok("project", "open", "demo", "--no-show")).toContain(`took back the running coordinator coord-dm-root (${address})`);
+    expect(meta().lanes.root.coordinator).toEqual({ address, name: "coord-dm-root" });
+    expect(await ok("project", "open", "demo", "--no-show")).toContain("is already running");
+  }, 30_000);
+
+  test("with Claude, an earlier coordinator that's now a plain shell is replaced", async () => {
+    setup();
+    // A "claude" that ignores hcoord's flags and reports no agent status, like the shell left behind.
+    const cfg = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+    writeFileSync(join(home, "config.json"), JSON.stringify({ ...cfg, agent: { kind: "claude", command: ["sh", "-c", "sleep 300"] } }));
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    const old = holder(OURS);
+    const out = await ok("project", "open", "demo", "--no-show");
+    expect(out).toContain(`stopped coord-dm-root (${old}): an earlier coordinator of this worktree`);
+    expect(out).toContain("started coordinator coord-dm-root");
+    expect(meta().lanes.root.coordinator.address).not.toBe(old);
+  }, 30_000);
+
+  test("someone else's terminal holding the name is left alone", async () => {
+    setup();
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    const other = holder({ "hcoord.project": "other", "hcoord.lane": "root", "hcoord.role": "coordinator" });
+    const r = await hcoord("project", "open", "demo", "--no-show");
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("isn't this worktree's coordinator");
+    expect(core.hc("get", other).state).toBe("live");
+    core.hc("kill", other);
+  }, 30_000);
+
+  test("a worker's checkout from another data folder is never a worktree", async () => {
+    setup();
+    await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");
+    const old = tempDir("oldwt");
+    rmSync(old, { recursive: true });
+    git(repo, "worktree", "add", "-q", "-b", "coord/dark-mode/dm-3-dark-pages", old);
+    const r = await hcoord("lane", "open", old, "--no-show");
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain("is a worker's checkout");
+    expect(Object.keys(meta().lanes)).toEqual(["root"]);
+    const b = JSON.parse(await ok("board", "--json"));
+    expect(b.projects[0].checkouts.map((c: any) => c.path)).toEqual([repo]);
+    rmSync(old, { recursive: true, force: true });
+  }, 30_000);
 });
 
 describe("worker-stopped (the Claude Stop hook)", () => {

@@ -146,6 +146,14 @@ export function branchFor(id: string, title: string, lane: string): string {
   return `coord/${lane}/${id.toLowerCase()}${s ? `-${s}` : ""}`;
 }
 
+/**
+ * Whether a branch is an hcoord worker's ("coord/<lane>/<id>-…"), from this data folder or any
+ * other (an old or test one): its checkout is never a worktree to coordinate.
+ */
+export function isWorkerBranch(branch: string | null | undefined): boolean {
+  return !!branch && /^coord\/[^/]+\/[a-z][a-z0-9]{1,7}-\d+(-|$)/.test(branch);
+}
+
 /** The main checkout's lane key. Other worktrees are keyed by their branch's slug. */
 export const ROOT_LANE = "root";
 export const LANE_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;

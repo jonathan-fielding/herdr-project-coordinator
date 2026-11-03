@@ -6,7 +6,7 @@ import { HcoordError } from "./errors.ts";
 import { withLock } from "./fsutil.ts";
 import { hcGet, hcKill, hcRunBg } from "./hc.ts";
 import { findTranscript } from "./log.ts";
-import { LANE_RE, ROOT_LANE, slugify } from "./model.ts";
+import { isWorkerBranch, LANE_RE, ROOT_LANE, slugify } from "./model.ts";
 import { paths } from "./paths.ts";
 import {
   checkoutOf,
@@ -68,7 +68,9 @@ export async function laneForPath(path: string): Promise<{ meta: ProjectMeta; la
     throw new HcoordError(`${co.main} isn't a project yet: hcoord project new ${basename(co.main)} --repo ${co.main}`);
   }
   const wtRoot = loadConfig().worktreeRoot;
-  if (co.top.startsWith(wtRoot + "/")) throw new HcoordError(`${co.top} is a worker's checkout, not a worktree to coordinate`);
+  if (co.top.startsWith(wtRoot + "/") || (co.top !== meta.repo && isWorkerBranch(co.branch))) {
+    throw new HcoordError(`${co.top} is a worker's checkout, not a worktree to coordinate`);
+  }
   if (co.top === meta.repo) return { meta, lane: ROOT_LANE };
   const known = Object.entries(meta.lanes).find(([, l]) => l.path === co.top);
   if (known) return { meta, lane: known[0] };
@@ -141,8 +143,26 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
     if (!shown) lines.push(`attach with: hc attach ${live.address}`);
     return { ok: true, lines };
   }
-  if (hcGet(name)?.state === "live") {
-    throw new HcoordError(`a terminal named ${name} is running but isn't this worktree's coordinator; stop it (hc kill ${name}) first`);
+  const holder = hcGet(name);
+  if (holder?.state === "live") {
+    // Our name is taken. An earlier coordinator of this same worktree that hcoord lost track of (the
+    // project was made again, or its record was lost) carries our labels: take it back, or replace
+    // it when it's only a shell now. Anything else is someone else's terminal: leave it alone.
+    const l = holder.labels ?? {};
+    const ours = l["hcoord.project"] === slug && l["hcoord.lane"] === laneKey && l["hcoord.role"] === "coordinator";
+    if (!ours) {
+      throw new HcoordError(`a terminal named ${name} is running but isn't this worktree's coordinator; stop it (hc kill ${name}) first`);
+    }
+    if (claude && !holder.status) {
+      hcKill(holder.address);
+      lines.push(`stopped ${name} (${holder.address}): an earlier coordinator of this worktree, now a plain shell`);
+    } else {
+      await saveCoordinator(slug, laneKey, { address: holder.address, name });
+      const shown = opts.show !== false && app(["do", "agent.focus", "--terminal", holder.address]) !== null;
+      lines.push(`took back the running coordinator ${name} (${holder.address})${shown ? "; showing it" : ""}`);
+      if (!shown) lines.push(`attach with: hc attach ${holder.address}`);
+      return { ok: true, lines };
+    }
   }
 
   // Carry on the earlier conversation when there was one and its transcript is still there.
