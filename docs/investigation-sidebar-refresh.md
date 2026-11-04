@@ -14,15 +14,15 @@ The data itself is cheap to load (about 45 ms in-process, about 60 ms as `bun sr
 
 ### 1. What the sidebar shows and where it comes from
 
-- The mod holds one snapshot, `this.data`. It's the parsed output of `hcoord board --json` (`mod/hcoord/main.js:80`, `:122-124`).
-- Worktree rows come from `worktrees(p)` (`mod/hcoord/main.js:195-211`), which uses three fields of that snapshot:
+- The mod holds one snapshot, `this.data`. It's the parsed output of `hcoord board --json` (`mods/hcoord/main.js:80`, `:122-124`).
+- Worktree rows come from `worktrees(p)` (`mods/hcoord/main.js:195-211`), which uses three fields of that snapshot:
   - `p.checkouts`: every checkout git knows, from `listWorktrees(meta.repo)`, i.e. `git worktree list --porcelain` (`src/board.ts:95-97`, `src/git.ts:63-73`). hcoord's own worker checkouts are left out.
   - `p.lanes`: registered worktrees from `project.json` (`src/board.ts:109-117`).
   - `p.defaultBranch`: from `defaultBranch()` (`src/board.ts:101-108`, `src/git.ts:25-33`).
 - `board()` only reads; it never caches or writes anything (`src/board.ts:87-133`). Each run spawns a fresh `bun`. For each project it runs `git worktree list`, `git symbolic-ref`, maybe `git config` and a few `git show-ref`s, and parses `~/.claude.json` once (`src/agents.ts:115-132`). There's no stale cache anywhere in this path.
 - The sidebar doesn't list branches. It lists checkouts, plus the default branch when nothing has it checked out. A new branch with no worktree never shows up, by design (`docs/design-worktrees.md:66-72`). "New branch" in practice means a new worktree on that branch, or a checkout that switched branch.
 
-### 2. What makes it reload (`refresh`, `mod/hcoord/main.js:112-134`)
+### 2. What makes it reload (`refresh`, `mods/hcoord/main.js:112-134`)
 
 `refresh()` runs `hcoord board --json`. If a run is already going, it queues one more (`this.again`). Its callers:
 
@@ -97,7 +97,7 @@ Recommended: 1 + 2 together, about ten lines in `main.js`. They fix the common `
 
 ## Implemented (HCM-6)
 
-Fixes 1, 2 and 3 are in `mod/hcoord/main.js`; fix 4 (watching `.git`) isn't.
+Fixes 1, 2 and 3 are in `mods/hcoord/main.js`; fix 4 (watching `.git`) isn't.
 
 - **Fix 1:** `lookAtNewSpaces` calls `this.refresh(cx)` when a new space's repo is already a project but its folder isn't a known checkout. Rows for the `+` dialog show about 2 s after the space appears.
 - **Fix 2:** `followSpace` hands the space to `startFor()`. When the board doesn't know the space's worktree yet, it's kept as `this.pendingSpace`. `retryPendingSpace()` runs once after each board load. It starts the coordinator once the worktree is known, and drops the pending space when the focus has moved. Starting the coordinator clears it, so there's no loop.

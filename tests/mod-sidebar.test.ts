@@ -1,4 +1,4 @@
-// The sidebar mod (mod/hcoord/main.js) runs inside Herdr; here it's loaded with stand-ins for Herdr's
+// The sidebar mod (mods/hcoord/main.js) runs inside Herdr; here it's loaded with stand-ins for Herdr's
 // modules so its refresh and follow-the-space logic can be checked without the app.
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFileSync, writeFileSync } from "node:fs";
@@ -6,9 +6,13 @@ import { join } from "node:path";
 import { tempDir } from "./helpers.ts";
 
 // A copy of the mod beside the hcoord-path.js that `hcoord mod install` would write.
+const SOURCE = join(import.meta.dir, "..", "mods", "hcoord");
 const MOD = tempDir("mod");
-copyFileSync(join(import.meta.dir, "..", "mod", "hcoord", "main.js"), join(MOD, "main.js"));
+copyFileSync(join(SOURCE, "main.js"), join(MOD, "main.js"));
 writeFileSync(join(MOD, "hcoord-path.js"), 'export const HCOORD = ["hcoord"];\n');
+// And a plain copy of the folder, as Herdr's gallery makes: nothing has set hcoord up.
+const COPY = tempDir("mod-copy");
+for (const f of ["main.js", "hcoord-path.js"]) copyFileSync(join(SOURCE, f), join(COPY, f));
 
 // What the stand-in Herdr reports, changed by each test.
 const world = {
@@ -30,12 +34,16 @@ const world = {
   events: [] as string[],
   /** Answers for hcoord commands by their first two words ("lane new"), else "{}". */
   answers: {} as Record<string, { code: number; stdout: string; stderr: string }>,
+  /** Set: exec of hcoord fails with this, as when its program is gone. */
+  execError: null as Error | null,
+  layout: null as any,
+  picked: 0,
 };
 
 /** A stand-in text field: a value, and handlers the test can fire. */
 class FakeInput {
   text: string;
-  handlers: Record<string, (e: any, cx: any) => void> = {};
+  handlers: any = {};
   constructor(o: { value?: string }) {
     this.text = o.value ?? "";
   }
@@ -57,8 +65,27 @@ class FakeInput {
 }
 const inputs: FakeInput[] = [];
 
-mock.module("gpui-kit", () => ({ View: class {}, div: () => ({}), svg: () => ({}) }));
-mock.module("gpui-base", () => ({ v_flex: () => ({}), h_flex: () => ({}), TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
+/** A stand-in element: any builder call chains; children, ids and clicks are kept for the test to read. */
+function el(...args: any[]) {
+  const node: any = { args, kids: [] as any[], elementId: null, click: null };
+  const self: any = new Proxy(node, {
+    get(n, k) {
+      if (k in n) return n[k];
+      if (k === "child") return (c: any) => (n.kids.push(c), self);
+      if (k === "children") return (cs: any[]) => (n.kids.push(...cs), self);
+      if (k === "when") return (c: any, f: (e: any) => any) => (c ? f(self) : self);
+      if (k === "id") return (id: string) => ((n.elementId = id), self);
+      if (k === "on_click") return (f: any) => ((n.click = f), self);
+      return () => self;
+    },
+  });
+  return self;
+}
+const walk = (e: any): any[] => (e?.kids ? [e, ...e.kids.flatMap(walk)] : [e]);
+const textOf = (e: any) => walk(e).filter((x) => typeof x === "string").join(" ");
+
+mock.module("gpui-kit", () => ({ View: class {}, div: el, svg: el }));
+mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => world.agents,
   terminals: () => world.terminals,
@@ -72,6 +99,7 @@ mock.module("herdr", () => ({
   exec: async (cmd: string, args: string[]) => {
     world.calls.push([cmd, ...args]);
     world.events.push([cmd, ...args].join(" "));
+    if (world.execError && cmd !== "git") throw world.execError;
     const answer = world.answers[args.slice(0, 2).join(" ")];
     if (answer) return answer;
     if (args[0] === "board") {
@@ -84,9 +112,9 @@ mock.module("herdr", () => ({
   theme: () => ({}),
   notify: (n: any) => void world.notes.push(n),
   nextCommand: () => new Promise(() => {}),
-  pickFolder: async () => null,
+  pickFolder: async () => (world.picked++, null),
   watchFolder: () => new Promise(() => {}),
-  layout: () => null,
+  layout: () => world.layout,
   home: () => "/home",
   props: () => world.props,
   openOverlay: (o: any) => void world.overlays.push(o),
@@ -100,6 +128,7 @@ mock.module("herdr", () => ({
 (globalThis as any).localStorage ??= { getItem: () => null, setItem: () => {} };
 
 const { default: Projects } = await import(join(MOD, "main.js"));
+const { default: PlainCopy } = await import(join(COPY, "main.js"));
 
 /** A stand-in cx. Some spawned tasks never end (the folder watch, the command loop), so settle()
  *  just lets the stand-in calls, which answer at once, run through. */
@@ -141,16 +170,112 @@ beforeEach(() => {
   world.notes = [];
   world.events = [];
   world.answers = {};
+  world.execError = null;
+  world.picked = 0;
+  world.layout = null;
   inputs.length = 0;
 });
 
-async function start() {
+async function start(View: any = Projects) {
   const cx = makeCx();
-  const v: any = new Projects();
+  const v: any = new View();
   v.init({}, cx);
   await cx.settle();
   return { v, cx };
 }
+
+describe("when the CLI can't be run", () => {
+  const URL = "https://github.com/jonathan-fielding/herdr-project-coordinator";
+  const fireTimers = async (cx: any) => {
+    for (const t of world.timers) t.fn(cx);
+    await cx.settle();
+  };
+  const hcoordCalls = () => world.calls.filter((c) => c[0] !== "git");
+  const expectNotice = (v: any, cx: any) => {
+    const tree = v.render(cx);
+    expect(textOf(tree)).toContain("needs hcoord's CLI");
+    expect(textOf(tree)).toContain(URL);
+    expect(textOf(tree)).not.toContain("hcoord:"); // the error line
+    expect(walk(tree).some((e) => e?.elementId === "hc-new")).toBe(false); // nothing to make a project with
+    return tree;
+  };
+
+  test("a plain copy shows the not-set-up state and never tries to run anything", async () => {
+    const { v, cx } = await start(PlainCopy);
+    await fireTimers(cx);
+    v.refresh(cx);
+    await cx.settle();
+    const tree = expectNotice(v, cx);
+    expect(world.calls).toEqual([]);
+    expect(world.notes).toEqual([]);
+    let opened = "";
+    walk(tree).find((e) => e?.elementId === "hc-setup").click(null, { open_url: (u: string) => (opened = u) });
+    expect(opened).toBe(URL);
+  });
+
+  test("the narrow rail says it too, in place of the new project button", async () => {
+    world.layout = { id: "sidebar", size: { px: 44 } };
+    const { v, cx } = await start(PlainCopy);
+    const tree = v.render(cx);
+    expect(walk(tree).some((e) => e?.elementId === "hc-setup")).toBe(true);
+    expect(walk(tree).some((e) => e?.elementId === "hc-new")).toBe(false);
+  });
+
+  test("the new project command does nothing, rather than ask for a folder it can't use", async () => {
+    const { v, cx } = await start(PlainCopy);
+    await v.newProject(cx);
+    expect(world.picked).toBe(0);
+  });
+
+  test("exec failing shows the same state, quietly, and is tried again now and then until it works", async () => {
+    world.execError = new Error("No such file or directory");
+    const { v, cx } = await start();
+    expectNotice(v, cx);
+    expect(hcoordCalls()).toHaveLength(1);
+    expect(world.notes).toEqual([]);
+
+    await fireTimers(cx); // the 8s fallback doesn't try every time
+    v.refresh(cx);
+    await cx.settle();
+    expect(hcoordCalls()).toHaveLength(1);
+
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + 61000;
+      await fireTimers(cx);
+      expect(hcoordCalls()).toHaveLength(2); // still failing: quiet
+      expectNotice(v, cx);
+
+      world.execError = null;
+      Date.now = () => realNow() + 122000;
+      await fireTimers(cx);
+    } finally {
+      Date.now = realNow;
+    }
+    expect(v.notSetUp).toBe(false);
+    expect(textOf(v.render(cx))).not.toContain("needs hcoord's CLI");
+    expect(walk(v.render(cx)).some((e) => e?.elementId === "hc-new")).toBe(true);
+  });
+
+  for (const [what, code, stderr] of [
+    ["bun has gone", 127, "env: bun: No such file or directory"],
+    ["the clone holding cli.ts has moved", 1, 'error: Module not found "/old/src/cli.ts"'],
+  ] as const) {
+    test(`${what} counts too`, async () => {
+      world.answers["board --json"] = { code, stdout: "", stderr };
+      const { v, cx } = await start();
+      expectNotice(v, cx);
+    });
+  }
+
+  test("a board command that ran and failed is still an error, shown as one", async () => {
+    world.answers["board --json"] = { code: 1, stdout: "", stderr: "hcoord: tasks.json is broken" };
+    const { v, cx } = await start();
+    expect(v.notSetUp).toBe(false);
+    expect(textOf(v.render(cx))).toContain("tasks.json is broken");
+    expect(textOf(v.render(cx))).not.toContain("needs hcoord's CLI");
+  });
+});
 
 describe("sidebar refresh", () => {
   test("has its own, shorter fallback interval", async () => {
