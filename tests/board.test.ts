@@ -1,6 +1,6 @@
 /** hcoord board / sync / mod install, and mutations that change nothing writing nothing. */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cli, tempDir, tempRepo } from "./helpers.ts";
 
@@ -120,5 +120,26 @@ describe("mod install", () => {
     const again = await cli(home, ["mod", "install", "--temp"], undefined, env);
     expect(again.code).toBe(1);
     expect(again.stderr).toContain("wasn't installed by hcoord");
+  });
+
+  test("a plain copy of mods/hcoord works as it is, and install turns it into a real install", async () => {
+    setup();
+    app = tempDir("herdr-app");
+    const dest = join(app, "mods", "hcoord");
+    const source = join(import.meta.dir, "..", "mods", "hcoord");
+    const committed = readFileSync(join(source, "hcoord-path.js"), "utf8");
+    // Gallery folders hold just their own files: the default must not need `mod install` to load.
+    expect(committed).toContain("export const HCOORD = null;");
+    mkdirSync(join(app, "mods"));
+    cpSync(source, dest, { recursive: true });
+
+    const r = await cli(home, ["mod", "install", "--temp"], undefined, { ...process.env, HERDR_APP_HOME: app });
+    expect(r.code).toBe(0);
+    const path = readFileSync(join(dest, "hcoord-path.js"), "utf8");
+    expect(path).toMatch(/src\/cli\.ts"\]/);
+    expect(path).not.toContain("HCOORD = null");
+    expect(existsSync(join(dest, ".hcoord-installed"))).toBe(true);
+    // The repo's own file is the default still.
+    expect(readFileSync(join(source, "hcoord-path.js"), "utf8")).toBe(committed);
   });
 });

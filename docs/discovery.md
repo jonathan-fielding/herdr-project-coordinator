@@ -168,7 +168,8 @@ All test terminals (`disc-env`, `disc-parent`, `disc-orphan`, `disc-dies`, `disc
   `flex_1` scrolling list inside collapses to nothing; `"overlay": {"width", "height"}` fixes that.
 - Reinstalling a mod (saving its files) closes its open overlay.
 - A mod's `exec` takes no environment, so the installed `hcoord-path.js` names bun and `cli.ts` exactly (and goes
-  through `env HCOORD_HOME=…` for a non-default root). The app's PATH doesn't matter.
+  through `env HCOORD_HOME=…` for a non-default root). The app's PATH doesn't matter. The repo's own `hcoord-path.js`
+  is a default (`HCOORD = null`), so a plain copy of the folder loads and shows how to set hcoord up.
 - `mutate` used to rewrite tasks.json even when nothing changed (schedule with only blocked queued tasks). With a
   folder watch on `projects/` that would loop; it now writes only when something changed.
 - Verified in the real window: a click on a project with no space ran `space.new` + `hcoord project open`; Herdr took the

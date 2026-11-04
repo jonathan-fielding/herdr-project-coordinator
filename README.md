@@ -120,7 +120,13 @@ hcoord mod install
 herdr-app check ~/.config/herdr-app/mods/hcoord
 ```
 
-This copies the section to `~/.config/herdr-app/mods/hcoord`. Run `hcoord mod install` again after you pull changes or edit `mod/hcoord/`. Don't edit the installed copy: the next install overwrites it.
+This copies the section to `~/.config/herdr-app/mods/hcoord`. Run `hcoord mod install` again after you pull changes or edit `mods/hcoord/`. Don't edit the installed copy: the next install overwrites it.
+
+### From the Herdr mod gallery
+
+Herdr's gallery copies `mods/hcoord/` into `~/.config/herdr-app/mods/hcoord` and runs `herdr-app check`. That gives you the Projects section and nothing else: the section is a front end for the `hcoord` CLI, which the gallery doesn't install. Until the CLI is set up, the section says so and links here.
+
+To finish, do steps 1 and 2 above, then run `hcoord mod install`. It takes over the gallery copy and records where your bun and `cli.ts` are. Step 4 still applies: the gallery doesn't place the section in your sidebar either.
 
 ### 4. Add the section to your sidebar
 
@@ -289,7 +295,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 
 ### How it's built
 
-- `mod/hcoord/`: the Projects section, a Herdr mod. It reads `hcoord board --json` and calls the CLI for everything else.
+- `mods/hcoord/`: the Projects section, a Herdr mod. It reads `hcoord board --json` and calls the CLI for everything else. The repo is shaped the way Herdr's mod gallery expects, so this folder loads when simply copied; `hcoord-path.js` holds a default there, and `hcoord mod install` writes the real path into the installed copy only.
 - `plugin/`: the coordinator skill, loaded into each coordinator with `--plugin-dir`, so there's nothing extra to install.
 - `src/`: the `hcoord` CLI. It starts agents through herdr-core and keeps state in the data folder.
 - `docs/`: `discovery.md` covers how herdr-core behaves, and `design-worktrees.md` covers the worktree model.

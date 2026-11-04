@@ -7,7 +7,7 @@ import { root, rootWarning } from "./paths.ts";
 import type { Outcome } from "./workers.ts";
 
 export const MOD_NAME = "hcoord";
-export const MOD_SOURCE = resolve(import.meta.dir, "..", "mod", MOD_NAME);
+export const MOD_SOURCE = resolve(import.meta.dir, "..", "mods", MOD_NAME);
 const CLI = resolve(import.meta.dir, "cli.ts");
 /** Marks a mod folder as hcoord's, so install never replaces someone else's. Hidden: Herdr ignores it. */
 const MARKER = ".hcoord-installed";
@@ -29,6 +29,12 @@ export function pathModule(): string {
   return `// Written by \`hcoord mod install\`: how this mod runs hcoord.\nexport const HCOORD = ${JSON.stringify(argv)};\n`;
 }
 
+/** mods/hcoord copied as it is (Herdr's gallery does this): still hcoord's, just not set up. */
+function isPlainCopy(dest: string): boolean {
+  const path = join(dest, "hcoord-path.js");
+  return existsSync(path) && /\bHCOORD = null\b/.test(readFileSync(path, "utf8"));
+}
+
 export function installMod(opts: { temp?: boolean } = {}): Outcome {
   const dest = modDir();
   // The mod would keep using that folder long after it's gone (that happened once already).
@@ -38,10 +44,11 @@ export function installMod(opts: { temp?: boolean } = {}): Outcome {
   if (!existsSync(join(herdrAppHome(), "mods"))) {
     throw new HcoordError(`no Herdr mods folder at ${join(herdrAppHome(), "mods")}: is the Herdr app installed? ($HERDR_APP_HOME overrides)`);
   }
-  if (existsSync(dest) && !existsSync(join(dest, MARKER))) {
+  if (existsSync(dest) && !existsSync(join(dest, MARKER)) && !isPlainCopy(dest)) {
     throw new HcoordError(`${dest} exists and wasn't installed by hcoord; move it away first`);
   }
   mkdirSync(dest, { recursive: true });
+  // Only the installed copy gets the real path: the repo's hcoord-path.js stays the committed default.
   const files = readdirSync(MOD_SOURCE).filter((f) => !f.startsWith(".") && f !== "hcoord-path.js");
   // Code last: Herdr reloads on every save, and main.js imports hcoord-path.js.
   writeFileSync(join(dest, MARKER), `${MOD_SOURCE}\n`);
