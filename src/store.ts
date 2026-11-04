@@ -1,6 +1,8 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import { ensureRoot } from "./config.ts";
 import { HcoordError } from "./errors.ts";
+import { assertCanGitInit, filesToCommit, gitInit, insideGitRepo } from "./git.ts";
 import { atomicWrite, readJson, withLock } from "./fsutil.ts";
 import { branchFor, defaultPrefix, PREFIX_RE, ROOT_LANE, slugify, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
@@ -183,24 +185,73 @@ function projectMdStub(meta: ProjectMeta): string {
   ].join("\n");
 }
 
-export async function createProject(opts: { name: string; repo: string; prefix?: string }): Promise<ProjectMeta> {
+export interface NewProject {
+  name: string;
+  repo: string;
+  prefix?: string;
+  /** Make a plain folder a repo with a first commit. Changes nothing for one already in a repo. */
+  gitInit?: boolean;
+}
+
+/** Every check that can refuse a new project and doesn't need the root lock. Changes nothing. */
+function planProject(opts: NewProject) {
   const name = opts.name.trim();
   const slug = slugify(name);
   if (!slug) throw new HcoordError(`can't make a folder name from "${opts.name}"`, 2);
+  const init = !!opts.gitInit && !insideGitRepo(opts.repo);
+  if (init) assertCanGitInit(opts.repo);
   // A worktree's path names its repo: the project is the main checkout.
-  const { main: repo } = checkoutOf(opts.repo);
-  const branch = checkoutOf(repo).branch;
+  const repo = init ? realpathSync(opts.repo) : checkoutOf(opts.repo).main;
   const prefix = (opts.prefix ?? defaultPrefix(name)).toUpperCase();
   if (!PREFIX_RE.test(prefix)) {
     throw new HcoordError(`prefix "${prefix}" must be 2-8 letters/digits starting with a letter (use --prefix)`, 2);
   }
+  return { name, slug, prefix, repo, init };
+}
+
+function assertProjectFree(slug: string, prefix: string, repo: string): void {
+  if (existsSync(paths.project(slug))) throw new HcoordError(`project "${slug}" already exists`);
+  const clash = listProjects().find((p) => p.prefix === prefix);
+  if (clash) throw new HcoordError(`prefix ${prefix} is used by "${clash.slug}"; pick another with --prefix`);
+  const same = listProjects().find((p) => p.repo === repo);
+  if (same) throw new HcoordError(`${repo} is already project "${same.slug}"`);
+}
+
+/** What `project new --git-init --dry-run` reports. */
+export interface GitInitPreview {
+  repo: string;
+  /** Whether a real run would init; false for a folder already in a repo. */
+  gitInit: boolean;
+  /** Relative paths the first commit would hold, at most GIT_INIT_PREVIEW_FILES of them. */
+  files: string[];
+  /** All of them, however many `files` shows. */
+  count: number;
+  hasGitignore: boolean;
+}
+
+const GIT_INIT_PREVIEW_FILES = 200;
+
+/** What createProject with gitInit would do, refusing what it would refuse. Changes nothing. */
+export function previewGitInit(opts: NewProject): GitInitPreview {
+  const { slug, prefix, repo, init } = planProject({ ...opts, gitInit: true });
+  assertProjectFree(slug, prefix, repo);
+  const files = init ? filesToCommit(repo) : [];
+  return {
+    repo,
+    gitInit: init,
+    files: files.slice(0, GIT_INIT_PREVIEW_FILES),
+    count: files.length,
+    hasGitignore: existsSync(join(repo, ".gitignore")),
+  };
+}
+
+export async function createProject(opts: NewProject): Promise<ProjectMeta> {
+  const { name, slug, prefix, repo, init } = planProject(opts);
   ensureRoot();
   return withLock(paths.rootLock(), () => {
-    if (existsSync(paths.project(slug))) throw new HcoordError(`project "${slug}" already exists`);
-    const clash = listProjects().find((p) => p.prefix === prefix);
-    if (clash) throw new HcoordError(`prefix ${prefix} is used by "${clash.slug}"; pick another with --prefix`);
-    const same = listProjects().find((p) => p.repo === repo);
-    if (same) throw new HcoordError(`${repo} is already project "${same.slug}"`);
+    assertProjectFree(slug, prefix, repo);
+    if (init) gitInit(repo);
+    const branch = checkoutOf(repo).branch;
     const createdAt = now();
     const meta: ProjectMeta = {
       version: 1, slug, name, prefix, repo,
