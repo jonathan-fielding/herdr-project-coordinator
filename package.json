@@ -2,6 +2,7 @@
   "name": "herdr-coordinator",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "A project coordinator for the Herdr desktop app: one coordinator agent, one worker per task, state in plain files.",
   "bin": {
