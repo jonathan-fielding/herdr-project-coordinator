@@ -263,6 +263,7 @@ async function main(argv: string[]): Promise<number> {
       if (!positionals[0]) throw new UsageError("hcoord lane checkout <branch> [<slug>]");
       const meta = loadProject(positionals[1] ?? defaultProjectSlug());
       const co = checkoutBranch(meta.repo, positionals[0]);
+      for (const w of co.warnings) process.stderr.write(`warning: ${w}\n`);
       const { lane } = await laneForPath(co.path);
       if (values.json) json({ project: meta.slug, lane, path: co.path, branch: positionals[0], created: co.created });
       else out(`${co.created ? "checked out" : "already checked out:"} ${positionals[0]} at ${co.path} (worktree ${lane})`);
@@ -273,6 +274,7 @@ async function main(argv: string[]): Promise<number> {
       if (!positionals[0]) throw new UsageError("hcoord lane new <branch> [<slug>] [--base <ref>]");
       const meta = loadProject(positionals[1] ?? defaultProjectSlug());
       const made = newBranchWorktree(meta.repo, positionals[0], values.base);
+      for (const w of made.warnings) process.stderr.write(`warning: ${w}\n`);
       const { lane } = await laneForPath(made.path);
       if (values.json) json({ project: meta.slug, lane, path: made.path, branch: positionals[0], base: made.base, created: true });
       else out(`made branch ${positionals[0]} (from ${made.base}) at ${made.path} (worktree ${lane})`);
