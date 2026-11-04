@@ -72,7 +72,7 @@ Every agent hcoord starts gets its own Claude session. The log icon opens its tr
 <table>
 <tr>
 <td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install</b><br /><sub>Paste one line into Claude Code, or clone this repo and follow a few steps. See <a href="#install">Install</a> below.</sub></td>
-<td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Make a project</b><br /><sub>Click the folder button in the Projects header and pick a folder in a git repo. Its coordinator starts in that checkout. Put how to test and your conventions in the project's <code>PROJECT.md</code>.</sub></td>
+<td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Make a project</b><br /><sub>Click the folder button in the Projects header and pick a folder. If it isn't a git repo yet, you're asked whether to set one up, with a first commit of its files. Its coordinator starts in that checkout. Put how to test and your conventions in the project's <code>PROJECT.md</code>.</sub></td>
 <td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane. It tells you the plan, starts the workers and ends its turn. The sidebar shows each task as it moves along.</sub></td>
 </tr>
 </table>
