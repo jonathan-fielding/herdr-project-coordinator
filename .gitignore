@@ -1,4 +1,3 @@
 node_modules/
 *.tmp-*
 .rehearsal/
-mod/hcoord/hcoord-path.js

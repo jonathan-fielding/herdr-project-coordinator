@@ -9,7 +9,8 @@
 // the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator).
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
-// Installed by `hcoord mod install`; edit the copy in the hcoord repo, not this one.
+// Needs the hcoord CLI: `hcoord mod install` writes how to run it into hcoord-path.js, and without it
+// this section only says how to set it up. Edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextView, InputState, Input, Scrollbar } from "gpui-base";
@@ -28,6 +29,9 @@ const FALLBACK_MS = 30000;
 // looked for this often. A board run is ~50 ms, so this is cheap.
 const SIDEBAR_FALLBACK_MS = 8000;
 const ACTIVE = ["starting", "working", "needs_you"];
+// While the CLI can't be run, how often to see whether that's changed.
+const SETUP_RETRY_MS = 60000;
+const SETUP_URL = "https://github.com/jonathan-fielding/herdr-project-coordinator";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -70,14 +74,23 @@ const GROUPS = [
 /** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
 const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
 
+/** Never rejects. `unavailable`: the CLI couldn't be run at all, as opposed to a command that failed. */
 async function hcoord(args) {
-  const r = await exec(HCOORD[0], [...HCOORD.slice(1), ...args]);
-  return { ok: r.code === 0, text: (r.stdout + r.stderr).trim(), stdout: r.stdout };
+  if (!HCOORD) return { ok: false, unavailable: true, text: `hcoord isn't set up: see ${SETUP_URL}`, stdout: "" };
+  try {
+    const r = await exec(HCOORD[0], [...HCOORD.slice(1), ...args]);
+    const text = (r.stdout + r.stderr).trim();
+    // 126/127: the program isn't there. Bun's error: it is, but the clone holding cli.ts has moved.
+    const unavailable = r.code === 126 || r.code === 127 || (r.code !== 0 && /Module not found|Cannot find module/.test(r.stderr));
+    return { ok: r.code === 0, unavailable, text, stdout: r.stdout };
+  } catch (e) {
+    return { ok: false, unavailable: true, text: String(e?.message ?? e), stdout: "" };
+  }
 }
 
 /** Makes a checkout with `hcoord lane checkout|new … --json`: { w } the worktree to go to, or { error }. */
 async function makeCheckout(args) {
-  const r = await hcoord([...args, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+  const r = await hcoord([...args, "--json"]);
   let made = null;
   try {
     made = r.ok ? JSON.parse(r.stdout) : null;
@@ -101,7 +114,7 @@ async function openLane(p, w, { space = null, fresh = false, restart = false, no
   else if (fresh) args.push("--new-space", spaceName(p, w));
   if (restart) args.push("--restart");
   if (noFocus) args.push("--no-focus", "--json");
-  const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+  const r = await hcoord(args);
   if (!noFocus) return r;
   let out = null;
   try {
@@ -119,6 +132,8 @@ export default class Projects extends View {
     if (props()?.newWorktree) return this.initNew(cx);
     this.data = null; // hcoord board --json
     this.error = null;
+    this.notSetUp = !HCOORD; // the CLI can't be run: the section says how to set it up
+    this.triedAt = 0; // when it last couldn't be
     this.loading = false;
     this.again = false;
     this.syncing = false;
@@ -154,6 +169,8 @@ export default class Projects extends View {
   // ------------------------------------------------------------- data
 
   refresh(cx) {
+    // With nothing to run, installing the CLI rewrites hcoord-path.js and that reloads this mod.
+    if (!HCOORD || (this.notSetUp && Date.now() - this.triedAt < SETUP_RETRY_MS)) return;
     if (this.loading) {
       this.again = true;
       return;
@@ -164,10 +181,16 @@ export default class Projects extends View {
         this.again = false;
         try {
           const r = await hcoord(["board", "--json"]);
-          if (!r.ok) throw new Error(r.text || "hcoord board failed");
-          this.data = JSON.parse(r.stdout);
-          this.error = null;
-          if (!this.watching) this.watch(cx);
+          this.notSetUp = r.unavailable;
+          if (r.unavailable) {
+            this.triedAt = Date.now();
+            this.error = null;
+          } else {
+            if (!r.ok) throw new Error(r.text || "hcoord board failed");
+            this.data = JSON.parse(r.stdout);
+            this.error = null;
+            if (!this.watching) this.watch(cx);
+          }
         } catch (e) {
           this.error = String(e?.message ?? e);
         }
@@ -220,7 +243,7 @@ export default class Projects extends View {
     cx.spawn(async (cx) => {
       do {
         this.syncAgain = false;
-        await hcoord(["sync"]).catch(() => null);
+        await hcoord(["sync"]);
       } while (this.syncAgain);
       this.syncing = false;
       this.refresh(cx);
@@ -342,7 +365,7 @@ export default class Projects extends View {
       const args = ["lane", "say", w.path, say];
       if (s) args.push("--space", s.id);
       else if (!live) args.push("--new-space", spaceName(p, w));
-      r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+      r = await hcoord(args);
     } else {
       r = await openLane(p, w, { space: s?.id, fresh: !auto, restart });
     }
@@ -407,6 +430,7 @@ export default class Projects extends View {
   // ------------------------------------------------------------- new projects
 
   async newProject(cx) {
+    if (this.notSetUp) return;
     const folder = await pickFolder({ prompt: "Make project" });
     if (!folder) return;
     await this.adopt(folder, cx);
@@ -418,7 +442,7 @@ export default class Projects extends View {
     const known = this.worktreeAt(folder);
     if (known) return this.go(known.p, known.w, cx);
     const name = base(folder);
-    const r = await hcoord(["project", "new", name, "--repo", folder, "--json"]).catch((e) => ({ ok: false, text: String(e) }));
+    const r = await hcoord(["project", "new", name, "--repo", folder, "--json"]);
     if (!r.ok) {
       notify({ title: `Couldn't make ${name} a project`, body: r.text, level: "error", timeout: 12000 });
       return;
@@ -434,7 +458,7 @@ export default class Projects extends View {
       save("open", this.open);
     }
     // Open the checkout that was picked (a worktree or the main one).
-    const lr = await hcoord(["lane", "open", folder]).catch((e) => ({ ok: false, text: String(e) }));
+    const lr = await hcoord(["lane", "open", folder]);
     if (!lr.ok) notify({ title: `Couldn't start ${name}'s coordinator`, body: lr.text, level: "error", timeout: 12000 });
     this.refresh(cx);
   }
@@ -891,7 +915,8 @@ export default class Projects extends View {
         .items_center()
         .justify_between()
         .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Projects"))
-        .child(plus)))
+        .when(!this.notSetUp, (el) => el.child(plus))))
+      .when(this.notSetUp && !collapsed, (el) => el.child(this.setupNotice(t)))
       .when(Boolean(this.error) && !collapsed, (el) => el.child(div().px(16).pb(6).text_size(12).text_color(t.blocked).child(`hcoord: ${this.error}`)))
       .when(!collapsed && !!this.data?.warnings?.length, (el) => el.children(this.data.warnings.map((w, i) =>
         h_flex().id(`hc-warn-${i}`).mx(8).px(8).mb(6).h(24).flex_none().gap(6).items_center().rounded(6)
@@ -909,7 +934,33 @@ export default class Projects extends View {
         .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
         .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
         .children(body))
-      .when(collapsed, (el) => el.child(h_flex().h(28).items_center().justify_center().child(plus)));
+      .when(collapsed, (el) => el.child(h_flex().h(28).items_center().justify_center().child(this.notSetUp ? this.setupRail(t) : plus)));
+  }
+
+  /** The CLI can't be run: what's needed, in the section itself. */
+  setupNotice(t) {
+    return v_flex().px(16).pb(8).gap(6).flex_none().text_size(12).text_color(t.dim)
+      .child(div().child("Projects needs hcoord's CLI. Install it, then run hcoord mod install."))
+      .child(div()
+        .id("hc-setup")
+        .text_color(t.muted)
+        .cursor_pointer()
+        .hover((s) => s.text_color(t.foreground))
+        .tooltip("Open the install steps")
+        .on_click((_e, cx) => cx.open_url(SETUP_URL))
+        .child(SETUP_URL));
+  }
+
+  /** The same on the sidebar's narrow rail. */
+  setupRail(t) {
+    return div()
+      .id("hc-setup")
+      .text_color(t.dim)
+      .cursor_pointer()
+      .hover((s) => s.text_color(t.foreground))
+      .tooltip(`Projects needs hcoord's CLI: ${SETUP_URL}`)
+      .on_click((_e, cx) => cx.open_url(SETUP_URL))
+      .child(svg(ICON("minus")).size(14));
   }
 
   // ------------------------------------------------------------- a log pane
@@ -1050,7 +1101,7 @@ export default class Projects extends View {
     const a = props().ask;
     const args = a.what === "project" ? ["project", "delete", a.project, "--dry-run", "--json"] : ["lane", "remove", a.path, "--dry-run", "--json"];
     cx.spawn(async (cx) => {
-      const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+      const r = await hcoord(args);
       if (r.ok) {
         try {
           this.plan = JSON.parse(r.stdout);
@@ -1085,7 +1136,7 @@ export default class Projects extends View {
       closing = this.spacesIn([plan.path]);
     }
     for (const s of closing) run("space.close", { id: s.id, confirmed: true });
-    const r = await hcoord(args).catch((e) => ({ ok: false, text: String(e) }));
+    const r = await hcoord(args);
     this.busyAsk = false;
     if (!r.ok) {
       this.error = r.text;
@@ -1272,7 +1323,7 @@ export default class Projects extends View {
   /** `hcoord lane branches --json`: { default, selected, branches: [{ name, ref, remote }] }. */
   async loadBranches(cx) {
     const n = props().newWorktree;
-    const r = await hcoord(["lane", "branches", n.project, "--json"]).catch(() => ({ ok: false }));
+    const r = await hcoord(["lane", "branches", n.project, "--json"]);
     let list = null;
     try {
       list = r.ok ? JSON.parse(r.stdout) : null;
