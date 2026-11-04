@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempDir } from "./helpers.ts";
+import { el, textOf, walk } from "./mod-stand-ins.ts";
 
 // A copy of the mod beside the hcoord-path.js that `hcoord mod install` would write.
 const SOURCE = join(import.meta.dir, "..", "mods", "hcoord");
@@ -64,25 +65,6 @@ class FakeInput {
   focus() {}
 }
 const inputs: FakeInput[] = [];
-
-/** A stand-in element: any builder call chains; children, ids and clicks are kept for the test to read. */
-function el(...args: any[]) {
-  const node: any = { args, kids: [] as any[], elementId: null, click: null };
-  const self: any = new Proxy(node, {
-    get(n, k) {
-      if (k in n) return n[k];
-      if (k === "child") return (c: any) => (n.kids.push(c), self);
-      if (k === "children") return (cs: any[]) => (n.kids.push(...cs), self);
-      if (k === "when") return (c: any, f: (e: any) => any) => (c ? f(self) : self);
-      if (k === "id") return (id: string) => ((n.elementId = id), self);
-      if (k === "on_click") return (f: any) => ((n.click = f), self);
-      return () => self;
-    },
-  });
-  return self;
-}
-const walk = (e: any): any[] => (e?.kids ? [e, ...e.kids.flatMap(walk)] : [e]);
-const textOf = (e: any) => walk(e).filter((x) => typeof x === "string").join(" ");
 
 mock.module("gpui-kit", () => ({ View: class {}, div: el, svg: el }));
 mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
