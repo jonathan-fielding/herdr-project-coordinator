@@ -1,6 +1,6 @@
 import { basename, join } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { HcoordError } from "./errors.ts";
 
 function git(cwd: string, args: string[]): { code: number; out: string; err: string } {
@@ -232,6 +232,67 @@ export function ensureWorktree(repo: string, path: string, branch: string, from 
     : ["worktree", "add", "-b", branch, path, base];
   gitOk(repo, args, `creating worktree ${path}`);
   return { base, reused: false };
+}
+
+/** Whether git sees `path` as inside a repo (bare ones and the inside of a .git count). */
+export function insideGitRepo(path: string): boolean {
+  return git(path, ["rev-parse", "--git-dir"]).code === 0;
+}
+
+/** Refuses a folder gitInit can't start, without touching it. Only for a path not inside a repo. */
+export function assertCanGitInit(path: string): void {
+  if (!existsSync(path)) throw new HcoordError(`no such folder: ${path}`);
+  if (!statSync(path).isDirectory()) throw new HcoordError(`not a folder: ${path}`);
+  // Something git doesn't accept as a repo (an empty .git, a broken link). It isn't ours to reuse
+  // or to clean up, so a failed run could never put it back.
+  if (lstatSync(join(path, ".git"), { throwIfNoEntry: false })) {
+    throw new HcoordError(`${join(path, ".git")} exists but isn't a working git repository; fix or move it first`);
+  }
+  // useConfigOnly: a commit would otherwise guess a name from the hostname and succeed.
+  const who = ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"];
+  if (who.some((v) => git(path, ["-c", "user.useConfigOnly=true", "var", v]).code !== 0)) {
+    throw new HcoordError(
+      `git has no identity to make the first commit with (user.name / user.email unset). Set it, then run this again:\n` +
+        `  git config --global user.name "Your Name"\n` +
+        `  git config --global user.email "you@example.com"`,
+    );
+  }
+}
+
+/**
+ * Makes `path` a repo with a first commit of its files (.gitignore honoured), so worktrees can be
+ * made from it; empty when there's nothing to commit. Call assertCanGitInit first: it is what makes
+ * any .git here this run's own, and so safe to remove when a step fails.
+ */
+export function gitInit(path: string): void {
+  try {
+    gitOk(path, ["init", "--quiet"], `git init in ${path}`);
+    gitOk(path, ["add", "-A"], `adding the files in ${path}`);
+    gitOk(path, ["commit", "--quiet", "--allow-empty", "-m", "Initial commit"], `making the first commit in ${path}`);
+  } catch (e) {
+    rmSync(join(path, ".git"), { recursive: true, force: true });
+    throw e;
+  }
+}
+
+/**
+ * The paths gitInit would commit, relative to `path`, sorted as git sorts them. Works it out against
+ * a throwaway git dir outside the folder, which is left untouched. A nested repo shows as "sub/".
+ */
+export function filesToCommit(path: string): string[] {
+  const dir = mkdtempSync(join(tmpdir(), "hcoord-git-init-"));
+  const env = { ...process.env, GIT_DIR: join(dir, "git"), GIT_WORK_TREE: path, GIT_INDEX_FILE: join(dir, "index") };
+  const run = (args: string[]) => {
+    const r = Bun.spawnSync(["git", "-C", path, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env });
+    if (r.exitCode !== 0) throw new HcoordError(`listing the files in ${path}: ${r.stderr.toString().trim()}`);
+    return r.stdout.toString();
+  };
+  try {
+    run(["init", "--quiet"]); // templates can carry info/exclude: same ignores as the real init
+    return run(["ls-files", "-z", "--others", "--exclude-standard"]).split("\0").filter(Boolean);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** Commits on HEAD since `base`, newest first, one line each ("" if none or unknown). */
