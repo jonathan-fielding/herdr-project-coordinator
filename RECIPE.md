@@ -1,14 +1,14 @@
-# Projects
+# Coordinator
 
-A sidebar section beside Spaces and Agents that shows your coding projects as a tree. Each
-project is a git repo, under it are its worktrees, each with its own Claude Code coordinator
+Coordinator adds a sidebar section labelled Projects, beside Spaces and Agents, that shows your
+coding projects as a tree. Each project is a git repo, under it are its worktrees, each with its own Claude Code coordinator
 agent, and under each worktree are its tasks, grouped by what they need from you: Needs you,
 Working, Queued, To do, Failed, Not merged and Merged. Click a worktree to go to its coordinator,
 which starts if it isn't running. Click a task to peek at its worker's terminal or read its log.
 Red marks show what's waiting on you, and spinners show what's running. The section is the front
 end of the `hcoord` command-line tool, and it says how to get that tool until it's installed.
 
-![Projects](preview.png)
+![Coordinator](preview.png)
 
 ## What you see
 
@@ -245,7 +245,7 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 ## Built from
 
 - `mods/hcoord/main.js`: one default-export `View`, class `Projects`. It ships no `keys.json`.
-- `mods/hcoord/mod.json`: `{ "place": "none", "title": "Projects", "overlay": { "width": 300,
+- `mods/hcoord/mod.json`: `{ "place": "none", "title": "Coordinator", "overlay": { "width": 300,
   "height": 480 } }`.
 - `mods/hcoord/hcoord-path.js`: `export const HCOORD = null;` as committed; see Watch out.
 - One mod plays several roles, chosen by `props()` in this order in both `init` and `render`. Each
