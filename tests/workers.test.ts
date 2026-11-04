@@ -83,6 +83,25 @@ async function addTask(title: string, b: Record<string, string>, ...extra: strin
 }
 
 describe("workers", () => {
+  test("a task runs in a folder that project new --git-init made a repo", async () => {
+    setup(1);
+    const plain = tempDir("plain");
+    try {
+      writeFileSync(join(plain, "README.md"), "plain\n");
+      const who = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+      const made = await cli(home, ["project", "new", "demo", "--repo", plain, "--prefix", "DM", "--git-init"], undefined, { ...core.env, ...who });
+      expect(made.code).toBe(0);
+      await addTask("Job", {});
+      await ok("task", "start", "DM-1", "--parent", coord);
+      expect(readFileSync(join(task("DM-1").worktree!, "README.md"), "utf8")).toBe("plain\n");
+      await until("DM-1 merged", () => task("DM-1").state === "merged");
+      expect(readFileSync(join(plain, "work-DM-1.txt"), "utf8")).toBe("work for DM-1\n");
+      await ok("task", "clean", "DM-1"); // its terminal would otherwise linger on the shared core
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
   test("three run in parallel worktrees, report back, and a queued fourth starts when a slot frees", async () => {
     setup(3);
     await ok("project", "new", "demo", "--repo", repo, "--prefix", "DM");

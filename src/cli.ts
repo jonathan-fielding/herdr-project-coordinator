@@ -15,6 +15,7 @@ import {
   listProjects,
   loadProject,
   loadTasks,
+  previewGitInit,
 } from "./store.ts";
 import {
   cancelTask,
@@ -49,7 +50,10 @@ A project is one git repo. Each of its worktrees (the main checkout is "root") h
 agent; its workers each get a branch and checkout of their own, merged back into the worktree when done.
 
 Projects and worktrees
-  hcoord project new <name> --repo <path> [--prefix ABC]
+  hcoord project new <name> --repo <path> [--prefix ABC] [--git-init [--dry-run]] [--json]
+                                                  --git-init: a folder not in a git repo becomes one,
+                                                  with a first commit of its files (.gitignore honoured);
+                                                  --dry-run: only say what that would do
   hcoord project list [--json]
   hcoord project show [<slug>] [--json]
   hcoord project open [<slug>] [...]              the main checkout's coordinator (lane open for root)
@@ -162,9 +166,26 @@ async function main(argv: string[]): Promise<number> {
 
   switch (`${group} ${cmd ?? ""}`) {
     case "project new": {
-      const { values, positionals } = parse(rest, { repo: { type: "string" }, prefix: { type: "string" } }, 1);
+      const { values, positionals } = parse(
+        rest,
+        { repo: { type: "string" }, prefix: { type: "string" }, "git-init": { type: "boolean" }, "dry-run": { type: "boolean" } },
+        1,
+      );
       if (!positionals[0] || !values.repo) throw new UsageError("hcoord project new <name> --repo <path>");
-      const meta = await createProject({ name: positionals[0], repo: values.repo, prefix: values.prefix });
+      if (values["dry-run"] && !values["git-init"]) throw new UsageError("--dry-run only goes with --git-init");
+      const opts = { name: positionals[0], repo: values.repo, prefix: values.prefix, gitInit: values["git-init"] };
+      if (values["dry-run"]) {
+        const plan = previewGitInit(opts);
+        if (values.json) json(plan);
+        else if (!plan.gitInit) out(`${plan.repo} is already in a git repo: nothing to init`);
+        else {
+          out(`would git init ${plan.repo} and commit ${plan.count} file(s)${plan.hasGitignore ? "" : " (no .gitignore)"}:`);
+          for (const f of plan.files) out(`  ${f}`);
+          if (plan.count > plan.files.length) out(`  ...and ${plan.count - plan.files.length} more`);
+        }
+        return 0;
+      }
+      const meta = await createProject(opts);
       if (values.json) json(meta);
       else out(`created ${meta.slug} (tasks ${meta.prefix}-n) at ${paths.project(meta.slug)}\nedit ${paths.projectMd(meta.slug)} to add standing instructions`);
       for (const w of trustWarnings(meta)) process.stderr.write(w + "\n");

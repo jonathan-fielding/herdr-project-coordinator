@@ -5,8 +5,9 @@
 // at its worker or read its log. Going to a project's worktree space starts its coordinator.
 // The same mod with props { log } is a pane showing one agent's log (its transcript); with
 // props { menu } a right-click menu, with props { ask } a dialog asking before a delete, with
-// props { info } a dialog explaining a warning (where hcoord keeps its data), and with props { newWorktree }
-// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator).
+// props { info } a dialog explaining a warning (where hcoord keeps its data), with props { newWorktree }
+// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator), and with
+// props { gitInit } a dialog asking before a plain folder becomes a git repo and a project.
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Needs the hcoord CLI: `hcoord mod install` writes how to run it into hcoord-path.js, and without it
@@ -74,6 +75,15 @@ const GROUPS = [
 /** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
 const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
 
+/** A command's --json output, or null if it isn't any. */
+const parsed = (stdout) => {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+};
+
 /** Never rejects. `unavailable`: the CLI couldn't be run at all, as opposed to a command that failed. */
 async function hcoord(args) {
   if (!HCOORD) return { ok: false, unavailable: true, text: `hcoord isn't set up: see ${SETUP_URL}`, stdout: "" };
@@ -130,6 +140,7 @@ export default class Projects extends View {
     if (props()?.ask) return this.initAsk(cx);
     if (props()?.info) return this.initInfo(cx);
     if (props()?.newWorktree) return this.initNew(cx);
+    if (props()?.gitInit) return this.initGitInit(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.notSetUp = !HCOORD; // the CLI can't be run: the section says how to set it up
@@ -161,6 +172,7 @@ export default class Projects extends View {
         if (c === "new") await this.newProject(cx);
         if (c === "adopt" && this.offer) await this.adopt(this.offer.repo, cx);
         if (c === "raise-pr") await this.raisePrFromMenu(cx);
+        if (c === "project-made") await this.projectMadeInDialog(cx);
         cx.notify();
       }
     });
@@ -436,23 +448,34 @@ export default class Projects extends View {
     await this.adopt(folder, cx);
   }
 
-  /** Makes a project of a git folder's repo, unless one has it, then goes to that checkout. */
+  /** Makes a project of a folder's repo, unless one has it, then goes to that checkout. A folder in no repo
+   *  gets the dialog offering to make it one; nothing is committed unless the person says so there. */
   async adopt(folder, cx) {
     this.offer = null;
     const known = this.worktreeAt(folder);
     if (known) return this.go(known.p, known.w, cx);
     const name = base(folder);
     const r = await hcoord(["project", "new", name, "--repo", folder, "--json"]);
-    if (!r.ok) {
-      notify({ title: `Couldn't make ${name} a project`, body: r.text, level: "error", timeout: 12000 });
-      return;
+    if (r.ok) return this.projectMade(r, folder, name, cx);
+    let why = r.text;
+    if (r.text.includes("not a git repository")) {
+      const d = await hcoord(["project", "new", name, "--repo", folder, "--git-init", "--dry-run", "--json"]);
+      const plan = d.ok ? parsed(d.stdout) : null;
+      if (plan?.gitInit) {
+        openOverlay({ mod: "hcoord", kind: "dialog", width: 520, height: 460, props: { gitInit: { name, folder, plan } } });
+        return;
+      }
+      if (!d.ok) why = d.text; // it can't be set up either (a name in use, no git identity): that's the reason to show
     }
+    notify({ title: `Couldn't make ${name} a project`, body: why, level: "error", timeout: 12000 });
+  }
+
+  /** `project new` worked, `r` being its result: says if Claude needs to trust the repo, then shows the project
+   *  and starts the coordinator of the checkout that was picked. */
+  async projectMade(r, folder, name, cx) {
     const warning = r.text.split("\n").find((l) => l.startsWith("warning:"));
     if (warning) notify({ title: `${name}: Claude doesn't trust this repo yet`, body: warning.replace(/^warning:\s*/, ""), level: "warning", timeout: 15000 });
-    let slug = null;
-    try {
-      slug = JSON.parse(r.stdout).slug;
-    } catch {}
+    const slug = parsed(r.stdout)?.slug;
     if (slug) {
       this.open[`p:${slug}`] = true;
       save("open", this.open);
@@ -461,6 +484,15 @@ export default class Projects extends View {
     const lr = await hcoord(["lane", "open", folder]);
     if (!lr.ok) notify({ title: `Couldn't start ${name}'s coordinator`, body: lr.text, level: "error", timeout: 12000 });
     this.refresh(cx);
+  }
+
+  /** The git-init dialog (another copy of this mod) leaves its result in shared state, then sends "project-made":
+   *  what's open in the list and the refresh belong to the sidebar copy. */
+  async projectMadeInDialog(cx) {
+    const made = shared("hcoord.project-made");
+    if (!made?.folder) return;
+    setShared("hcoord.project-made", null); // taken: a second Projects copy finds nothing
+    await this.projectMade(made, made.folder, made.name, cx);
   }
 
   /** A space made in a git repo no project has: offer to make it one, once per repo. */
@@ -872,6 +904,7 @@ export default class Projects extends View {
     if (props()?.ask) return this.renderAsk(t);
     if (props()?.info) return this.renderInfo(t);
     if (props()?.newWorktree) return this.renderNew(t);
+    if (props()?.gitInit) return this.renderGitInit(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -888,7 +921,7 @@ export default class Projects extends View {
       .text_color(t.dim)
       .cursor_pointer()
       .hover((s) => s.text_color(t.foreground))
-      .tooltip("New project from a git folder")
+      .tooltip("New project from a folder")
       .on_click((_e, cx) => cx.spawn(async (cx) => {
         await this.newProject(cx);
         cx.notify();
@@ -928,7 +961,7 @@ export default class Projects extends View {
           .child(div().flex_1().min_w(0).truncate().child(/temporary folder/.test(w) ? "Data folder is temporary: it may be emptied" : w))
           .child(svg(ICON("chevron-right")).size(11).flex_none()))))
       .when(!this.error && !!this.data && !projects.length && !collapsed, (el) => el.child(
-        div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk to.")))
+        div().px(16).text_size(12).text_color(t.dim).child("No projects yet. The folder button makes one from any folder, and offers to set up git if it needs it; each of its worktrees gets a coordinator agent you talk to.")))
       .child(v_flex().id("hc-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always")
         // A drag let go off the projects, or taken out of the list, is dropped.
         .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
@@ -1211,6 +1244,79 @@ export default class Projects extends View {
       .child(h_flex().justify_end().gap(8).text_size(12)
         .when(this.busyAsk, (el) => el.child(div().flex_1().text_color(t.dim).child("Deleting…")))
         .children(buttons));
+  }
+
+  // ------------------------------------------------------------- asking before git init
+
+  initGitInit(cx) {
+    this.error = null;
+    this.busyGit = false;
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+  }
+
+  async doGitInit(cx) {
+    if (this.busyGit) return;
+    const { name, folder } = props().gitInit;
+    this.busyGit = true;
+    this.error = null;
+    cx.notify();
+    const r = await hcoord(["project", "new", name, "--repo", folder, "--git-init", "--json"]);
+    this.busyGit = false;
+    if (!r.ok) {
+      this.error = r.text.replace(/^hcoord: /, "") || "hcoord failed";
+      cx.notify();
+      return;
+    }
+    setShared("hcoord.project-made", { folder, name, text: r.text, stdout: r.stdout });
+    run("hcoord.project-made");
+    closeOverlay(props().overlay);
+  }
+
+  renderGitInit(t) {
+    const { name, folder, plan } = props().gitInit;
+    const { files, count, hasGitignore } = plan;
+    const busy = this.busyGit;
+    // While it runs the commit can't be called back, so Cancel and Esc wait too.
+    const close = () => {
+      if (!busy) closeOverlay(props().overlay);
+    };
+    const button = (id, label, bg, fg, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "no" ? t.input : bg).bg(bg).text_color(fg)
+        .when(!busy, (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick))
+        .when(busy, (el) => el.opacity(0.5))
+        .child(label);
+    const hidden = count - files.length;
+    return v_flex()
+      .id("hc-git")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key !== "escape") return;
+        close();
+        cx.stop_propagation();
+      })
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child(`Set up git in ${name}?`))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(div().text_color(t.muted).child(`${tilde(folder)} isn't a git repo yet. Workers each get a checkout of it, and for that it needs a first commit of its files.`))
+      .when(count > 0 && !hasGitignore, (el) => el.child(div().text_color(t.blocked)
+        .child("There's no .gitignore, so everything listed gets committed, including things like node_modules or .env.")))
+      .child(div().text_color(t.foreground).font_medium()
+        .child(count ? `${count} file${count > 1 ? "s" : ""} will be committed:` : "The folder has no files to commit, so the first commit will be empty."))
+      .child(v_flex().id("hc-git-files").flex_1().min_h(0).overflow_y_scrollbar().text_size(12).text_color(t.muted)
+        .children(files.map((f) => div().truncate().child(f)))
+        .when(hidden > 0, (el) => el.child(div().pt(4).text_color(t.dim).child(`and ${hidden} more`))))
+      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))
+      .child(h_flex().justify_end().gap(8).text_size(12)
+        .when(busy, (el) => el.child(div().flex_1().text_color(t.dim).child("Setting up git…")))
+        .child(button("no", "Cancel", t.raised, t.foreground, close))
+        .child(button("yes", "Set up git", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doGitInit(cx)))));
   }
 
   // ------------------------------------------------------------- what a warning means

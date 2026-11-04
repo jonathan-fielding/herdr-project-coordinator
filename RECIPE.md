@@ -18,7 +18,7 @@ at alpha `26` (hex) as a background. Top to bottom:
 
 - **Header**, 41px tall, 16px side padding, 14px above and 5px below. The word `Projects` at 11.5px,
   medium, `dim`, on the left. On the right a 14px folder-plus icon, `dim`, `foreground` under the
-  pointer, tooltip `New project from a git folder`. The icon is hidden in the not-set-up state.
+  pointer, tooltip `New project from a folder`. The icon is hidden in the not-set-up state.
 - **Not-set-up notice**, only when the CLI can't be run. 16px side padding, 8px below, 6px gap,
   12px `dim`: `Projects needs hcoord's CLI. Install it, then run hcoord mod install.`, then the URL
   `https://github.com/jonathan-fielding/herdr-project-coordinator` in `muted`, `foreground` under
@@ -30,8 +30,8 @@ at alpha `26` (hex) as a background. Top to bottom:
   `Click for more`. A truncated line, then an 11px chevron-right. A warning about a temporary folder
   reads `Data folder is temporary: it may be emptied`; any other shows its own text.
 - **Empty line**, once loaded with no projects, 12px `dim`, 16px side padding: `No projects yet. The
-  folder button makes one from a git repo; each of its worktrees gets a coordinator agent you talk
-  to.`
+  folder button makes one from any folder, and offers to set up git if it needs it; each of its
+  worktrees gets a coordinator agent you talk to.`
 - **The list** fills the rest, scrolling, 8px side padding, the scrollbar always shown.
 
 Rows in the list, all radius 8 and `hover` under the pointer unless noted:
@@ -176,7 +176,9 @@ forgets being open on reload. The other groups never fold. Reasons and summaries
 - Folder-plus: the system's folder picker with the prompt `Make project`, then the folder's repo
   becomes a project named after the folder, unfolded, and that checkout's coordinator starts. A folder
   already in a project just goes there. If Claude doesn't trust the repo, a warning toast shows for
-  15 s.
+  15 s. A folder in no git repo opens the git dialog instead. If that can't be offered (say the name is
+  taken), or `project new` fails any other way, a 12 s error toast `Couldn't make <name> a project`
+  gives the reason.
 - Rail row: goes to the main checkout's coordinator.
 
 **Right-clicks**
@@ -216,6 +218,16 @@ gone`; the unchecked-out default branch says what a click will do. A task shows 
   `Type a name for the new branch.`. Create shows `Creating the branch and its checkout…` then
   `Starting its coordinator…`, closes the dialog and goes to the new space with one `agent.focus`, so
   the window moves only once it's ready.
+- Git dialog, 520 by 460: `Set up git in <name>?`, then `~/path isn't a git repo yet. Workers each get
+  a checkout of it, and for that it needs a first commit of its files.` With no `.gitignore` and files
+  to commit, a `blocked` line: `There's no .gitignore, so everything listed gets committed, including
+  things like node_modules or .env.` Then `N files will be committed:` (or, with none, `The folder has
+  no files to commit, so the first commit will be empty.`) over the files in a scrolling list, ending
+  `and N more` when the dry run's list is shorter than its count. Cancel (`raised`) and Set up git
+  (`solid`). Only that click commits; Enter does nothing. It shows `Setting up git…`, with both buttons
+  at 50% and Esc ignored, since a commit under way can't be called back. An error stays in the dialog
+  in `blocked`. On success the sidebar copy carries on as for any new project: the trust toast, the
+  project unfolded, its coordinator started.
 - Data dialog: Esc or Enter closes it.
 
 **The log pane** reloads every 30 s and whenever the folder of its transcript changes, so it follows
@@ -258,6 +270,7 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   | `ask` | delete dialog; `{ what: "project" \| "worktree", … }` | `openOverlay`, `kind: "dialog"`, 480×360 or 460×300 |
   | `info` | data dialog; `{ warning, root, worktreeRoot }` | `openOverlay`, `kind: "dialog"`, 520×400 |
   | `newWorktree` | New worktree dialog; `{ project, name, defaultBranch }` | `openOverlay`, `kind: "dialog"`, 460×420 |
+  | `gitInit` | git dialog; `{ name, folder, plan }`, `plan` being the dry run below | `openOverlay`, `kind: "dialog"`, 520×460 |
   | none | the section | a layout block |
 
 - Shipped mods used: only `workspace-chrome`, for its icons. Nothing of its code.
@@ -268,10 +281,12 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   `closeOverlay`, `shared`, `setShared`. Also `localStorage`, and `cx.open_url` for the setup link.
 - Commands through `run`: `agent.focus {terminal}`, `space.select {id}`, `space.close {id, confirmed:
   true}`, `terminal.peek {terminal}`, `tab.new {name, folder, argv: ["claude"]}`, `pane.split
-  {direction, mod, props}`, and its own `hcoord.raise-pr`.
+  {direction, mod, props}`, its own `hcoord.raise-pr`, and its own `hcoord.project-made`.
 - Commands it receives through `nextCommand()`: `new` (the folder-plus flow; nothing ships a key for
   it), `adopt` (the toast's `action: { name: "hcoord.adopt" }`), `raise-pr` (from the menu copy, which
-  first does `setShared("hcoord.raise-pr", { project, path })`; the sidebar copy reads it and clears it).
+  first does `setShared("hcoord.raise-pr", { project, path })`; the sidebar copy reads it and clears it),
+  `project-made` (from the git dialog copy, the same way with `setShared("hcoord.project-made", { folder,
+  name, text, stdout })`).
 - Programs run through `exec`:
   - `HCOORD[0]` with `HCOORD.slice(1)` and the hcoord arguments below.
   - `git rev-parse --path-format=absolute --git-common-dir` with `cwd` at a new space's folder.
@@ -290,8 +305,11 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
     `selected` is the default's `ref`.
   - `lane remove <path> --dry-run --json`: `{ path, branch, changed: [file], coordinator, unfinished:
     [id], … }`. Then `lane remove <path> [--force]`.
-  - `project new <name> --repo <folder> --json`: the project with its `slug`. A stderr line starting
-    `warning:` is the trust warning.
+  - `project new <name> --repo <folder> [--git-init] --json`: the project with its `slug`. A stderr
+    line starting `warning:` is the trust warning.
+  - `project new <name> --repo <folder> --git-init --dry-run --json`: `{ repo, gitInit, files, count,
+    hasGitignore }`. `files` is capped at 200; `count` is all of them. Run when `project new` fails with
+    `not a git repository`.
   - `project delete <slug> --dry-run --json`: `{ checkouts: [{ path, changed }], workerDir, unpushed,
     unfinished: [id], coordinators: [address], archive, trash, … }`. Then `project delete <slug>
     [--files]`.
@@ -372,9 +390,9 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   `~/.config/herdr-app/mods/hcoord`, so a from-scratch build is replaced by the repo's files. To keep a
   build, write `hcoord-path.js` by hand instead. It also refuses a folder it doesn't recognize unless
   that folder has `.hcoord-installed` or `HCOORD = null`, and refuses a temporary data folder.
-- **The name `hcoord` is hard-coded**: in `openOverlay`, `pane.split`, the `hcoord.adopt` and
-  `hcoord.raise-pr` commands, the install target, and the layout block. Rename all of them together, or
-  not at all (the install always writes `mods/hcoord`).
+- **The name `hcoord` is hard-coded**: in `openOverlay`, `pane.split`, the `hcoord.adopt`,
+  `hcoord.raise-pr` and `hcoord.project-made` commands, the install target, and the layout block.
+  Rename all of them together, or not at all (the install always writes `mods/hcoord`).
 - `exec` rejects when the program can't start: catch it and treat it as not set up. `hcoord()` must never
   reject, because every caller assumes that.
 - Read JSON from stdout alone. Warnings go to stderr, so parsing the combined text fails.
