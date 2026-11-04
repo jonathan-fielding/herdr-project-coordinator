@@ -44,7 +44,7 @@ PROJECTS                                   📁
     feature-login                        ⟳
       Needs you  ! SHP-3 Users API …
       Working    ⟳ SHP-4 Users page      ≡
-      Merged (3)
+      Merged 3
 ```
 
 ### 📋 Every task, grouped by what it needs

@@ -340,9 +340,13 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
     moves a repo and its checkouts to the Trash, or deletes them for good where `/usr/bin/trash` is
     missing.
   - Network: the mod makes no network requests; the setup link opens in the browser. The only network
-    use the CLI makes itself is a `git fetch` of one branch from origin before `lane new` or `lane
-    checkout`, in CLI versions that have it, limited to 15 s. The agents it starts are full Claude Code
-    sessions that use Anthropic's service, and Raise PR has a worker run `git push` and `gh pr create`.
+    use the CLI makes itself is a `git fetch` of one branch from origin, limited to 15 s
+    (`HCOORD_FETCH_TIMEOUT_MS` overrides that). `lane new` fetches its base branch every time, and
+    fast-forwards a local base that is behind origin's and not checked out anywhere. `lane checkout`
+    fetches only a branch with no local copy. A fetch that fails or times out doesn't block: the CLI
+    prints a `warning:` line on stderr, which the mod doesn't show, and carries on with the local copy.
+    The agents it starts are full Claude Code sessions that use Anthropic's service, and Raise PR has a
+    worker run `git push` and `gh pr create`.
 - **`"place": "none"` means nothing appears after copying.** Add the section to a layout. Never edit a
   shipped layout, they're replaced on update; clone first with `herdr-app do layout.clone
   '{"name":"main","as":"main-plus"}'`. Then in `layouts/main-plus.json` add this to the sidebar column,
