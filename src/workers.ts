@@ -113,15 +113,31 @@ export function liveCoordinator(meta: ProjectMeta, lane: string): CoordinatorRef
   return state === "running" || state === "prompt" ? meta.lanes[lane]!.coordinator! : null;
 }
 
-/** Where a task's news goes: its worktree's live coordinator (it may have been restarted), else the worker's parent. */
+/**
+ * Whether this address is a worktree's recorded coordinator that doesn't run our agent any more.
+ * What's there now is a plain shell or someone's own program, so typing a note there can run it as a
+ * command or hand it to an agent it isn't for.
+ */
+function formerCoordinator(meta: ProjectMeta, lane: string, address: string): boolean {
+  return address === meta.lanes[lane]?.coordinator?.address && !liveCoordinator(meta, lane);
+}
+
+/**
+ * Where a task's news goes: its worktree's live coordinator (it may have been restarted), else the
+ * worker's parent, unless that parent is the coordinator we've just found isn't live. Null then:
+ * the state is saved, and the coordinator sees it in `hcoord task list` when it comes back.
+ */
 function notifyTarget(meta: ProjectMeta, task: Task): string | null {
-  return liveCoordinator(meta, task.lane)?.address ?? task.parent ?? null;
+  const live = liveCoordinator(meta, task.lane);
+  if (live) return live.address;
+  return task.parent && !formerCoordinator(meta, task.lane, task.parent) ? task.parent : null;
 }
 
 /**
  * The coordinator terminal a new worker reports to (its hc parent): an explicit --parent, else the
  * project's coordinator, else `fallback` (the reporting worker's coordinator), else the caller when
- * the caller isn't one of our workers. Never a worker: that would send notes to the wrong agent.
+ * the caller isn't one of our workers. Never a worker or a former coordinator: that would send
+ * notes to the wrong place.
  */
 export function resolveParent(meta: ProjectMeta, lane: string, explicit?: string, fallback?: string): string | null {
   if (explicit) {
@@ -129,15 +145,10 @@ export function resolveParent(meta: ProjectMeta, lane: string, explicit?: string
     if (!h || h.state !== "live") throw new HcoordError(`--parent ${explicit} isn't a live terminal`);
     return h.address;
   }
-  for (const c of [meta.lanes[lane]?.coordinator?.address, fallback]) {
+  for (const c of [meta.lanes[lane]?.coordinator?.address, fallback, process.env.HC_TERMINAL_ID]) {
     if (!c) continue;
     const h = hcGet(c);
-    if (h?.state === "live" && !h.labels?.["hcoord.task"]) return h.address;
-  }
-  const caller = process.env.HC_TERMINAL_ID;
-  if (caller) {
-    const h = hcGet(caller);
-    if (h?.state === "live" && !h.labels?.["hcoord.task"]) return h.address;
+    if (h?.state === "live" && !h.labels?.["hcoord.task"] && !formerCoordinator(meta, lane, h.address)) return h.address;
   }
   return null;
 }
@@ -243,7 +254,8 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
         if (changed) {
           lines.push(`${id} → needs_you: ${stuck}`);
           // Only tell the coordinator when someone else (a worker's report) started this task.
-          if (parent && parent !== process.env.HC_TERMINAL_ID) hcSend(parent, `${id} needs_you: ${stuck}`);
+          const to = notifyTarget(meta, { ...task, parent: parent ?? undefined });
+          if (to && to !== process.env.HC_TERMINAL_ID) hcSend(to, `${id} needs_you: ${stuck}`);
         }
       }
     }

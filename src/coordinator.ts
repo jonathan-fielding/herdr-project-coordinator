@@ -194,7 +194,7 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
     return {
       ok: false,
       lines: [
-        `${name} (${term!.address}) is running but reports no agent status: it may be at a prompt, such as Claude's trust question.`,
+        `${name} (${term!.address}) is running but reports no agent status: it may be at a prompt, such as Claude's trust question, or still starting.`,
         `Look with: hc attach ${term!.address}. To replace it: hcoord lane open ${lane.path} --restart`,
       ],
     };
@@ -272,8 +272,8 @@ export async function addMemory(project: string, text: string): Promise<Outcome>
 
 /**
  * After a reboot (or a core restart): checks workers, brings back each worktree's coordinator that
- * had one (resuming its conversation) unless its terminal is in use, and restarts tasks whose worker vanished, in their checkouts,
- * with what's there so far.
+ * had one (resuming its conversation) unless its terminal is in use or it's at a prompt, and restarts
+ * tasks whose worker vanished, in their checkouts, with what's there so far.
  */
 export async function recoverProject(project: string, opts: { show?: boolean } = {}): Promise<Outcome> {
   const slug = loadProject(project).slug;
@@ -294,9 +294,10 @@ export async function recoverProject(project: string, opts: { show?: boolean } =
       const { name, address } = lane.coordinator;
       out.lines.push(`${key}: coordinator ${name} (${address}) is running`);
     } else {
-      // Refuses, and says why, when something else runs in the coordinator's terminal.
+      // Refuses, and says why, when something else runs in the coordinator's terminal or it's at a
+      // prompt. Replacing a prompt wouldn't get past a trust question, and would kill one still starting.
       try {
-        add(await openLane(slug, key, { show: opts.show, restart: true }));
+        add(await openLane(slug, key, { show: opts.show }));
       } catch (e) {
         out.ok = false;
         out.lines.push(`${key}: couldn't restart its coordinator: ${e instanceof Error ? e.message : e}`);
