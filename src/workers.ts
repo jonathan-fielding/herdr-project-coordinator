@@ -66,23 +66,101 @@ function ourTerminal(task: Task): HcTerminal | null {
 
 // ---------------------------------------------------------------- who gets notes
 
-/** A worktree's coordinator terminal if it's still that exact live terminal. */
-export function liveCoordinator(meta: ProjectMeta, lane: string): CoordinatorRef | null {
-  const c = meta.lanes[lane]?.coordinator;
-  if (!c) return null;
-  const h = hcGet(c.address);
-  return h && h.state === "live" && h.name === c.name ? c : null;
+/**
+ * What became of a worktree's coordinator:
+ * - running: our agent.
+ * - prompt: our program, reporting no status (Claude's trust question, or still starting).
+ * - shell: replaced by a shell with nothing running in it, or about to be. Safe to replace.
+ * - occupied: replaced, and something else runs in that shell. Never ours to stop.
+ * - none: no such terminal running.
+ */
+export type CoordinatorState = "running" | "prompt" | "shell" | "occupied" | "none";
+
+/**
+ * Sorts a coordinator's terminal (`hc get`) into a CoordinatorState. The test is what the terminal
+ * runs, not which shell: everything hcoord starts for a project goes through `env HCOORD_PROJECT=<slug>`
+ * (agents.ts), and only a kept terminal can lose that, its argv then being the shell's. The marker is
+ * in the terminal itself, so it needs no record and holds for coordinators started by older versions.
+ * Status can't tell: a Claude started by hand in the shell reports one too.
+ */
+export function classifyCoordinator(t: HcTerminal | null, slug: string, claude: boolean): CoordinatorState {
+  if (!t || t.state !== "live") return "none";
+  // Its program is lost and the core hasn't started the shell yet (reason: stopped_by_restart, signaled).
+  if (t.pid === null) return "shell";
+  // Not kept, or no argv (a core too old to say): all we have is the status.
+  const replaced = t.keep && t.argv && !(t.argv[0] === "env" && t.argv.includes(`HCOORD_PROJECT=${slug}`));
+  if (!replaced) return claude && !t.status ? "prompt" : "running";
+  // Foreground unknown counts as occupied: a shell shows none for a moment as it starts, and looking
+  // again is cheap, where stopping what someone runs isn't.
+  const fg = t.foreground;
+  return fg && fg.pid === t.pid && fg.argv.join("\0") === t.argv!.join("\0") ? "shell" : "occupied";
 }
 
-/** Where a task's news goes: its worktree's live coordinator (it may have been restarted), else the worker's parent. */
+/** The terminal recorded as a worktree's coordinator, if the core still has that exact live terminal. */
+export function recordedCoordinator(meta: ProjectMeta, lane: string): HcTerminal | null {
+  const c = meta.lanes[lane]?.coordinator;
+  const h = c ? hcGet(c.address) : null;
+  return h && h.state === "live" && h.name === c!.name ? h : null;
+}
+
+/**
+ * The program in a terminal's foreground, by the name it was run as: "claude", "vim", or null when the
+ * core doesn't say. `foreground.name` won't do: it's the process's own name, Claude's version here.
+ * Status only decides when argv can't (npm's node, or Claude run by its versioned path): any other
+ * program may just have a status left over from what ran there before. `hc get` gives status as
+ * `{ app, state }`, which HcTerminal doesn't describe.
+ */
+export function foregroundProgram(t: HcTerminal | null): string | null {
+  const cmd = t?.foreground?.argv[0];
+  if (!cmd) return null;
+  const name = cmd.split("/").pop() || cmd;
+  if (name === "claude") return name;
+  const reports = (t!.status as unknown as { app?: string } | null | undefined)?.app;
+  return reports === "claude-code" && /^(node|bun|\d+(\.\d+)+)$/.test(name) ? "claude" : name;
+}
+
+/** A coordinator's state and, when occupied, what occupies it, from one look at its terminal. */
+export function coordinatorNow(meta: ProjectMeta, lane: string): { state: CoordinatorState; program: string | null } {
+  const t = recordedCoordinator(meta, lane);
+  const state = classifyCoordinator(t, meta.slug, loadConfig().agent.kind === "claude");
+  return { state, program: state === "occupied" ? foregroundProgram(t) : null };
+}
+
+export function coordinatorState(meta: ProjectMeta, lane: string): CoordinatorState {
+  return coordinatorNow(meta, lane).state;
+}
+
+/** A worktree's coordinator, if its terminal is still that exact live terminal and still runs our agent. */
+export function liveCoordinator(meta: ProjectMeta, lane: string): CoordinatorRef | null {
+  const state = coordinatorState(meta, lane);
+  return state === "running" || state === "prompt" ? meta.lanes[lane]!.coordinator! : null;
+}
+
+/**
+ * Whether this address is a worktree's recorded coordinator that doesn't run our agent any more.
+ * What's there now is a plain shell or someone's own program, so typing a note there can run it as a
+ * command or hand it to an agent it isn't for.
+ */
+function formerCoordinator(meta: ProjectMeta, lane: string, address: string): boolean {
+  return address === meta.lanes[lane]?.coordinator?.address && !liveCoordinator(meta, lane);
+}
+
+/**
+ * Where a task's news goes: its worktree's live coordinator (it may have been restarted), else the
+ * worker's parent, unless that parent is the coordinator we've just found isn't live. Null then:
+ * the state is saved, and the coordinator sees it in `hcoord task list` when it comes back.
+ */
 function notifyTarget(meta: ProjectMeta, task: Task): string | null {
-  return liveCoordinator(meta, task.lane)?.address ?? task.parent ?? null;
+  const live = liveCoordinator(meta, task.lane);
+  if (live) return live.address;
+  return task.parent && !formerCoordinator(meta, task.lane, task.parent) ? task.parent : null;
 }
 
 /**
  * The coordinator terminal a new worker reports to (its hc parent): an explicit --parent, else the
  * project's coordinator, else `fallback` (the reporting worker's coordinator), else the caller when
- * the caller isn't one of our workers. Never a worker: that would send notes to the wrong agent.
+ * the caller isn't one of our workers. Never a worker or a former coordinator: that would send
+ * notes to the wrong place.
  */
 export function resolveParent(meta: ProjectMeta, lane: string, explicit?: string, fallback?: string): string | null {
   if (explicit) {
@@ -90,15 +168,10 @@ export function resolveParent(meta: ProjectMeta, lane: string, explicit?: string
     if (!h || h.state !== "live") throw new HcoordError(`--parent ${explicit} isn't a live terminal`);
     return h.address;
   }
-  for (const c of [meta.lanes[lane]?.coordinator?.address, fallback]) {
+  for (const c of [meta.lanes[lane]?.coordinator?.address, fallback, process.env.HC_TERMINAL_ID]) {
     if (!c) continue;
     const h = hcGet(c);
-    if (h?.state === "live" && !h.labels?.["hcoord.task"]) return h.address;
-  }
-  const caller = process.env.HC_TERMINAL_ID;
-  if (caller) {
-    const h = hcGet(caller);
-    if (h?.state === "live" && !h.labels?.["hcoord.task"]) return h.address;
+    if (h?.state === "live" && !h.labels?.["hcoord.task"] && !formerCoordinator(meta, lane, h.address)) return h.address;
   }
   return null;
 }
@@ -204,7 +277,8 @@ async function launch(slug: string, id: string, parent: string | null): Promise<
         if (changed) {
           lines.push(`${id} → needs_you: ${stuck}`);
           // Only tell the coordinator when someone else (a worker's report) started this task.
-          if (parent && parent !== process.env.HC_TERMINAL_ID) hcSend(parent, `${id} needs_you: ${stuck}`);
+          const to = notifyTarget(meta, { ...task, parent: parent ?? undefined });
+          if (to && to !== process.env.HC_TERMINAL_ID) hcSend(to, `${id} needs_you: ${stuck}`);
         }
       }
     }

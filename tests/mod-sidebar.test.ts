@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { copyFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempDir } from "./helpers.ts";
-import { el, textOf, walk } from "./mod-stand-ins.ts";
+import { byId, el, textOf, walk } from "./mod-stand-ins.ts";
 
 // A copy of the mod beside the hcoord-path.js that `hcoord mod install` would write.
 const SOURCE = join(import.meta.dir, "..", "mods", "hcoord");
@@ -39,6 +39,8 @@ const world = {
   execError: null as Error | null,
   layout: null as any,
   picked: 0,
+  /** Set: `lane open` waits for this, so a test can see what's happening while one runs. */
+  hold: null as Promise<void> | null,
 };
 
 /** A stand-in text field: a value, and handlers the test can fire. */
@@ -82,6 +84,7 @@ mock.module("herdr", () => ({
     world.calls.push([cmd, ...args]);
     world.events.push([cmd, ...args].join(" "));
     if (world.execError && cmd !== "git") throw world.execError;
+    if (world.hold && args[0] === "lane" && args[1] === "open") await world.hold;
     const answer = world.answers[args.slice(0, 2).join(" ")];
     if (answer) return answer;
     if (args[0] === "board") {
@@ -155,6 +158,7 @@ beforeEach(() => {
   world.execError = null;
   world.picked = 0;
   world.layout = null;
+  world.hold = null;
   inputs.length = 0;
 });
 
@@ -538,5 +542,581 @@ describe("new worktree", () => {
     await v.go(p(), w, cx);
     expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
     expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/feature", "--new-space", "r · feature"]]);
+  });
+});
+
+describe("coordinators a restart stopped", () => {
+  const STOPPED = "Stopped by a restart: click to bring back";
+  const OCCUPIED = "Something else is running in its terminal: exit it first";
+  const PLAIN_CLAUDE = "Plain Claude running, not the coordinator";
+  const NO_STATUS = "Coordinator reports no status: look at it";
+
+  /** A board whose worktrees have coordinators in these states (`/r` is the main checkout), their terminals live. */
+  function coordinators(states: Record<string, string>) {
+    const paths = Object.keys(states);
+    const lanes = paths.map((path, i) => ({
+      key: base(path),
+      path,
+      branch: base(path),
+      present: true,
+      coordinator: { address: `t${i}`, name: `coord-${i}`, session: `session-${i}` },
+      coordinatorState: states[path],
+    }));
+    world.board = project(paths, lanes);
+    world.terminals = lanes.map((l) => ({ address: l.coordinator.address, name: l.coordinator.name, state: "live" }));
+    return lanes;
+  }
+  const p = () => world.board.projects[0];
+  const tree = (v: any, cx: any) => v.render(cx);
+  const head = (v: any, cx: any, path: string) => byId(tree(v, cx), `wt-${path}`);
+  const click = async (e: any, cx: any) => {
+    e.click({}, cx);
+    await cx.settle();
+  };
+  const focusMoves = () => world.runs.filter(([name]) => name === "space.select" || name === "agent.focus");
+  const laneSays = () => world.calls.filter((c) => c[1] === "lane" && c[2] === "say");
+  const later = async (ms: number, fn: () => Promise<void> | void) => {
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + ms;
+      await fn();
+    } finally {
+      Date.now = realNow;
+    }
+  };
+
+  describe("shell", () => {
+    test("says it's stopped, with a mark and a tooltip, and no ? badge or prompt row", async () => {
+      coordinators({ "/r": "shell" });
+      const { v, cx } = await start();
+      const t = tree(v, cx);
+      expect(textOf(t)).toContain(STOPPED);
+      expect(textOf(t)).not.toContain("?");
+      expect(textOf(t)).not.toContain(NO_STATUS);
+      expect(byId(t, "restartbtn-/r")).toBeUndefined();
+      expect(byId(t, "stopped-/r").tip).toContain("carrying on its conversation");
+      expect(head(v, cx, "/r").tip).toContain("carrying on its conversation");
+      expect(walk(t).some((e) => e?.args?.[0] === "mods/workspace-chrome/square.svg")).toBe(true);
+    });
+
+    test("doesn't promise a conversation it hasn't got", async () => {
+      const [l] = coordinators({ "/r": "shell" });
+      delete (l!.coordinator as any).session;
+      const { v, cx } = await start();
+      expect(byId(tree(v, cx), "stopped-/r").tip).toContain("new conversation");
+    });
+
+    test("shows on a folded worktree too", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "running" });
+      const { v, cx } = await start();
+      v.open["w:/r"] = false;
+      expect(textOf(tree(v, cx))).toContain(STOPPED);
+    });
+
+    test("clicking the worktree resumes it in its space, with no error", async () => {
+      coordinators({ "/r": "shell" });
+      const { v, cx } = await start();
+      await click(head(v, cx, "/r"), cx);
+      expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/r", "--space", "s1"]]);
+      expect(world.notes).toEqual([]);
+    });
+
+    test("clicking the line does the same", async () => {
+      coordinators({ "/r": "shell" });
+      const { v, cx } = await start();
+      await click(byId(tree(v, cx), "stopped-/r"), cx);
+      expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/r", "--space", "s1"]]);
+    });
+
+    test("an agent Herdr reports in that terminal doesn't count: it still resumes, rather than focus it", async () => {
+      coordinators({ "/r": "shell" });
+      world.agents = [{ address: "t0", space: "s1", status: "idle" }];
+      const { v, cx } = await start();
+      await click(head(v, cx, "/r"), cx);
+      expect(laneOpens()).toHaveLength(1);
+      expect(world.runs.some(([name]) => name === "agent.focus")).toBe(false);
+    });
+
+    test("it resumes in the space still holding its pane, wherever that is", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.spaces.push({ id: "s2", folder: "/elsewhere", tabs: [{ id: "tab2" }] });
+      world.panes = [{ pane: "p1", terminal: "t1", tab: "tab2", cwd: "/elsewhere" }];
+      const { v, cx } = await start();
+      await click(head(v, cx, "/home/wt/a"), cx);
+      expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/a", "--space", "s2"]]);
+    });
+
+    test("switching to its space resumes it, once a minute at most", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.agents = [{ address: "t0", space: "s1", status: "idle" }];
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      const { v, cx } = await start();
+      const go = async (space: string) => {
+        world.focused = space;
+        v.followSpace(cx);
+        await cx.settle();
+      };
+      await go("s2");
+      expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/a", "--space", "s2"]]);
+      expect(world.notes).toEqual([]);
+      expect(focusMoves()).toEqual([]);
+
+      await go("s1");
+      await go("s2"); // back within the minute: still stopped on the board, left alone
+      expect(laneOpens()).toHaveLength(1);
+
+      await later(61000, async () => {
+        await go("s1");
+        await go("s2");
+      });
+      expect(laneOpens()).toHaveLength(2);
+    });
+
+    test("switching there keeps the space's name if replacing it closes the space", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", name: "r · a", named: true, tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      world.spaces[1] = { id: "s2", folder: "/home/wt/a", name: "a", named: false, tabs: [] };
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toContainEqual(["space.rename", { id: "s2", name: "r · a" }]);
+    });
+
+    test("and its place in the list", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      const moved = { id: "s2", folder: "/home/wt/a", tabs: [] };
+      world.spaces.unshift(moved);
+      world.focused = "s1";
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      world.spaces.reverse(); // made again, last
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toContainEqual(["space.move", { id: "s2", index: 1 }]);
+    });
+
+    test("the focus landing elsewhere while one is replaced doesn't resume that space's coordinator too", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      world.focused = "s2";
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      await new Promise<void>((done) => {
+        head(v, cx, "/home/wt/a").click({}, cx);
+        cx.settle().then(done);
+      });
+      world.focused = "s1"; // s2 closed, as its only tab was replaced
+      v.followSpace(cx);
+      await cx.settle();
+      world.focused = "s2"; // hcoord focuses the new coordinator
+      v.followSpace(cx);
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(laneOpens().map((c) => c[3])).toEqual(["/home/wt/a"]);
+    });
+
+    test("Raise PR goes through lane say, which resumes it: the shell isn't focused or typed at here", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.board.projects[0].defaultBranch = { name: "main", path: "/r", checkedOut: true };
+      world.agents = [{ address: "t1", space: "s1", status: "idle" }]; // stale: mustn't look like a running coordinator
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      const { v, cx } = await start();
+      const w = v.worktrees(p()).find((x: any) => x.path === "/home/wt/a");
+      await v.raisePr(p(), w, cx);
+      expect(laneSays()).toHaveLength(1);
+      expect(laneSays()[0]!.slice(0, 4)).toEqual(["hcoord", "lane", "say", "/home/wt/a"]);
+      expect(world.runs.some(([name]) => name === "agent.focus")).toBe(false);
+      expect(world.notes.map((n) => n.level)).toEqual(["info"]);
+    });
+
+    test("Raise PR with no space for it makes one, as a click would", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.board.projects[0].defaultBranch = { name: "main", path: "/r", checkedOut: true };
+      const { v, cx } = await start();
+      const w = v.worktrees(p()).find((x: any) => x.path === "/home/wt/a");
+      await v.raisePr(p(), w, cx);
+      expect(laneSays()[0]!.slice(-2)).toEqual(["--new-space", "r · a"]);
+    });
+  });
+
+  describe("nothing resumes by itself", () => {
+    test("not on load, however often the sidebar redraws or refreshes", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      const { v, cx } = await start();
+      tree(v, cx);
+      for (const t of world.timers) t.fn(cx);
+      await cx.settle();
+      tree(v, cx);
+      await later(61000, async () => {
+        for (const t of world.timers) t.fn(cx);
+        await cx.settle();
+        tree(v, cx);
+        await cx.settle();
+      });
+      expect(laneOpens()).toEqual([]);
+      expect(laneSays()).toEqual([]);
+    });
+
+    test("not when Herdr's focus only arrives after the mod has loaded", async () => {
+      coordinators({ "/r": "shell" });
+      world.focused = null;
+      const { v, cx } = await start();
+      world.focused = "s1";
+      tree(v, cx);
+      await cx.settle();
+      v.refresh(cx);
+      await cx.settle();
+      expect(laneOpens()).toEqual([]);
+    });
+
+    test("not when that space is only known once the board has loaded", async () => {
+      coordinators({ "/r": "shell" });
+      world.focused = null;
+      const cx = makeCx();
+      const v: any = new Projects();
+      const board = world.board;
+      world.board = project([]);
+      v.init({}, cx);
+      await cx.settle();
+      world.focused = "s1";
+      v.followSpace(cx);
+      expect(v.pendingSpace).toBe("s1");
+      world.board = board;
+      v.refresh(cx);
+      await cx.settle();
+      expect(laneOpens()).toEqual([]);
+    });
+
+    test("but going back to the space Herdr came up on is a switch", async () => {
+      coordinators({ "/r": "shell" });
+      world.focused = null;
+      world.spaces.push({ id: "s2", folder: "/home", tabs: [] });
+      const { v, cx } = await start();
+      for (const space of ["s1", "s2", "s1"]) {
+        world.focused = space;
+        v.followSpace(cx);
+        await cx.settle();
+      }
+      expect(laneOpens()).toHaveLength(1);
+    });
+  });
+
+  describe("occupied", () => {
+    test("has its own line, with no replace button and no ? badge", async () => {
+      coordinators({ "/r": "occupied" });
+      const { v, cx } = await start();
+      const t = tree(v, cx);
+      expect(textOf(t)).toContain(OCCUPIED);
+      expect(textOf(t)).not.toContain(STOPPED);
+      expect(textOf(t)).not.toContain(NO_STATUS);
+      expect(textOf(t)).not.toContain("?");
+      expect(byId(t, "restartbtn-/r")).toBeUndefined();
+      expect(byId(t, "occupied-/r").tip).toContain("Exit it first");
+    });
+
+    describe("says what's there", () => {
+      /** The occupied line and worktree tooltip for this program, the lane with or without a saved session. */
+      async function shown(program: string | null | undefined, session = true) {
+        const [lane] = coordinators({ "/r": "occupied" });
+        if (program !== undefined) (lane as any).coordinatorProgram = program;
+        if (!session) delete (lane as any).coordinator.session;
+        const { v, cx } = await start();
+        const t = tree(v, cx);
+        return { text: textOf(t), tip: byId(t, "occupied-/r").tip as string, head: byId(t, "wt-/r").tip as string };
+      }
+
+      test("Claude with a saved session: that conversation comes back, not this one", async () => {
+        const { text, tip, head } = await shown("claude");
+        expect(text).toContain(PLAIN_CLAUDE);
+        expect(text).not.toContain(OCCUPIED);
+        expect(tip).toContain("started by hand and isn't the coordinator");
+        expect(tip).toContain("/exit it, then click the worktree");
+        expect(tip).toContain("saved conversation comes back, not this session, which stays in its own transcript");
+        expect(head).toContain(tip);
+      });
+
+      test("Claude with no saved session: a new conversation", async () => {
+        const { text, tip } = await shown("claude", false);
+        expect(text).toContain(PLAIN_CLAUDE);
+        expect(tip).toContain("/exit it");
+        expect(tip).toContain("starts a new conversation");
+        expect(tip).not.toContain("saved conversation");
+      });
+
+      for (const session of [true, false]) {
+        test(`another program is named${session ? "" : ", no saved session"}`, async () => {
+          const { text, tip } = await shown("vim", session);
+          expect(text).toContain("vim running, not the coordinator");
+          expect(text).not.toContain("Claude");
+          expect(tip).toContain("vim is running in the coordinator's terminal");
+          expect(tip).toContain("Exit it first");
+          expect(tip).not.toContain("conversation");
+        });
+
+        test(`unknown foreground keeps the generic line${session ? "" : ", no saved session"}`, async () => {
+          const { text, tip } = await shown(null, session);
+          expect(text).toContain(OCCUPIED);
+          expect(tip).toContain("Something else is running");
+          expect(tip).toContain("Exit it first");
+        });
+      }
+
+      test("a board from an older hcoord, with no such field: the generic line", async () => {
+        expect((await shown(undefined)).text).toContain(OCCUPIED);
+      });
+    });
+
+    test("a click, on the line or the worktree, peeks and starts nothing", async () => {
+      coordinators({ "/r": "occupied" });
+      const { v, cx } = await start();
+      await click(byId(tree(v, cx), "occupied-/r"), cx);
+      await click(head(v, cx, "/r"), cx);
+      expect(world.runs).toEqual([["terminal.peek", { terminal: "t0" }], ["terminal.peek", { terminal: "t0" }]]);
+      expect(laneOpens()).toEqual([]);
+      expect(world.notes).toEqual([]);
+    });
+
+    test("a Claude started by hand there doesn't count as the coordinator", async () => {
+      coordinators({ "/r": "occupied" });
+      world.agents = [{ address: "t0", space: "s1", status: "working" }];
+      const { v, cx } = await start();
+      expect(textOf(tree(v, cx))).toContain(OCCUPIED);
+      await click(head(v, cx, "/r"), cx);
+      expect(world.runs).toEqual([["terminal.peek", { terminal: "t0" }]]);
+    });
+
+    test("switching to its space leaves it alone", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "occupied" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      const { v, cx } = await start();
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      expect(laneOpens()).toEqual([]);
+      expect(world.runs).toEqual([]);
+    });
+
+    test("Raise PR leaves the refusing to hcoord, whose message names what's running", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "occupied" });
+      world.board.projects[0].defaultBranch = { name: "main", path: "/r", checkedOut: true };
+      world.answers["lane say"] = { code: 1, stdout: "", stderr: "`vim` is running in coord-1 (t1), not the coordinator. hcoord won't stop it.\n" };
+      const { v, cx } = await start();
+      const w = v.worktrees(p()).find((x: any) => x.path === "/home/wt/a");
+      await v.raisePr(p(), w, cx);
+      expect(world.notes.map((n) => n.level)).toEqual(["error"]);
+      expect(world.notes[0].body).toContain("vim");
+    });
+
+    test("isn't counted as stopped", async () => {
+      coordinators({ "/r": "occupied", "/home/wt/a": "occupied", "/home/wt/b": "shell" });
+      const { v, cx } = await start();
+      expect(textOf(tree(v, cx))).not.toContain("coordinators stopped");
+    });
+  });
+
+  describe("prompt", () => {
+    test("keeps its row and replace button", async () => {
+      coordinators({ "/r": "prompt" });
+      const { v, cx } = await start();
+      const t = tree(v, cx);
+      expect(textOf(t)).toContain(NO_STATUS);
+      expect(textOf(t)).toContain("?");
+      expect(textOf(t)).not.toContain(STOPPED);
+      await click({ click: (e: any, c: any) => byId(t, "restartbtn-/r").click({ ...e }, { ...c, stop_propagation() {} }) }, cx);
+      expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/r", "--space", "s1", "--restart"]]);
+    });
+
+    test("the row's click peeks", async () => {
+      coordinators({ "/r": "prompt" });
+      const { v, cx } = await start();
+      await click(byId(tree(v, cx), "restart-/r"), cx);
+      expect(world.runs).toEqual([["terminal.peek", { terminal: "t0" }]]);
+    });
+
+    test("goes by the board even if Herdr reports an agent there", async () => {
+      coordinators({ "/r": "prompt" });
+      world.agents = [{ address: "t0", space: "s1", status: "unknown" }];
+      const { v, cx } = await start();
+      expect(textOf(tree(v, cx))).toContain(NO_STATUS);
+    });
+
+    test("isn't brought back by switching to it", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "prompt" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      const { v, cx } = await start();
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      expect(laneOpens()).toEqual([]);
+    });
+  });
+
+  describe("the bring-back line", () => {
+    const line = (v: any, cx: any) => byId(tree(v, cx), "bring-back-r");
+    const three = { "/r": "shell", "/home/wt/a": "shell", "/home/wt/b": "running" };
+
+    test("shows for more than one, counting only the stopped", async () => {
+      coordinators(three);
+      const { v, cx } = await start();
+      expect(textOf(line(v, cx))).toContain("2 coordinators stopped: bring back");
+    });
+
+    test("doesn't show for one", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "running" });
+      const { v, cx } = await start();
+      expect(line(v, cx)).toBeUndefined();
+    });
+
+    test("leaves out a worktree that's gone", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      const [, gone] = p().lanes;
+      gone.present = false;
+      p().checkouts = p().checkouts.filter((c: any) => c.path === "/r");
+      p().tasks = [{ id: "T-1", lane: gone.key, state: "working", waitingOn: [] }];
+      const { v, cx } = await start();
+      expect(line(v, cx)).toBeUndefined();
+      expect(textOf(tree(v, cx))).not.toContain(`${STOPPED} ${STOPPED}`);
+    });
+
+    test("a folded project opens to show it, unless the person folded it", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.board.projects.push({ ...p(), slug: "other", lanes: [], checkouts: [] }); // so it isn't the only project
+      world.focused = null;
+      const { v, cx } = await start();
+      expect(line(v, cx)).toBeTruthy();
+      v.open["p:r"] = false;
+      expect(line(v, cx)).toBeUndefined();
+    });
+
+    test("one click resumes each in turn, without moving the focus", async () => {
+      coordinators(three);
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      const { v, cx } = await start();
+      line(v, cx).click({}, cx);
+      await cx.settle();
+      expect(laneOpens()).toHaveLength(1); // the second waits for the first
+      expect(textOf(line(v, cx))).toContain("Bringing coordinators back");
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(laneOpens()).toEqual([
+        ["hcoord", "lane", "open", "/r", "--space", "s1", "--no-focus", "--json"],
+        ["hcoord", "lane", "open", "/home/wt/a", "--space", "s2", "--no-focus", "--json"],
+      ]);
+      expect(world.runs).toEqual([]);
+      expect(world.notes).toEqual([]);
+    });
+
+    test("if bringing back the focused space closes it for a moment, the person is put back", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.answers["lane open"] = { code: 0, stdout: JSON.stringify({ terminal: "t9", lines: [] }), stderr: "" };
+      world.spaces.push({ id: "s2", folder: "/home", tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      line(v, cx).click({}, cx);
+      await cx.settle();
+      world.focused = "s2"; // Herdr, as the only tab in s1 closes
+      v.followSpace(cx);
+      await cx.settle();
+      expect(laneOpens()).toHaveLength(1); // landing there started nothing
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toEqual([["agent.focus", { terminal: "t9" }]]);
+    });
+
+    test("focus isn't touched when it stayed put", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.answers["lane open"] = { code: 0, stdout: JSON.stringify({ terminal: "t9", lines: [] }), stderr: "" };
+      const { v, cx } = await start();
+      await click(line(v, cx), cx);
+      expect(world.runs).toEqual([]);
+    });
+
+    test("a named space that was closed and made again gets its name back", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell", "/home/wt/b": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", name: "r · a", named: true, tabs: [] });
+      world.spaces.push({ id: "s3", folder: "/home/wt/b", name: "mine", named: true, tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      line(v, cx).click({}, cx);
+      await cx.settle();
+      world.spaces[1] = { id: "s2", folder: "/home/wt/a", name: "a", named: false, tabs: [] };
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toEqual([["space.rename", { id: "s2", name: "r · a" }]]); // s3 kept its name
+    });
+
+    test("one with no space gets a new one, still without the focus moving", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      const { v, cx } = await start();
+      await click(line(v, cx), cx);
+      expect(laneOpens()[1]).toEqual(["hcoord", "lane", "open", "/home/wt/a", "--new-space", "r · a", "--no-focus", "--json"]);
+      expect(world.runs).toEqual([]);
+    });
+
+    test("a second click while it runs does nothing", async () => {
+      coordinators(three);
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      const { v, cx } = await start();
+      const l = line(v, cx);
+      l.click({}, cx);
+      l.click({}, cx);
+      await cx.settle();
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(laneOpens()).toHaveLength(2);
+    });
+
+    test("one that fails says so, and the rest still come back", async () => {
+      coordinators(three);
+      world.answers["lane open"] = { code: 1, stdout: "", stderr: "hcoord: nope\n" };
+      const { v, cx } = await start();
+      await click(line(v, cx), cx);
+      expect(laneOpens()).toHaveLength(2);
+      expect(world.notes).toHaveLength(2);
+      expect(world.notes[0].title).toContain("Couldn't bring back");
+      expect(v.bringing.size).toBe(0);
+      expect(v.busy.size).toBe(0);
+    });
+
+    test("the count follows the board as they come back", async () => {
+      coordinators(three);
+      const { v, cx } = await start();
+      await click(line(v, cx), cx);
+      expect(world.boardRuns).toBeGreaterThan(1);
+      coordinators({ "/r": "running", "/home/wt/a": "running", "/home/wt/b": "running" });
+      v.refresh(cx);
+      await cx.settle();
+      expect(line(v, cx)).toBeUndefined();
+    });
+  });
+
+  test("a board without the state (an older CLI) works as before", async () => {
+    const [l] = coordinators({ "/r": "running" });
+    delete (l as any).coordinatorState;
+    const { v, cx } = await start();
+    expect(textOf(tree(v, cx))).toContain(NO_STATUS);
+    expect(textOf(tree(v, cx))).not.toContain(STOPPED);
   });
 });
