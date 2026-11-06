@@ -49,6 +49,8 @@ export interface Task {
   mergeCommit?: string;
   /** failed because its worker terminal vanished (a reboot, a core restart, hc kill): `hcoord recover` retries it. */
   lostWorker?: boolean;
+  /** Runs the project's cleanup prompt before its worktree is removed: see `Lane.removing`. */
+  cleanup?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -115,6 +117,17 @@ export function transition(
   if (to !== "failed") delete task.lostWorker;
   if (to !== "done") delete task.mergeError;
   return { type: "task.state", task: task.id, from, to, ...(data ? { data } : {}) };
+}
+
+/**
+ * Gives up on a cleanup task, whatever became of it: unlike other tasks it can be cancelled when failed
+ * or done, because its worktree's removal hangs on it. Null when merged or cancelled already.
+ */
+export function abandonCleanup(task: Task, now: string, data?: Record<string, unknown>): StateChange | null {
+  const from = task.state;
+  if (from === "merged" || from === "cancelled") return null;
+  task.state = "todo"; // Every other state's way out, for `transition`'s tidying.
+  return { ...transition(task, "cancelled", now, data), from };
 }
 
 /** Lowercase, words joined by "-", at most `max` chars. */

@@ -16,6 +16,15 @@ export interface CoordinatorRef {
   session?: string;
 }
 
+/** A worktree's removal, waiting for its cleanup task to be merged. */
+export interface PendingRemoval {
+  /** The cleanup task's id. */
+  task: string;
+  /** Remove it even with uncommitted changes. */
+  force: boolean;
+  since: string;
+}
+
 /** A checkout of the project's repo that has (or had) a coordinator: the main one ("root") or a worktree. */
 export interface Lane {
   /** Absolute path of the checkout. */
@@ -23,6 +32,7 @@ export interface Lane {
   /** Its branch when registered (the live one can differ). Null: detached or unknown. */
   branch: string | null;
   coordinator?: CoordinatorRef;
+  removing?: PendingRemoval;
   createdAt: string;
 }
 
@@ -109,13 +119,17 @@ export function loadProject(slug: string): ProjectMeta {
   return normalizeMeta(readJson<ProjectMeta>(paths.projectJson(slug)));
 }
 
+function writeMeta(meta: ProjectMeta): void {
+  atomicWrite(paths.projectJson(meta.slug), JSON.stringify(meta, null, 2) + "\n");
+}
+
 /** Changes project.json under the project lock (re-read inside it). */
 export async function updateMeta<T>(project: string, fn: (meta: ProjectMeta) => { result: T; event?: NewEvent }): Promise<T> {
   const slug = loadProject(project).slug;
   return withLock(paths.lock(slug), () => {
     const meta = loadProject(slug);
     const { result, event } = fn(meta);
-    atomicWrite(paths.projectJson(slug), JSON.stringify(meta, null, 2) + "\n");
+    writeMeta(meta);
     if (event) appendEvents(slug, now(), [event]);
     return result;
   });
@@ -322,6 +336,29 @@ export interface NewTask {
   dependsOn?: string[];
   /** The worktree it belongs to; default $HCOORD_LANE, else the main checkout. */
   lane?: string;
+  cleanup?: boolean;
+}
+
+/** A new todo task at the end of `file`, and the event for it. */
+function appendTask(meta: ProjectMeta, file: TaskFile, input: NewTask & { lane: string }, now: string): { task: Task; event: NewEvent } {
+  const id = `${meta.prefix}-${file.nextId}`;
+  file.nextId += 1;
+  const dependsOn = input.dependsOn ?? [];
+  const task: Task = {
+    id,
+    title: input.title,
+    brief: input.brief,
+    state: "todo",
+    repo: meta.repo,
+    lane: input.lane,
+    branch: branchFor(id, input.title, input.lane),
+    dependsOn,
+    ...(input.cleanup ? { cleanup: true } : {}),
+    createdAt: now,
+    updatedAt: now,
+  };
+  file.tasks.push(task);
+  return { task, event: { type: "task.created", task: id, to: "todo", data: { title: input.title, dependsOn } } };
 }
 
 export async function addTask(slug: string, input: NewTask): Promise<Task> {
@@ -335,29 +372,47 @@ export async function addTask(slug: string, input: NewTask): Promise<Task> {
     if (!meta.lanes[lane]) {
       throw new HcoordError(`${slug} has no worktree "${lane}" (it has: ${Object.keys(meta.lanes).join(", ")})`);
     }
-    const repo = meta.repo;
     const known = new Set(file.tasks.map((t) => t.id));
     const missing = deps.filter((d) => !known.has(d));
     if (missing.length) throw new HcoordError(`unknown task${missing.length > 1 ? "s" : ""} in --depends-on: ${missing.join(", ")}`);
 
-    const id = `${meta.prefix}-${file.nextId}`;
-    file.nextId += 1;
-    const task: Task = {
-      id,
-      title,
-      brief: input.brief,
-      state: "todo",
-      repo,
-      lane,
-      branch: branchFor(id, title, lane),
-      dependsOn: deps,
-      createdAt: now,
-      updatedAt: now,
-    };
-    file.tasks.push(task);
-    return {
-      result: task,
-      events: [{ type: "task.created", task: id, to: "todo", data: { title, dependsOn: deps } }],
-    };
+    const { task, event } = appendTask(meta, file, { title, brief: input.brief, dependsOn: deps, lane }, now);
+    return { result: task, events: [event] };
+  });
+}
+
+/**
+ * Records a worktree's pending removal and adds its cleanup task, under one lock so that two deletes
+ * can't add two tasks. With a removal pending already, returns its task; a `force` now stands too.
+ * A pending removal whose task was cancelled doesn't count.
+ */
+export async function beginRemoval(project: string, lane: string, cleanup: { title: string; brief: string }, force: boolean): Promise<Task> {
+  return mutate(project, ({ meta: { slug }, file, now }) => {
+    const meta = loadProject(slug); // mutate read its copy before taking the lock.
+    const l = meta.lanes[lane];
+    if (!l) throw new HcoordError(`${slug} has no worktree "${lane}"`);
+    const pending = file.tasks.find((t) => t.id === l.removing?.task && t.state !== "cancelled");
+    if (pending) {
+      if (force && !l.removing!.force) {
+        l.removing!.force = true;
+        writeMeta(meta);
+      }
+      return { result: pending, events: [] };
+    }
+    const { task, event } = appendTask(meta, file, { ...cleanup, lane, cleanup: true }, now);
+    l.removing = { task: task.id, force, since: now };
+    writeMeta(meta);
+    return { result: task, events: [event, { type: "lane.removing", task: task.id, data: { lane, path: l.path, force } }] };
+  });
+}
+
+/** Forgets a worktree's pending removal, if it's still the one `task` holds up. Whether there was one. */
+export async function clearRemoval(project: string, lane: string, task: string): Promise<boolean> {
+  if (loadProject(project).lanes[lane]?.removing?.task !== task) return false;
+  return updateMeta(project, (m) => {
+    const l = m.lanes[lane];
+    if (l?.removing?.task !== task) return { result: false };
+    delete l.removing;
+    return { result: true, event: { type: "lane.removal_cleared", task, data: { lane, path: l.path } } };
   });
 }

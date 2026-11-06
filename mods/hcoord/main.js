@@ -6,18 +6,19 @@
 // The same mod with props { log } is a pane showing one agent's log (its transcript); with
 // props { menu } a right-click menu, with props { ask } a dialog asking before a delete, with
 // props { info } a dialog explaining a warning (where hcoord keeps its data), with props { newWorktree }
-// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator), and with
-// props { gitInit } a dialog asking before a plain folder becomes a git repo and a project.
+// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator), with
+// props { gitInit } a dialog asking before a plain folder becomes a git repo and a project, and with
+// props { settings } a project's settings dialog.
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Needs the hcoord CLI: `hcoord mod install` writes how to run it into hcoord-path.js, and without it
 // this section only says how to set it up. Edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView, InputState, Input, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, TextView, InputState, Input, TextareaState, Textarea, Scrollbar } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay, shared, setShared,
+  pickFolder, watchFolder, writeTextFile, layout, home, props, openOverlay, closeOverlay, shared, setShared,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
@@ -33,6 +34,10 @@ const ACTIVE = ["starting", "working", "needs_you"];
 // While the CLI can't be run, how often to see whether that's changed.
 const SETUP_RETRY_MS = 60000;
 const SETUP_URL = "https://github.com/jonathan-fielding/herdr-project-coordinator";
+// How long a merged cleanup task may wait for hcoord to remove its worktree before that counts as having failed.
+const REMOVAL_GRACE_MS = 60000;
+// Shared state: the pending removals whose end has been announced.
+const ANNOUNCED = "hcoord.removals-announced";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -96,6 +101,24 @@ function occupiedWords({ program, session }) {
   };
 }
 
+/** A pending removal that won't finish by itself. A done task with no mergeError is only on its way to merged. */
+function cleanupStuck(removing, task) {
+  if (removing.state === "done") return !!task?.mergeError;
+  // Merged, and the worktree still here for a while: git refused to remove it.
+  if (removing.state === "merged") return Date.now() - Date.parse(task?.updatedAt ?? removing.since) > REMOVAL_GRACE_MS;
+  return !removing.state || removing.state === "failed" || removing.state === "cancelled";
+}
+
+const removalKey = (project, task) => `${project}:${task}`;
+/** Whether to announce a removal's end: yes once, whichever of the dialog and the sidebar copies gets there first. */
+function claimRemoval(key) {
+  const seen = shared(ANNOUNCED) ?? [];
+  if (seen.includes(key)) return false;
+  setShared(ANNOUNCED, [...seen, key]);
+  return true;
+}
+const releaseRemoval = (key) => setShared(ANNOUNCED, (shared(ANNOUNCED) ?? []).filter((k) => k !== key));
+
 /** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
 const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
 
@@ -122,6 +145,26 @@ async function hcoord(args) {
   }
 }
 
+/** hcoord given `text` as a file, since `exec` has no stdin: `args(file)` are its arguments. The file is in a
+ *  private folder of its own and is gone afterwards. Never rejects. */
+async function hcoordWithFile(text, args) {
+  let dir = null;
+  try {
+    const made = await exec("mktemp", ["-d", "-t", "hcoord.XXXXXX"]);
+    dir = made.code === 0 ? made.stdout.trim() : null;
+    if (!dir) return { ok: false, text: `Couldn't make a temporary folder: ${made.stderr.trim()}`, stdout: "" };
+    await writeTextFile(`${dir}/text`, text, null);
+    return await hcoord(args(`${dir}/text`));
+  } catch (e) {
+    return { ok: false, text: String(e?.message ?? e), stdout: "" };
+  } finally {
+    if (dir) {
+      await exec("rm", ["-f", `${dir}/text`]).catch(() => {});
+      await exec("rmdir", [dir]).catch(() => {});
+    }
+  }
+}
+
 /** Makes a checkout with `hcoord lane checkout|new … --json`: { w } the worktree to go to, or { error }. */
 async function makeCheckout(args) {
   const r = await hcoord([...args, "--json"]);
@@ -135,6 +178,9 @@ async function makeCheckout(args) {
 
 /** hcoord's New worktree dialog for a project: { project, name, defaultBranch }. */
 const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 420, props: { newWorktree: n } });
+
+/** hcoord's settings dialog for a project: { project, name }. */
+const openSettings = (s) => openOverlay({ mod: "hcoord", kind: "dialog", width: 520, height: 420, props: { settings: s } });
 
 /** What a worktree's own space is called. */
 const spaceName = (p, w) => (w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`);
@@ -165,6 +211,7 @@ export default class Projects extends View {
     if (props()?.info) return this.initInfo(cx);
     if (props()?.newWorktree) return this.initNew(cx);
     if (props()?.gitInit) return this.initGitInit(cx);
+    if (props()?.settings) return this.initSettings(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.notSetUp = !HCOORD; // the CLI can't be run: the section says how to set it up
@@ -188,6 +235,7 @@ export default class Projects extends View {
     this.order = load("order", []); // project slugs in the order the person dragged them to
     this.drag = null; // { from, over }: a project header pressed, and the project it's over
     this.offer = null; // { repo } the last "make it a project?" toast is about
+    this.removals = load("removals", {}); // removalKey -> { project, path, branch } waiting for a cleanup task
     this.refresh(cx);
     cx.timer.every(SIDEBAR_FALLBACK_MS, (cx) => this.refresh(cx));
     // New spaces settle (their first terminal's folder) for a moment before they're asked about.
@@ -227,6 +275,7 @@ export default class Projects extends View {
             if (!r.ok) throw new Error(r.text || "hcoord board failed");
             this.data = JSON.parse(r.stdout);
             this.error = null;
+            this.noticeRemovals();
             if (!this.watching) this.watch(cx);
           }
         } catch (e) {
@@ -237,6 +286,28 @@ export default class Projects extends View {
       } while (this.again);
       this.loading = false;
     });
+  }
+
+  /** hcoord removes a worktree whose cleanup is merged, with nothing here running: once it's off the board, its
+   *  spaces close as a direct delete's do. A removal called off leaves the worktree, and a deleted project its folders. */
+  noticeRemovals() {
+    const now = {};
+    for (const p of this.data.projects) {
+      for (const l of p.lanes) {
+        if (l.removing) now[removalKey(p.slug, l.removing.task)] = { project: p.slug, path: l.path, branch: l.branch ?? base(l.path) };
+      }
+    }
+    const before = this.removals;
+    this.removals = now;
+    if (JSON.stringify(now) !== JSON.stringify(before)) save("removals", now);
+    for (const [key, r] of Object.entries(before)) {
+      if (now[key]) continue;
+      const p = this.data.projects.find((x) => x.slug === r.project);
+      if (!p || p.lanes.some((l) => l.path === r.path) || p.checkouts.some((c) => c.path === r.path)) continue;
+      if (!claimRemoval(key)) continue;
+      for (const s of this.spacesIn([r.path])) run("space.close", { id: s.id, confirmed: true });
+      notify({ title: `Worktree ${r.branch} deleted`, level: "info", timeout: 8000 });
+    }
   }
 
   watch(cx) {
@@ -810,7 +881,17 @@ export default class Projects extends View {
       .child(this.status(t, c, busy));
 
     const rows = [head];
-    // These two show on a folded worktree too: they're what the person has to act on.
+    // A pending removal, a stopped or an occupied coordinator show on a folded worktree too.
+    if (w.lane?.removing) {
+      const stuck = cleanupStuck(w.lane.removing, tasks.find((x) => x.id === w.lane.removing.task));
+      rows.push(h_flex()
+        .id(`removing-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .tooltip(stuck
+          ? "The worktree was kept. Ask its coordinator what went wrong, or right-click: Delete worktree…"
+          : "Its coordinator is running the cleanup prompt. The worktree is removed once that finishes.")
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(stuck ? t.blocked : t.dim).child(stuck ? "Cleanup failed" : "Cleaning up…")));
+    }
     if (stopped) {
       rows.push(h_flex()
         .id(`stopped-${w.path}`)
@@ -967,6 +1048,7 @@ export default class Projects extends View {
       .child(this.fold(t, key, isOpen))
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .child(this.iconButton(`settings-${p.slug}`, t, "settings", "Project settings", () => openSettings({ project: p.slug, name: p.name })))
       .child(this.iconButton(`newwt-${p.slug}`, t, "plus", "New worktree (with its own coordinator)", () => this.newWorktree(p)));
     const block = (rows) => this.draggable(v_flex().id(`projblock-${p.slug}`).flex_none(), t, p, list).children(rows);
     if (!isOpen) return block([head]);
@@ -1029,6 +1111,7 @@ export default class Projects extends View {
     if (props()?.info) return this.renderInfo(t);
     if (props()?.newWorktree) return this.renderNew(t);
     if (props()?.gitInit) return this.renderGitInit(t);
+    if (props()?.settings) return this.renderSettings(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -1201,7 +1284,7 @@ export default class Projects extends View {
     } });
     if (m.log) items.push({ label: "Coordinator's log", icon: "file-text", go: () => run("pane.split", { direction: "right", mod: "hcoord", props: { log: m.log } }) });
     if (m.main) items.push({ label: "Main checkout: delete the project instead", icon: "folder", disabled: true });
-    else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { ask: { ...m, what: "worktree" } } }) });
+    else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 360, props: { ask: { ...m, what: "worktree" } } }) });
     return items;
   }
 
@@ -1276,33 +1359,51 @@ export default class Projects extends View {
     return spaces().filter((s) => !s.machine && paths.some((p) => within(this.placeOf(s, ps), p)));
   }
 
-  async doDelete(files, cx) {
+  async doDelete(files, cx, { skipCleanup = false } = {}) {
     const a = props().ask;
     const plan = this.plan;
     if (!plan || this.busyAsk) return;
     this.busyAsk = true;
     this.error = null;
     cx.notify();
-    let args, closing = [];
+    let args, closing = [], deferred = false, claimed = null;
     if (a.what === "project") {
       args = ["project", "delete", a.project, ...(files ? ["--files"] : [])];
       // Its folders are about to go: their spaces first, so no shell sits in them.
       if (files) closing = this.spacesIn(plan.checkouts.map((c) => c.path));
     } else {
-      args = ["lane", "remove", plan.path, ...(plan.changed.length ? ["--force"] : [])];
-      closing = this.spacesIn([plan.path]);
+      // A deferred removal needs its coordinator, which lives in those spaces: see noticeRemovals.
+      deferred = !!plan.cleanupPrompt && !skipCleanup;
+      args = ["lane", "remove", plan.path, ...(plan.changed.length ? ["--force"] : []), ...(skipCleanup ? ["--skip-cleanup"] : []), ...(deferred ? ["--json"] : [])];
+      if (!deferred) closing = this.spacesIn([plan.path]);
+      // Ending a pending removal here: the toast below says so, not the sidebar seeing it go.
+      if (plan.removing) {
+        claimed = removalKey(plan.project, plan.removing.task);
+        claimRemoval(claimed);
+      }
     }
     for (const s of closing) run("space.close", { id: s.id, confirmed: true });
     const r = await hcoord(args);
+    const answer = deferred ? parsed(r.stdout) : null;
+    const text = answer?.lines?.join("\n") ?? r.text;
+    const waiting = !!answer?.cleanup;
+    if (claimed && (waiting || !r.ok)) releaseRemoval(claimed);
     this.busyAsk = false;
     if (!r.ok) {
-      this.error = r.text;
+      this.error = text;
       cx.notify();
       return;
     }
+    // Asked to wait, but it's gone: the cleanup had merged already, or the prompt has been cleared since.
+    if (deferred && !waiting) for (const s of this.spacesIn([plan.path])) run("space.close", { id: s.id, confirmed: true });
     closeOverlay(props().overlay);
+    const body = text.split("\n").slice(-3).join("\n");
+    if (waiting) {
+      notify({ title: `Cleanup started for ${a.branch}`, body, level: "info", timeout: 8000 });
+      return;
+    }
     const what = a.what === "project" ? `${a.name} deleted${files ? ", files too" : " from Herdr"}` : `Worktree ${a.branch} deleted`;
-    notify({ title: what, body: r.text.split("\n").slice(-3).join("\n"), level: "info", timeout: 8000 });
+    notify({ title: what, body, level: "info", timeout: 8000 });
   }
 
   askLines(t) {
@@ -1313,6 +1414,12 @@ export default class Projects extends View {
     if (!p) return [line(this.error ? "" : "Looking…", t.dim)];
     if (a.what === "worktree") {
       out.push(line(`${tilde(p.path)} goes, with its Herdr space. The branch ${p.branch ?? "(detached)"} is kept.`));
+      if (p.cleanupPrompt) {
+        out.push(line(p.removing
+          ? `Its cleanup ${p.removing.task} hasn't finished. Delete worktree picks it up again if it stopped; Delete without cleanup removes the worktree now.`
+          : "The coordinator runs the cleanup prompt first, and the worktree is removed once that finishes."));
+        out.push(line(p.cleanupPrompt.split("\n")[0], t.dim));
+      }
       if (p.changed.length) out.push(line(`It has ${p.changed.length} uncommitted file${p.changed.length > 1 ? "s" : ""}: they will be lost (${p.changed.slice(0, 4).join(", ")}${p.changed.length > 4 ? ", …" : ""}).`, t.blocked));
       if (p.coordinator) out.push(line("Its coordinator is stopped."));
       if (p.unfinished.length) out.push(line(`Unfinished tasks are cancelled and their workers stopped: ${p.unfinished.join(", ")}.`, t.blocked));
@@ -1344,6 +1451,7 @@ export default class Projects extends View {
       buttons.push(button("herdr", "Remove from Herdr", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
       buttons.push(button("files", "Delete files too", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(true, cx))));
     } else {
+      if (this.plan?.cleanupPrompt) buttons.push(button("skip", "Delete without cleanup", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx, { skipCleanup: true }))));
       buttons.push(button("yes", "Delete worktree", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
     }
     return v_flex()
@@ -1740,5 +1848,105 @@ export default class Projects extends View {
         .when(Boolean(this.busyNew), (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.busyNew)))
         .child(button("cancel", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay)))
         .child(button("create", "Create", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.createWorktree(cx)))));
+  }
+
+  // ------------------------------------------------------------- project settings dialog
+
+  initSettings(cx) {
+    this.loaded = null; // null: loading, true: loaded, false: it failed. Only true can be saved.
+    this.saving = false;
+    this.error = null;
+    this.promptFocused = false;
+    this.promptBox = TextareaState.new({ value: "", placeholder: "Nothing runs if this is empty.", rows: 8 });
+    this.promptBox.on("change", (_e, cx) => {
+      this.error = null;
+      cx.notify();
+    });
+    for (const [event, on] of [["focus", true], ["blur", false]]) {
+      this.promptBox.on(event, (_e, cx) => {
+        this.promptFocused = on;
+        cx.notify();
+      });
+    }
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+    cx.timer.after(600, () => this.loaded && !this.promptFocused && this.promptBox.focus());
+    cx.spawn(async (cx) => this.loadSettings(cx));
+  }
+
+  /** The box stays out of reach until this answers, so nothing typed can be lost and nothing empty saved. */
+  async loadSettings(cx) {
+    const r = await hcoord(["settings", "show", props().settings.project, "--json"]);
+    const prompt = r.ok ? parsed(r.stdout)?.cleanupPrompt : undefined;
+    if (typeof prompt === "string") {
+      this.promptBox.set_value(prompt);
+      this.loaded = true;
+      this.promptBox.focus();
+    } else {
+      this.loaded = false;
+      this.error = r.ok ? "hcoord's answer had no cleanup prompt." : (r.text || "hcoord failed").replace(/^hcoord: /, "");
+    }
+    cx.notify();
+  }
+
+  async saveSettings(cx) {
+    if (!this.loaded || this.saving) return;
+    this.saving = true;
+    this.error = null;
+    cx.notify();
+    const { project } = props().settings;
+    const r = await hcoordWithFile(this.promptBox.value(), (file) => ["settings", "set", project, "--cleanup-prompt-file", file]);
+    this.saving = false;
+    if (r.ok) return closeOverlay(props().overlay);
+    this.error = (r.text || "hcoord failed").replace(/^hcoord: /, "");
+    cx.notify();
+  }
+
+  /** One setting: label, control, then what it does. A new setting is one more of these in renderSettings. */
+  settingField(t, label, control, helper) {
+    return v_flex().flex_none().gap(4)
+      .child(div().text_size(11.5).text_color(t.dim).child(label))
+      .child(control)
+      .child(div().text_color(t.muted).child(helper));
+  }
+
+  renderSettings(t) {
+    const { name } = props().settings;
+    const frame = (el) => el.w_full().h(170).px(10).py(8).rounded(6).border(1).bg(t.background).text_color(t.foreground);
+    const box = this.loaded
+      ? frame(Textarea.new(this.promptBox)).border_color(this.promptFocused ? t.accent : t.input)
+      : frame(div()).border_color(t.input).text_color(t.dim).child(this.loaded === null ? "Loading…" : "Couldn't load this setting.");
+    const button = (id, label, bg, fg, ready, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "cancel" ? t.input : bg).bg(bg).text_color(fg)
+        .when(ready, (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick))
+        .when(!ready, (el) => el.opacity(0.5))
+        .child(label);
+    return v_flex()
+      .id("hc-settings")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key !== "escape") return;
+        cx.stop_propagation();
+        if (!this.saving) closeOverlay(props().overlay);
+      })
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().flex_none().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child(`Settings for ${name}`))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      // Scrolls once settings outgrow the dialog. Presses stay here, so selecting text can't drag the dialog.
+      .child(v_flex().id("hc-settings-form").flex_1().min_h(0).gap(12).overflow_y_scrollbar()
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(this.settingField(t, "Cleanup prompt", box,
+          "The worktree's coordinator runs this when a worktree of this project is deleted, before its folder is removed.")))
+      .when(Boolean(this.error), (el) => el.child(div().flex_none().text_color(t.blocked).child(this.error)))
+      .child(h_flex().flex_none().justify_end().gap(8).text_size(12)
+        .when(this.saving, (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child("Saving…")))
+        .child(button("cancel", "Cancel", t.raised, t.foreground, !this.saving, () => closeOverlay(props().overlay)))
+        .child(button("save", "Save", t.solid, t.solid_foreground, Boolean(this.loaded) && !this.saving, (_e, cx) => cx.spawn(async (cx) => this.saveSettings(cx)))));
   }
 }

@@ -41,6 +41,16 @@ const world = {
   picked: 0,
   /** Set: `lane open` waits for this, so a test can see what's happening while one runs. */
   hold: null as Promise<void> | null,
+  /** Set: `settings show` waits for this. */
+  holdSettings: null as Promise<void> | null,
+  /** Each project's saved cleanup prompt, as hcoord would keep it. */
+  saved: {} as Record<string, string>,
+  /** The temp files on disk, as writeTextFile left them. */
+  files: {} as Record<string, string>,
+  /** Set: writeTextFile fails with this. */
+  writeError: null as Error | null,
+  /** Herdr's shared state between copies of the mod. */
+  shared: {} as Record<string, any>,
 };
 
 /** A stand-in text field: a value, and handlers the test can fire. */
@@ -69,7 +79,7 @@ class FakeInput {
 const inputs: FakeInput[] = [];
 
 mock.module("gpui-kit", () => ({ View: class {}, div: el, svg: el }));
-mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
+mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, TextareaState: FakeInput, Textarea: { new: el }, Scrollbar: { vertical: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => world.agents,
   terminals: () => world.terminals,
@@ -85,8 +95,22 @@ mock.module("herdr", () => ({
     world.events.push([cmd, ...args].join(" "));
     if (world.execError && cmd !== "git") throw world.execError;
     if (world.hold && args[0] === "lane" && args[1] === "open") await world.hold;
+    if (cmd === "mktemp") return { code: 0, stdout: "/tmp/hcoord.abc\n", stderr: "" };
+    if (cmd === "rm") {
+      delete world.files[args[1]];
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (cmd === "rmdir") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "settings" && args[1] === "show" && world.holdSettings) await world.holdSettings;
     const answer = world.answers[args.slice(0, 2).join(" ")];
     if (answer) return answer;
+    if (args[0] === "settings" && args[1] === "show") {
+      return { code: 0, stdout: JSON.stringify({ cleanupPrompt: world.saved[args[2]] ?? "" }), stderr: "" };
+    }
+    if (args[0] === "settings" && args[1] === "set") {
+      world.saved[args[2]] = world.files[args[args.indexOf("--cleanup-prompt-file") + 1]].trim();
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (args[0] === "board") {
       world.boardRuns++;
       return { code: 0, stdout: JSON.stringify(world.board), stderr: "" };
@@ -98,6 +122,13 @@ mock.module("herdr", () => ({
   notify: (n: any) => void world.notes.push(n),
   nextCommand: () => new Promise(() => {}),
   pickFolder: async () => (world.picked++, null),
+  writeTextFile: async (path: string, text: string, expected: string | null) => {
+    if (world.writeError) throw world.writeError;
+    if (expected !== null) throw new Error("expected a new file");
+    world.files[path] = text;
+    world.events.push(`write ${path}`);
+    return null;
+  },
   watchFolder: () => new Promise(() => {}),
   layout: () => world.layout,
   home: () => "/home",
@@ -107,8 +138,8 @@ mock.module("herdr", () => ({
     world.closed.push(id);
     world.events.push(`close ${id}`);
   },
-  shared: () => null,
-  setShared: () => {},
+  shared: (key: string) => world.shared[key] ?? null,
+  setShared: (key: string, value: any) => void (world.shared[key] = value),
 }));
 (globalThis as any).localStorage ??= { getItem: () => null, setItem: () => {} };
 
@@ -159,6 +190,11 @@ beforeEach(() => {
   world.picked = 0;
   world.layout = null;
   world.hold = null;
+  world.holdSettings = null;
+  world.saved = {};
+  world.files = {};
+  world.writeError = null;
+  world.shared = {};
   inputs.length = 0;
 });
 
@@ -542,6 +578,480 @@ describe("new worktree", () => {
     await v.go(p(), w, cx);
     expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
     expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/feature", "--new-space", "r · feature"]]);
+  });
+});
+
+describe("project settings", () => {
+  const dialog = (project = "r") => {
+    world.props = { overlay: "ov", settings: { project, name: `${project}-name` } };
+    const cx = makeCx();
+    const d: any = new Projects();
+    d.init({}, cx);
+    return { d, cx, box: inputs[inputs.length - 1] };
+  };
+  const key = (d: any, cx: any, k: string) => {
+    let stopped = false;
+    byId(d.render(cx), "hc-settings").keyDown({ key: k }, { ...cx, stop_propagation: () => (stopped = true) });
+    return stopped;
+  };
+  const clickSave = async (d: any, cx: any) => {
+    byId(d.render(cx), "save").click(null, cx);
+    await cx.settle();
+  };
+
+  test("the cog sits just before + on a project row, folded or not, and opens the dialog for that project", async () => {
+    const { v, cx } = await start();
+    const check = (tree: any) => {
+      const ids = walk(tree).map((e) => e?.elementId).filter(Boolean);
+      expect(ids.indexOf("newwt-r")).toBe(ids.indexOf("settings-r") + 1);
+      return byId(tree, "settings-r");
+    };
+    v.open["p:r"] = true;
+    const cog = check(v.render(cx));
+    expect(cog.tip).toBe("Project settings");
+    v.open["p:r"] = false;
+    check(v.render(cx));
+    const stop = { ...cx, stop_propagation() {} };
+    cog.click(null, stop);
+    expect(world.overlays).toHaveLength(1);
+    expect(world.overlays[0]).toMatchObject({ mod: "hcoord", kind: "dialog", props: { settings: { project: "r", name: "r" } } });
+  });
+
+  test("it says what it's for and which project, with Esc shown", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    const text = textOf(d.render(cx));
+    expect(text).toContain("Settings for r-name");
+    expect(text).toContain("Esc");
+    expect(text).toContain("Cleanup prompt");
+    expect(text).toContain("before its folder is removed");
+    expect(text).toContain("Cancel");
+    expect(text).toContain("Save");
+  });
+
+  test("the box shows no text field and Save does nothing until the setting has loaded", async () => {
+    world.saved.r = "old prompt";
+    let answer = () => {};
+    world.holdSettings = new Promise((r) => (answer = r));
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    expect(textOf(d.render(cx))).toContain("Loading…");
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    box.text = "typed while it loads"; // nothing on screen takes this, but a save mustn't send it anyway
+    await d.saveSettings(cx);
+    expect(world.calls.filter((c) => c.includes("set"))).toEqual([]);
+
+    answer();
+    await cx.settle();
+    expect(textOf(d.render(cx))).not.toContain("Loading…");
+    expect(box.value()).toBe("old prompt");
+    expect(byId(d.render(cx), "save").click).toBeFunction();
+  });
+
+  test("several lines save and come back, per project, through a file that doesn't stay", async () => {
+    const prompt = "stop the dev server\n\ndrop the test database\n  (indented, \"quoted\" $HOME)";
+    const a = dialog("r");
+    await a.cx.settle();
+    a.box.text = prompt;
+    await clickSave(a.d, a.cx);
+    expect(world.closed).toEqual(["ov"]);
+
+    const b = dialog("other");
+    await b.cx.settle();
+    expect(b.box.value()).toBe("");
+    b.box.text = "other's prompt";
+    await clickSave(b.d, b.cx);
+
+    const again = dialog("r");
+    await again.cx.settle();
+    expect(again.box.value()).toBe(prompt);
+    expect(world.saved.other).toBe("other's prompt");
+
+    const set = world.calls.find((c) => c.includes("set"))!;
+    expect(set).toEqual(["hcoord", "settings", "set", "r", "--cleanup-prompt-file", "/tmp/hcoord.abc/text"]);
+    expect(world.files).toEqual({});
+    expect(world.calls).toContainEqual(["rmdir", "/tmp/hcoord.abc"]);
+  });
+
+  test("a prompt can be emptied", async () => {
+    world.saved.r = "old prompt";
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    box.text = "";
+    await clickSave(d, cx);
+    expect(world.saved.r).toBe("");
+    expect(world.closed).toEqual(["ov"]);
+  });
+
+  test("a load that fails stays in the dialog and can't be saved", async () => {
+    world.answers["settings show"] = { code: 1, stdout: "", stderr: "hcoord: unknown project r" };
+    const { d, cx } = dialog();
+    await cx.settle();
+    const text = textOf(d.render(cx));
+    expect(text).toContain("unknown project r");
+    expect(text).not.toContain("hcoord:");
+    expect(text).not.toContain("Loading…");
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    await d.saveSettings(cx);
+    expect(world.calls.filter((c) => c.includes("set"))).toEqual([]);
+  });
+
+  test("an answer with no cleanup prompt is a failed load too, not an empty box to save", async () => {
+    world.answers["settings show"] = { code: 0, stdout: "{}", stderr: "" };
+    const { d, cx } = dialog();
+    await cx.settle();
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    expect(textOf(d.render(cx))).toContain("no cleanup prompt");
+  });
+
+  test("a save that fails stays in the dialog, keeps the text, and typing clears the error", async () => {
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    world.answers["settings set"] = { code: 1, stdout: "", stderr: "hcoord: disk full" };
+    box.text = "my prompt";
+    await clickSave(d, cx);
+    expect(textOf(d.render(cx))).toContain("disk full");
+    expect(world.closed).toEqual([]);
+    expect(box.value()).toBe("my prompt");
+    expect(world.files).toEqual({});
+    box.handlers.change(null, cx);
+    expect(textOf(d.render(cx))).not.toContain("disk full");
+  });
+
+  test("a temp file that can't be written stays in the dialog as well", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    world.writeError = new Error("no space left");
+    await clickSave(d, cx);
+    expect(textOf(d.render(cx))).toContain("no space left");
+    expect(world.closed).toEqual([]);
+    expect(world.calls).toContainEqual(["rmdir", "/tmp/hcoord.abc"]);
+  });
+
+  test("Esc and Cancel close it, Enter doesn't, and neither closes it during a save", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    expect(key(d, cx, "enter")).toBe(false);
+    expect(world.closed).toEqual([]);
+    d.saving = true;
+    expect(key(d, cx, "escape")).toBe(true);
+    expect(byId(d.render(cx), "cancel").click).toBeNull();
+    expect(world.closed).toEqual([]);
+    d.saving = false;
+    key(d, cx, "escape");
+    byId(d.render(cx), "cancel").click(null, cx);
+    expect(world.closed).toEqual(["ov", "ov"]);
+  });
+});
+
+describe("deleting a worktree", () => {
+  const PATH = "/wt/feat";
+  const SPACE = { id: "s2", folder: PATH, tabs: [] };
+  const plan = (over: any = {}) => ({ project: "r", path: PATH, branch: "feat", changed: [], unfinished: [], coordinator: "t1", cleanupPrompt: null, removing: null, ...over });
+  const pending = { task: "R-9", state: "working", force: false, since: "2026-11-06T10:00:00.000Z" };
+  const task = (over: any = {}) => ({ id: "R-9", lane: "feat", title: "Clean up", state: "working", updatedAt: new Date().toISOString(), ...over });
+
+  /** The board with worktree feat, its removal pending if given. */
+  function board(removing: any = null, tasks: any[] = []) {
+    const lane = { key: "feat", path: PATH, branch: "feat", present: true, removing };
+    world.board = project(["/r", PATH], [lane]);
+    world.board.projects[0].tasks = tasks;
+  }
+  const gone = () => {
+    world.board = project(["/r"]);
+  };
+
+  /** Opens the dialog on a dry run answering `p`. */
+  async function dialog(p: any) {
+    world.answers["lane remove"] = { code: 0, stdout: JSON.stringify(p), stderr: "" };
+    world.props = { overlay: "ov", ask: { what: "worktree", project: "r", name: "r", path: PATH, branch: "feat" } };
+    world.spaces = [{ id: "s1", folder: "/r", tabs: [] }, SPACE];
+    const cx = makeCx();
+    const v: any = new Projects();
+    v.init({}, cx);
+    await cx.settle();
+    return { v, cx };
+  }
+  const answer = (code: number, out: any, stderr = "") => {
+    world.answers["lane remove"] = { code, stdout: typeof out === "string" ? out : JSON.stringify(out), stderr };
+  };
+  const press = async (t: any, id: string) => {
+    byId(t.v.render(t.cx), id).click({}, t.cx);
+    await t.cx.settle();
+  };
+  const removes = () => world.calls.filter((c) => c[1] === "lane" && c[2] === "remove" && !c.includes("--dry-run")).map((c) => c.slice(3));
+  const closes = () => world.runs.filter(([n]) => n === "space.close").map(([, a]) => a.id);
+  const refresh = async (t: any) => {
+    t.v.refresh(t.cx);
+    await t.cx.settle();
+  };
+
+  test("the menu opens the dialog, tall enough for the cleanup lines", async () => {
+    world.props = { overlay: "ov", menu: { kind: "worktree", project: "r", name: "r", path: PATH, branch: "feat" } };
+    const cx = makeCx();
+    const v: any = new Projects();
+    v.init({}, cx);
+    v.choose(0);
+    expect(world.overlays[0]).toMatchObject({ width: 460, height: 360, props: { ask: { what: "worktree", path: PATH } } });
+  });
+
+  describe("with no cleanup prompt", () => {
+    test("has the one Delete button and no word of cleanup", async () => {
+      const t = await dialog(plan());
+      const body = textOf(t.v.render(t.cx));
+      expect(body).not.toMatch(/cleanup/i);
+      expect(byId(t.v.render(t.cx), "skip")).toBeUndefined();
+    });
+
+    test("closes the spaces, then runs hcoord with no extra flags, then toasts", async () => {
+      const t = await dialog(plan());
+      answer(0, "line 1\nline 2\nline 3\nline 4");
+      await press(t, "yes");
+      expect(removes()).toEqual([[PATH]]);
+      expect(world.events.findIndex((e) => e.startsWith("run space.close"))).toBeLessThan(world.events.findIndex((e) => e.endsWith(`lane remove ${PATH}`)));
+      expect(closes()).toEqual(["s2"]);
+      expect(world.closed).toEqual(["ov"]);
+      expect(world.notes).toEqual([{ title: "Worktree feat deleted", body: "line 2\nline 3\nline 4", level: "info", timeout: 8000 }]);
+    });
+
+    test("uncommitted files are forced, as the dialog warned", async () => {
+      const t = await dialog(plan({ changed: ["a.txt"] }));
+      await press(t, "yes");
+      expect(removes()).toEqual([[PATH, "--force"]]);
+    });
+
+    test("an error stays in the dialog", async () => {
+      const t = await dialog(plan());
+      answer(1, "", "hcoord: nope");
+      await press(t, "yes");
+      expect(textOf(t.v.render(t.cx))).toContain("hcoord: nope");
+      expect(world.closed).toEqual([]);
+      expect(world.notes).toEqual([]);
+    });
+  });
+
+  describe("with a cleanup prompt", () => {
+    const PROMPT = plan({ cleanupPrompt: "Archive the notes\nThen tidy up" });
+
+    test("says what will happen, shows the prompt's first line, and offers both buttons", async () => {
+      const t = await dialog(PROMPT);
+      const body = textOf(t.v.render(t.cx));
+      expect(body).toContain("The coordinator runs the cleanup prompt first, and the worktree is removed once that finishes.");
+      expect(body).toContain("Archive the notes");
+      expect(body).not.toContain("Then tidy up");
+      expect(textOf(byId(t.v.render(t.cx), "skip"))).toBe("Delete without cleanup");
+      expect(textOf(byId(t.v.render(t.cx), "yes"))).toBe("Delete worktree");
+    });
+
+    test("Delete worktree leaves the spaces open and toasts that cleanup started", async () => {
+      const t = await dialog(PROMPT);
+      answer(0, { path: PATH, ok: true, cleanup: "R-9", lines: ["cancelled R-3", `${PATH} is removed once R-9 is merged`] });
+      await press(t, "yes");
+      expect(removes()).toEqual([[PATH, "--json"]]);
+      expect(closes()).toEqual([]);
+      expect(world.closed).toEqual(["ov"]);
+      expect(world.notes.map((n) => n.title)).toEqual(["Cleanup started for feat"]);
+      expect(world.notes[0].body).toBe(`cancelled R-3\n${PATH} is removed once R-9 is merged`);
+    });
+
+    test("Delete without cleanup is a direct delete: spaces closed first", async () => {
+      const t = await dialog(PROMPT);
+      answer(0, "removed");
+      await press(t, "skip");
+      expect(removes()).toEqual([[PATH, "--skip-cleanup"]]);
+      expect(closes()).toEqual(["s2"]);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+    });
+
+    test("uncommitted files are forced on both paths", async () => {
+      const t = await dialog({ ...PROMPT, changed: ["a.txt"] });
+      answer(0, { ok: true, cleanup: "R-9", lines: ["x"] });
+      await press(t, "yes");
+      expect(removes()).toEqual([[PATH, "--force", "--json"]]);
+      const u = await dialog({ ...PROMPT, changed: ["a.txt"] });
+      answer(0, "removed");
+      world.calls = [];
+      await press(u, "skip");
+      expect(removes()).toEqual([[PATH, "--force", "--skip-cleanup"]]);
+    });
+
+    test("hcoord refusing shows the reason, not JSON, and leaves the spaces", async () => {
+      const t = await dialog(PROMPT);
+      answer(1, { ok: false, cleanup: "R-9", lines: ["couldn't reach its coordinator"] });
+      await press(t, "yes");
+      const body = textOf(t.v.render(t.cx));
+      expect(body).toContain("couldn't reach its coordinator");
+      expect(body).not.toContain('"cleanup"');
+      expect(closes()).toEqual([]);
+      expect(world.closed).toEqual([]);
+    });
+
+    test("a removal that needed no waiting after all closes the spaces and says deleted", async () => {
+      const t = await dialog(PROMPT);
+      answer(0, { ok: true, cleanup: null, lines: ["removed worktree"] });
+      await press(t, "yes");
+      expect(closes()).toEqual(["s2"]);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+    });
+  });
+
+  describe("reopened while its removal is pending", () => {
+    const WAITING = plan({ cleanupPrompt: "Archive the notes", removing: { task: "R-9", force: false, since: pending.since } });
+
+    test("says so, and offers the way out", async () => {
+      const t = await dialog(WAITING);
+      expect(textOf(t.v.render(t.cx))).toContain("Its cleanup R-9 hasn't finished.");
+      expect(textOf(byId(t.v.render(t.cx), "skip"))).toBe("Delete without cleanup");
+    });
+
+    test("Delete without cleanup: one toast, though the sidebar sees it go as well", async () => {
+      board({ ...pending, state: "failed" }, [task({ state: "failed" })]);
+      const side = await start();
+      const t = await dialog(WAITING);
+      answer(0, "removed");
+      await press(t, "skip");
+      gone();
+      await refresh(side);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+    });
+
+    test("if that fails the removal is still the sidebar's to announce", async () => {
+      board({ ...pending, state: "failed" }, [task({ state: "failed" })]);
+      const side = await start();
+      const t = await dialog(WAITING);
+      answer(1, "", "hcoord: nope");
+      await press(t, "skip");
+      gone();
+      await refresh(side);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+    });
+  });
+
+  describe("the row", () => {
+    const line = (v: any, cx: any) => byId(v.render(cx), `removing-${PATH}`);
+    const showing = async (removing: any, tasks: any[] = []) => {
+      board(removing, tasks);
+      world.spaces = [{ id: "s1", folder: "/r", tabs: [] }];
+      const { v, cx } = await start();
+      return textOf(line(v, cx));
+    };
+
+    test("no pending removal, no line, as on a board from an older hcoord", async () => {
+      expect(await showing(undefined)).toBe("");
+      expect(await showing(null)).toBe("");
+    });
+
+    for (const state of ["todo", "queued", "starting", "working", "needs_you"]) {
+      test(`${state}: Cleaning up…`, async () => {
+        expect(await showing({ ...pending, state }, [task({ state })])).toBe("Cleaning up…");
+      });
+    }
+
+    test("failed: Cleanup failed", async () => {
+      expect(await showing({ ...pending, state: "failed" }, [task({ state: "failed" })])).toBe("Cleanup failed");
+    });
+
+    test("done but not merged: Cleanup failed; done on its way to merged doesn't flash it", async () => {
+      expect(await showing({ ...pending, state: "done" }, [task({ state: "done", mergeError: "conflict" })])).toBe("Cleanup failed");
+      expect(await showing({ ...pending, state: "done" }, [task({ state: "done" })])).toBe("Cleaning up…");
+    });
+
+    test("merged: still cleaning up, until the worktree should have gone", async () => {
+      const state = "merged";
+      expect(await showing({ ...pending, state }, [task({ state })])).toBe("Cleaning up…");
+      const old = new Date(Date.now() - 120000).toISOString();
+      expect(await showing({ ...pending, state }, [task({ state, updatedAt: old })])).toBe("Cleanup failed");
+    });
+
+    test("a task that's gone can't finish", async () => {
+      expect(await showing({ ...pending, state: null })).toBe("Cleanup failed");
+    });
+
+    test("the row stays usable, and the line shows on a folded worktree", async () => {
+      board({ ...pending, state: "failed" }, [task({ state: "failed" })]);
+      world.spaces = [{ id: "s1", folder: "/r", tabs: [] }];
+      const { v, cx } = await start();
+      v.open[`w:${PATH}`] = false;
+      expect(textOf(line(v, cx))).toBe("Cleanup failed");
+      byId(v.render(cx), `wt-${PATH}`).click({}, cx);
+      await cx.settle();
+      expect(laneOpens().length).toBe(1);
+    });
+  });
+
+  describe("when the removal finishes", () => {
+    const side = async (removing: any = pending) => {
+      board(removing, [task()]);
+      world.spaces = [{ id: "s1", folder: "/r", tabs: [] }, SPACE];
+      return start();
+    };
+
+    test("its spaces close and the toast says so, once", async () => {
+      const t = await side();
+      await refresh(t);
+      expect(closes()).toEqual([]);
+      gone();
+      await refresh(t);
+      expect(closes()).toEqual(["s2"]);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+      await refresh(t);
+      expect(world.notes.length).toBe(1);
+    });
+
+    test("two sidebar copies: one toast", async () => {
+      const a = await side();
+      const b = await side();
+      gone();
+      await refresh(a);
+      await refresh(b);
+      expect(world.notes.length).toBe(1);
+    });
+
+    test("a removal called off leaves the worktree and its spaces alone", async () => {
+      const t = await side();
+      board(null);
+      await refresh(t);
+      expect(closes()).toEqual([]);
+      expect(world.notes).toEqual([]);
+    });
+
+    test("nor does a project deleted meanwhile close anything: its folders stay", async () => {
+      const t = await side();
+      world.board = { ...project([]), projects: [] };
+      await refresh(t);
+      expect(closes()).toEqual([]);
+      expect(world.notes).toEqual([]);
+    });
+
+    test("a board that can't be read isn't the worktree going", async () => {
+      const t = await side();
+      world.answers["board --json"] = { code: 1, stdout: "", stderr: "broken" };
+      await refresh(t);
+      expect(closes()).toEqual([]);
+    });
+
+    test("a worktree that shows on as the virtual default branch has gone too", async () => {
+      const t = await side();
+      gone();
+      world.board.projects[0].defaultBranch = { name: "feat", path: PATH, checkedOut: false };
+      await refresh(t);
+      expect(closes()).toEqual(["s2"]);
+    });
+
+    test("one that finished while the mod was away is still noticed", async () => {
+      const key = "removals";
+      const real = localStorage.getItem;
+      (localStorage as any).getItem = (k: string) => (k === key ? JSON.stringify({ "r:R-9": { project: "r", path: PATH, branch: "feat" } }) : null);
+      try {
+        gone();
+        world.spaces = [{ id: "s1", folder: "/r", tabs: [] }, SPACE];
+        await start();
+      } finally {
+        (localStorage as any).getItem = real;
+      }
+      expect(closes()).toEqual(["s2"]);
+      expect(world.notes.map((n) => n.title)).toEqual(["Worktree feat deleted"]);
+    });
   });
 });
 

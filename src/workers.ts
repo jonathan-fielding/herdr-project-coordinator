@@ -7,10 +7,11 @@ import { HcoordError, UsageError } from "./errors.ts";
 import { commitsSince, dirtyFiles, ensureWorktree, mergeBranch, mergedInto, removeWorktree } from "./git.ts";
 import { withLock } from "./fsutil.ts";
 import { hcCall, hcGet, hcKill, hcList, hcRm, hcRunBg, hcSend, type HcTerminal } from "./hc.ts";
-import { ACTIVE_STATES, depMet, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
+import { abandonCleanup, ACTIVE_STATES, depMet, FINAL_STATES, transition, workerName, type Task, type TaskState } from "./model.ts";
 import { paths } from "./paths.ts";
+import { finishRemoval, stop } from "./remove.ts";
 import { byNumber } from "./render.ts";
-import { findTask, loadProject, loadTasks, mutate, type CoordinatorRef, type Lane, type NewEvent, type ProjectMeta } from "./store.ts";
+import { clearRemoval, findTask, loadProject, loadTasks, mutate, type CoordinatorRef, type Lane, type NewEvent, type ProjectMeta } from "./store.ts";
 
 /** What a command did, line by line, and whether all of it worked. */
 export interface Outcome {
@@ -377,8 +378,14 @@ export async function retryTask(idArg: string, opts: { parent?: string } = {}): 
     if (t.state !== "failed" && t.state !== "cancelled") {
       throw new HcoordError(`${t.id} is ${t.state}; only failed or cancelled tasks can be retried`);
     }
+    if (t.cleanup && loadProject(meta.slug).lanes[t.lane]?.removing?.task !== t.id) {
+      throw new HcoordError(`${t.id} cleans up for a removal that was called off; delete the worktree again to run it`);
+    }
     return { result: null, events: [transition(t, "todo", now, { by: "retry" })] };
   });
+  // A worker that reported failed is still there, and would hold the new one's name.
+  const old = ourTerminal(task);
+  if (old?.state === "live") hcKill(old.address);
   return startTask(task.id, opts);
 }
 
@@ -462,6 +469,7 @@ export async function report(
   const out: Outcome = { ok: true, lines: [`${id} → ${state}; report saved to ${reportPath}`] };
   // Done work goes into its worktree's branch at once, so the next task starts from it.
   let merged = "";
+  let cleanupMerged = false;
   if (state === "done") {
     // Whatever happens here, the coordinator is still told and the queue still moves.
     let m: Outcome & { nothing?: boolean };
@@ -479,6 +487,7 @@ export async function report(
       m = { ok: false, lines: [error] };
     }
     out.lines.push(...m.lines);
+    cleanupMerged = m.ok && !!task.cleanup;
     const into = meta.lanes[task.lane]?.branch ?? task.lane;
     merged = !m.ok ? ` (NOT merged: ${m.lines.at(-1)})` : m.nothing ? ` (nothing to merge: no commits that ${into} doesn't already have)` : ` (merged into ${into})`;
   }
@@ -490,11 +499,18 @@ export async function report(
       out.lines.push(r.ok ? `notified the coordinator (${parent})` : `warning: couldn't notify ${parent}: ${r.error}`);
     }
   }
+  // After the note above: this ends the coordinator it went to. The report itself stands either way.
+  const finish = cleanupMerged ? await tryFinishRemoval(slug, id) : null;
+  if (finish) {
+    out.lines.push(...finish.lines);
+    if (!finish.ok && parent && opts.notify !== false) hcSend(parent, `${id} merged, but ${finish.lines.at(-1)}`);
+  }
   if (state !== "needs_you") {
     const s = await schedule(slug, parent ? { lane: task.lane, address: parent } : undefined);
     out.lines.push(...s.lines);
     out.ok &&= s.ok;
   }
+  stopAfterRemoval(finish, out.lines);
   return out;
 }
 
@@ -517,14 +533,34 @@ export async function replyTask(idArg: string, text: string): Promise<Outcome> {
 
 // ---------------------------------------------------------------- merging back
 
+/** finishRemoval, turning anything thrown into a failure: whatever called has its own work to complete. */
+async function tryFinishRemoval(slug: string, id: string): ReturnType<typeof finishRemoval> {
+  try {
+    return await finishRemoval(slug, id);
+  } catch (e) {
+    return { ok: false, lines: [`the worktree wasn't removed: ${errText(e)}`] };
+  }
+}
+
+/** Stops a removed worktree's coordinator: the last thing to do, as it may be what's running us. */
+function stopAfterRemoval(finish: Awaited<ReturnType<typeof finishRemoval>>, lines: string[]): void {
+  const s = finish && stop(finish.coordinator);
+  if (s) lines.push(s);
+}
+
 /**
  * Merges a done task's branch into its worktree's branch (in the worktree). One merge per worktree
  * at a time. A conflict leaves everything as it was and the task done with `mergeError`.
+ * A merged cleanup task finishes its worktree's removal, even if it was merged earlier and the removal
+ * failed then. `quiet`: the caller (report) does that and starts queued tasks itself.
  */
 export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): Promise<Outcome & { nothing?: boolean }> {
   const { meta, task } = findTask(idArg);
   const id = task.id;
-  if (task.state === "merged") return { ok: true, lines: [`${id} is already merged`] };
+  if (task.state === "merged") {
+    const lines = [`${id} is already merged`];
+    return task.cleanup && !opts.quiet ? afterMerge(meta.slug, task, lines) : { ok: true, lines };
+  }
   if (task.state !== "done") throw new HcoordError(`${id} is ${task.state}; only done tasks are merged`);
   const lane = laneOf(meta, task.lane);
   if (!existsSync(lane.path)) throw new HcoordError(`${id}'s worktree ${lane.path} is gone`);
@@ -547,13 +583,20 @@ export async function mergeTask(idArg: string, opts: { quiet?: boolean } = {}): 
         ? `nothing to merge: ${task.branch} has no commits that ${result.into} doesn't already have`
         : `merged ${task.branch} into ${result.into} (${result.commit}) in ${lane.path}`,
     ];
-    if (!opts.quiet) {
-      const s = await schedule(meta.slug);
-      lines.push(...s.lines);
-    }
-    return { ok: true, lines, nothing: !!result.nothing };
+    if (opts.quiet) return { ok: true, lines, nothing: !!result.nothing };
+    return { ...(await afterMerge(meta.slug, task, lines)), nothing: !!result.nothing };
   }
   return { ok: false, lines: [result.error] };
+}
+
+/** `task merge`'s last steps: a cleanup task's removal, then whatever can start now. */
+async function afterMerge(slug: string, task: Task, lines: string[]): Promise<Outcome> {
+  const finish = task.cleanup ? await tryFinishRemoval(slug, task.id) : null;
+  if (finish) lines.push(...finish.lines);
+  const s = await schedule(slug);
+  lines.push(...s.lines);
+  stopAfterRemoval(finish, lines);
+  return { ok: finish?.ok ?? true, lines };
 }
 
 // ---------------------------------------------------------------- cancel / clean
@@ -564,10 +607,16 @@ export async function cancelTask(idArg: string): Promise<Outcome> {
   const term = ourTerminal(task);
   await mutate(meta.slug, ({ file, now }) => {
     const t = get(file, id);
+    // A failed or done cleanup task can go too: that's how to keep a worktree after all.
+    const given = t.cleanup ? abandonCleanup(t, now) : null;
+    if (given) return { result: null, events: [given] };
     if (FINAL_STATES.includes(t.state)) throw new HcoordError(`${id} is already ${t.state}`);
     return { result: null, events: [transition(t, "cancelled", now)] };
   });
   const out: Outcome = { ok: true, lines: [`${id} cancelled${task.worktree ? `; worktree kept at ${task.worktree}` : ""}`] };
+  if (task.cleanup && (await clearRemoval(meta.slug, task.lane, id))) {
+    out.lines.push(`the removal of worktree ${task.lane} is called off; it stays`);
+  }
   if (term?.state === "live") {
     const k = hcKill(term.address);
     out.lines.push(k.ok ? `stopped ${term.name} (${term.address})` : `warning: couldn't stop ${term.address}: ${k.error}`);

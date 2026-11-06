@@ -20,6 +20,8 @@ export interface BoardTask {
   summary?: string;
   /** done but not merged: why. */
   mergeError?: string;
+  /** It runs the cleanup prompt before its worktree is removed. */
+  cleanup?: boolean;
   /** The worker's hc address, while it has one. */
   terminal?: string;
   /** It has a Claude transcript to show. */
@@ -41,6 +43,8 @@ export interface BoardLane {
   coordinatorState: CoordinatorState;
   /** When occupied, the program there ("claude", "vim"); null if the core doesn't say, and in every other state. */
   coordinatorProgram: string | null;
+  /** Its removal, waiting for this cleanup task to be merged; null when none is pending. */
+  removing: { task: string; state: TaskState | null; force: boolean; since: string } | null;
 }
 
 export interface BoardProject {
@@ -85,6 +89,7 @@ function boardTask(t: Task, all: Map<string, Task>): BoardTask {
   if (t.needsYouReason) b.reason = t.needsYouReason;
   if (t.summary) b.summary = t.summary;
   if (t.mergeError) b.mergeError = t.mergeError;
+  if (t.cleanup) b.cleanup = true;
   if (t.terminal) b.terminal = t.terminal.address;
   return b;
 }
@@ -123,6 +128,7 @@ export function board(): Board {
           coordinator: l.coordinator ?? null,
           coordinatorState: state,
           coordinatorProgram: program,
+          removing: l.removing ? { ...l.removing, state: all.get(l.removing.task)?.state ?? null } : null,
         };
       });
     return {
