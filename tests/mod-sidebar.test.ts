@@ -671,6 +671,62 @@ describe("coordinators a restart stopped", () => {
       expect(laneOpens()).toHaveLength(2);
     });
 
+    test("switching there keeps the space's name if replacing it closes the space", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", name: "r · a", named: true, tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      world.spaces[1] = { id: "s2", folder: "/home/wt/a", name: "a", named: false, tabs: [] };
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toContainEqual(["space.rename", { id: "s2", name: "r · a" }]);
+    });
+
+    test("and its place in the list", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell" });
+      const moved = { id: "s2", folder: "/home/wt/a", tabs: [] };
+      world.spaces.unshift(moved);
+      world.focused = "s1";
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      world.focused = "s2";
+      v.followSpace(cx);
+      await cx.settle();
+      world.spaces.reverse(); // made again, last
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toContainEqual(["space.move", { id: "s2", index: 1 }]);
+    });
+
+    test("the focus landing elsewhere while one is replaced doesn't resume that space's coordinator too", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", tabs: [] });
+      world.focused = "s2";
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      await new Promise<void>((done) => {
+        head(v, cx, "/home/wt/a").click({}, cx);
+        cx.settle().then(done);
+      });
+      world.focused = "s1"; // s2 closed, as its only tab was replaced
+      v.followSpace(cx);
+      await cx.settle();
+      world.focused = "s2"; // hcoord focuses the new coordinator
+      v.followSpace(cx);
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(laneOpens().map((c) => c[3])).toEqual(["/home/wt/a"]);
+    });
+
     test("Raise PR goes through lane say, which resumes it: the shell isn't focused or typed at here", async () => {
       coordinators({ "/r": "running", "/home/wt/a": "shell" });
       world.board.projects[0].defaultBranch = { name: "main", path: "/r", checkedOut: true };
@@ -911,6 +967,49 @@ describe("coordinators a restart stopped", () => {
       ]);
       expect(world.runs).toEqual([]);
       expect(world.notes).toEqual([]);
+    });
+
+    test("if bringing back the focused space closes it for a moment, the person is put back", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.answers["lane open"] = { code: 0, stdout: JSON.stringify({ terminal: "t9", lines: [] }), stderr: "" };
+      world.spaces.push({ id: "s2", folder: "/home", tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      line(v, cx).click({}, cx);
+      await cx.settle();
+      world.focused = "s2"; // Herdr, as the only tab in s1 closes
+      v.followSpace(cx);
+      await cx.settle();
+      expect(laneOpens()).toHaveLength(1); // landing there started nothing
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toEqual([["agent.focus", { terminal: "t9" }]]);
+    });
+
+    test("focus isn't touched when it stayed put", async () => {
+      coordinators({ "/r": "shell", "/home/wt/a": "shell" });
+      world.answers["lane open"] = { code: 0, stdout: JSON.stringify({ terminal: "t9", lines: [] }), stderr: "" };
+      const { v, cx } = await start();
+      await click(line(v, cx), cx);
+      expect(world.runs).toEqual([]);
+    });
+
+    test("a named space that was closed and made again gets its name back", async () => {
+      coordinators({ "/r": "running", "/home/wt/a": "shell", "/home/wt/b": "shell" });
+      world.spaces.push({ id: "s2", folder: "/home/wt/a", name: "r · a", named: true, tabs: [] });
+      world.spaces.push({ id: "s3", folder: "/home/wt/b", name: "mine", named: true, tabs: [] });
+      const { v, cx } = await start();
+      let release = () => {};
+      world.hold = new Promise((r) => (release = r));
+      line(v, cx).click({}, cx);
+      await cx.settle();
+      world.spaces[1] = { id: "s2", folder: "/home/wt/a", name: "a", named: false, tabs: [] };
+      release();
+      world.hold = null;
+      await cx.settle();
+      expect(world.runs).toEqual([["space.rename", { id: "s2", name: "r · a" }]]); // s3 kept its name
     });
 
     test("one with no space gets a new one, still without the focus moving", async () => {

@@ -380,8 +380,9 @@ export default class Projects extends View {
       if (!say) return;
     }
     if (this.busy.has(w.path)) return;
-    const s = space ? { id: space } : this.spaceOf(w, panes(), ags);
+    const s = space ? spaces().find((x) => x.id === space) ?? { id: space } : this.spaceOf(w, panes(), ags);
     const live = c.live && c.agent;
+    const at = spaces().findIndex((x) => x.id === s?.id);
     // No space yet: Herdr makes one around the coordinator (space.new would show a shell first).
     if (!auto && s && !(live && say)) run("space.select", { id: s.id });
     this.busy.add(w.path);
@@ -396,6 +397,7 @@ export default class Projects extends View {
       r = await openLane(p, w, { space: s?.id, fresh: !auto, restart });
     }
     this.busy.delete(w.path);
+    this.keepPlace(s, at);
     if (!r.ok) notify({ title: `Couldn't ${say ? "ask" : "open"} ${spaceName(p, w)}${say ? "'s coordinator" : ""}`, body: r.text, level: "error", timeout: 12000 });
     else if (say) notify({ title: `Asked ${w.branch ?? base(w.path)}'s coordinator`, body: say, level: "info", timeout: 6000 });
     this.refresh(cx);
@@ -406,7 +408,17 @@ export default class Projects extends View {
     return this.worktrees(p).filter((w) => !w.gone && this.coordinatorOf(w, all, ags).state === "shell");
   }
 
-  /** Resumes coordinators one at a time, leaving the focus where it is: hcoord doesn't focus each, and no space is selected. */
+  /** Replacing the only tab in a space closes the space, and Herdr makes it again, unnamed and last, around the new terminal. */
+  keepPlace(s, at) {
+    const list = spaces();
+    const now = list.findIndex((x) => x.id === s?.id);
+    if (now < 0) return;
+    if (s.named && !list[now].named) run("space.rename", { id: s.id, name: s.name });
+    if (at >= 0 && now !== at) run("space.move", { id: s.id, index: at + 1 });
+  }
+
+  /** Resumes coordinators one at a time, leaving the focus where it is: hcoord doesn't focus each, and no space is
+   *  selected. The one space it has to act on is the person's own, if that closes as above: they're put back. */
   async bringBack(p, list, cx) {
     if (this.bringing.has(p.slug)) return;
     this.bringing.add(p.slug);
@@ -416,8 +428,12 @@ export default class Projects extends View {
       this.busy.add(w.path);
       cx.notify();
       const s = this.spaceOf(w, panes(), agents());
+      const here = !!s && focused()?.space === s.id;
+      const at = spaces().findIndex((x) => x.id === s?.id);
       const r = await openLane(p, w, { space: s?.id, fresh: true, noFocus: true });
+      if (here && r.terminal && focused()?.space !== s.id) run("agent.focus", { terminal: r.terminal });
       this.busy.delete(w.path);
+      this.keepPlace(s, at);
       if (!r.ok) notify({ title: `Couldn't bring back ${spaceName(p, w)}`, body: r.text, level: "error", timeout: 12000 });
       this.refresh(cx);
     }
@@ -426,13 +442,15 @@ export default class Projects extends View {
   }
 
   /** Switching to a project's worktree space starts its coordinator when it isn't running (once a minute at most).
-   *  Herdr coming up isn't a switch: each resume uses a Claude turn, so that waits for the person. */
+   *  Herdr coming up isn't a switch: each resume uses a Claude turn, so that waits for the person. Nor is the focus
+   *  landing elsewhere while a coordinator is replaced, which can close its space for a moment. */
   followSpace(cx) {
     const now = focused()?.space ?? null;
     if (now === this.space) return;
     this.opened = this.space === null ? now : null;
     this.space = now;
     this.pendingSpace = null;
+    if (this.busy.size) return;
     this.startFor(now, cx);
   }
 
