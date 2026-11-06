@@ -2,6 +2,9 @@
  * Removing a worktree (`hcoord lane remove`) and deleting a project (`hcoord project delete`).
  * Both have a dry run (`--dry-run --json`) that says what would go and what's at risk, so the
  * Herdr section can ask first. Branches are never deleted by either.
+ *
+ * A project with a cleanup prompt removes a worktree in two steps: `lane remove` adds a cleanup task
+ * for the worktree's coordinator to start, and the task's merge (workers.ts) calls finishRemoval.
  */
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -10,9 +13,22 @@ import { loadConfig } from "./config.ts";
 import { HcoordError } from "./errors.ts";
 import { listWorktrees } from "./git.ts";
 import { hcGet, hcKill } from "./hc.ts";
-import { FINAL_STATES, transition, type Task } from "./model.ts";
+import { abandonCleanup, ACTIVE_STATES, FINAL_STATES, transition, type Task } from "./model.ts";
 import { paths, root } from "./paths.ts";
-import { checkoutOf, loadProject, loadTasks, mutate, projectForRepo, updateMeta, type ProjectMeta } from "./store.ts";
+import { loadSettings } from "./settings.ts";
+import {
+  beginRemoval,
+  checkoutOf,
+  clearRemoval,
+  loadProject,
+  loadTasks,
+  mutate,
+  projectForRepo,
+  updateMeta,
+  type CoordinatorRef,
+  type PendingRemoval,
+  type ProjectMeta,
+} from "./store.ts";
 import type { Outcome } from "./workers.ts";
 
 function git(cwd: string, args: string[]): { code: number; out: string; err: string } {
@@ -34,7 +50,7 @@ function unpushedCommits(repo: string): number {
 }
 
 /** Stops a terminal if it is still the one we started (same name). */
-function stop(t: { address: string; name: string } | undefined): string | null {
+export function stop(t: { address: string; name: string } | undefined): string | null {
   if (!t) return null;
   const h = hcGet(t.address);
   if (!h || h.name !== t.name || h.state !== "live") return null;
@@ -42,10 +58,13 @@ function stop(t: { address: string; name: string } | undefined): string | null {
   return k.ok ? `stopped ${t.name} (${t.address})` : `warning: couldn't stop ${t.address}: ${k.error}`;
 }
 
-/** Cancels every unfinished task of the given worktrees (all when lanes is null), stopping their workers. */
-async function cancelUnfinished(meta: ProjectMeta, lanes: Set<string> | null, why: string): Promise<string[]> {
+/**
+ * Cancels every unfinished task of the given worktrees (all when lanes is null), stopping their
+ * workers. `keepCleanup`: not the cleanup tasks, which is what a delete waiting for one wants.
+ */
+async function cancelUnfinished(meta: ProjectMeta, lanes: Set<string> | null, why: string, keepCleanup = false): Promise<string[]> {
   const lines: string[] = [];
-  const open = (t: Task) => !FINAL_STATES.includes(t.state) && (!lanes || lanes.has(t.lane));
+  const open = (t: Task) => !FINAL_STATES.includes(t.state) && (!lanes || lanes.has(t.lane)) && !(keepCleanup && t.cleanup);
   for (const t of loadTasks(meta.slug).tasks.filter(open)) {
     const s = stop(t.terminal);
     if (s) lines.push(s);
@@ -75,6 +94,10 @@ export interface WorktreePlan {
   coordinator: string | null;
   /** Worker checkouts of its tasks: kept (`hcoord task clean` removes them). */
   workerCheckouts: string[];
+  /** The project's cleanup prompt, run by a worker before the worktree is removed; null when none. */
+  cleanupPrompt: string | null;
+  /** The removal already waiting for its cleanup task, if any. */
+  removing: PendingRemoval | null;
 }
 
 function worktreePlan(path: string): { meta: ProjectMeta; plan: WorktreePlan } {
@@ -99,6 +122,8 @@ function worktreePlan(path: string): { meta: ProjectMeta; plan: WorktreePlan } {
       unfinished: tasks.filter((t) => !FINAL_STATES.includes(t.state)).map((t) => t.id),
       coordinator: h && h.name === c!.name && h.state === "live" ? c!.address : null,
       workerCheckouts: tasks.filter((t) => t.worktree && existsSync(t.worktree)).map((t) => t.worktree!),
+      cleanupPrompt: loadSettings(meta.slug).cleanupPrompt || null,
+      removing: (lane && meta.lanes[lane]!.removing) || null,
     },
   };
 }
@@ -107,25 +132,11 @@ export function planRemoveWorktree(path: string): WorktreePlan {
   return worktreePlan(path).plan;
 }
 
-/**
- * Removes a linked worktree: cancels its unfinished tasks, stops its coordinator, runs
- * `git worktree remove` (forced only with `force`, which loses uncommitted changes) and forgets it.
- * Its branch is kept, and so are its tasks' checkouts and history.
- */
-export async function removeWorktreeLane(path: string, opts: { force?: boolean } = {}): Promise<Outcome> {
-  const { meta, plan } = worktreePlan(path);
-  if (plan.changed.length && !opts.force) {
-    throw new HcoordError(`${plan.path} has uncommitted changes (${plan.changed.slice(0, 5).join(", ")}${plan.changed.length > 5 ? ", …" : ""}); --force removes it anyway`);
-  }
-  const lines: string[] = [];
-  if (plan.lane) {
-    lines.push(...(await cancelUnfinished(meta, new Set([plan.lane]), "worktree removed")));
-    const s = stop(meta.lanes[plan.lane]!.coordinator);
-    if (s) lines.push(s);
-  }
-  const r = git(meta.repo, ["worktree", "remove", ...(opts.force ? ["--force"] : []), plan.path]);
+/** `git worktree remove` (forced only with `force`, which loses uncommitted changes), then forgets it. */
+async function dropWorktree(meta: ProjectMeta, plan: WorktreePlan, force: boolean): Promise<string[]> {
+  const r = git(meta.repo, ["worktree", "remove", ...(force ? ["--force"] : []), plan.path]);
   if (r.code !== 0) throw new HcoordError(`git worktree remove ${plan.path}: ${r.err || r.out}`);
-  lines.push(`removed worktree ${plan.path}${plan.branch ? `; branch ${plan.branch} kept` : ""}`);
+  const lines = [`removed worktree ${plan.path}${plan.branch ? `; branch ${plan.branch} kept` : ""}`];
   if (plan.lane) {
     await updateMeta(meta.slug, (m) => {
       delete m.lanes[plan.lane!];
@@ -133,7 +144,129 @@ export async function removeWorktreeLane(path: string, opts: { force?: boolean }
     });
   }
   if (plan.workerCheckouts.length) lines.push(`its tasks' checkouts are kept (hcoord task clean ID): ${plan.workerCheckouts.join(", ")}`);
+  return lines;
+}
+
+/** Drops a worktree's pending removal, giving up on its cleanup task. cancelUnfinished can't end a failed or done one. */
+async function callOffRemoval(meta: ProjectMeta, lane: string, removing: PendingRemoval, why: string): Promise<string[]> {
+  const cancelled = await mutate(meta.slug, ({ file, now }) => {
+    const t = file.tasks.find((x) => x.id === removing.task);
+    const ev = t ? abandonCleanup(t, now, { why }) : null;
+    return { result: !!ev, events: ev ? [ev] : [] };
+  });
+  await clearRemoval(meta.slug, lane, removing.task);
+  return cancelled ? [`cancelled ${removing.task}`] : [];
+}
+
+/** What the worktree's coordinator is told to do about its cleanup task, by the state that's in. */
+function cleanupNote(t: Task): string | null {
+  const then = "then end your turn. hcoord removes the worktree once that task is merged.";
+  const say = (cmd: string) => `Cleanup before deleting this worktree: run \`hcoord task ${cmd} ${t.id}\`, ${then}`;
+  if (t.state === "todo" || t.state === "queued") return say("start");
+  if (t.state === "failed") return say("retry");
+  if (t.state === "done") return say("merge");
+  return null;
+}
+
+function cleanupBrief(prompt: string, plan: WorktreePlan, force: boolean): string {
+  return `${prompt}
+
+## The worktree being deleted
+
+This task runs just before the worktree below is deleted. You run in a checkout of your own, not in
+that worktree, so reach it by its path. For this worktree, this overrides the rule to work only
+inside your own.
+
+- Path: ${plan.path}
+- Branch: ${plan.branch ?? "(detached)"}
+
+hcoord deletes the worktree and keeps its branch once this task is merged.
+${force ? "Uncommitted changes there are discarded." : "Leave no uncommitted or untracked files there, or hcoord can't delete it."}
+If the cleanup can't be done, report failed: the worktree is then kept.
+`;
+}
+
+/** Puts a worktree's removal off until its cleanup task is merged. */
+async function deferRemoval(meta: ProjectMeta, plan: WorktreePlan, opts: RemoveOptions): Promise<RemoveOutcome> {
+  const force = !!opts.force;
+  // Its coordinator runs the task, so it needs to be a worktree hcoord knows.
+  const lane = plan.lane ?? (await opts.registerLane!(plan.path)).lane;
+  const lines = await cancelUnfinished(meta, new Set([lane]), "worktree removed", true);
+  const task = await beginRemoval(meta.slug, lane, { title: `Clean up before removing ${lane}`, brief: cleanupBrief(plan.cleanupPrompt!, plan, force) }, force);
+  // Merged already: only the removal itself failed last time.
+  if (task.state === "merged") {
+    const f = await finishRemoval(meta.slug, task.id);
+    if (!f) throw new HcoordError(`${task.id}'s removal disappeared`);
+    const s = stop(f.coordinator);
+    return { ok: f.ok, lines: [...lines, ...f.lines, ...(s ? [s] : [])] };
+  }
+  const running = ACTIVE_STATES.includes(task.state);
+  lines.push(`${plan.path} is removed once ${task.id} is merged${running ? ` (it's ${task.state})` : ""}`);
+  return { ok: true, lines, cleanup: task.id, tell: cleanupNote(task) ?? undefined };
+}
+
+export interface RemoveOptions {
+  force?: boolean;
+  /** Remove it now, cleanup prompt or not, calling off any pending removal. */
+  skipCleanup?: boolean;
+  /** Registers a worktree as a lane (coordinator.ts): needed when it has to run a cleanup task. */
+  registerLane?: (path: string) => Promise<{ lane: string }>;
+}
+
+export interface RemoveOutcome extends Outcome {
+  /** The removal waits for this cleanup task. */
+  cleanup?: string;
+  /** What to tell the worktree's coordinator about that task, if anything. */
+  tell?: string;
+}
+
+/**
+ * Removes a linked worktree: cancels its unfinished tasks, stops its coordinator, runs
+ * `git worktree remove` and forgets it. Its branch is kept, and so are its tasks' checkouts and
+ * history. With a cleanup prompt (and no skipCleanup) it only cancels the tasks and defers the rest.
+ */
+export async function removeWorktreeLane(path: string, opts: RemoveOptions = {}): Promise<RemoveOutcome> {
+  const { meta, plan } = worktreePlan(path);
+  if (plan.changed.length && !opts.force) {
+    throw new HcoordError(`${plan.path} has uncommitted changes (${plan.changed.slice(0, 5).join(", ")}${plan.changed.length > 5 ? ", …" : ""}); --force removes it anyway`);
+  }
+  if (plan.cleanupPrompt && !opts.skipCleanup) return deferRemoval(meta, plan, opts);
+  const lines: string[] = [];
+  if (plan.lane) {
+    lines.push(...(await cancelUnfinished(meta, new Set([plan.lane]), "worktree removed")));
+    if (plan.removing) lines.push(...(await callOffRemoval(meta, plan.lane, plan.removing, "cleanup skipped")));
+    const s = stop(meta.lanes[plan.lane]!.coordinator);
+    if (s) lines.push(s);
+  }
+  lines.push(...(await dropWorktree(meta, plan, !!opts.force)));
   return { ok: true, lines };
+}
+
+export interface RemovalFinish extends Outcome {
+  /** To stop once the caller has nothing left to do: see finishRemoval. */
+  coordinator?: CoordinatorRef;
+}
+
+/**
+ * The cleanup task `id` is merged: removes the worktree waiting for it, with the force saved then.
+ * Null when none is. If git refuses, the worktree and its pending removal stay and ok is false.
+ *
+ * The coordinator is left for the caller to stop, last: it has to be there to hear of a failure, and
+ * stopping it hangs up on its terminal, which is where `hcoord task merge` itself may be running.
+ */
+export async function finishRemoval(project: string, id: string): Promise<RemovalFinish | null> {
+  const meta = loadProject(project);
+  const entry = Object.entries(meta.lanes).find(([, l]) => l.removing?.task === id);
+  if (!entry) return null;
+  const [lane, { path, removing, coordinator }] = entry;
+  const lines = await cancelUnfinished(meta, new Set([lane]), "worktree removed");
+  try {
+    lines.push(...(await dropWorktree(meta, worktreePlan(path).plan, removing!.force)));
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    return { ok: false, lines: [...lines, `the worktree wasn't removed: ${why}`] };
+  }
+  return { ok: true, lines, coordinator };
 }
 
 // ---------------------------------------------------------------- a project

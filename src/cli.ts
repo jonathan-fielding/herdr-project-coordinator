@@ -76,9 +76,13 @@ Projects and worktrees
                                                   a new branch (from the default branch, or <ref>) and
                                                   a worktree for it where Herdr puts them, registered;
                                                   prints its path
-  hcoord lane remove <path> [--force] [--dry-run]  remove a linked worktree: its coordinator and
+  hcoord lane remove <path> [--force] [--skip-cleanup] [--dry-run] [--json]
+                                                  remove a linked worktree: its coordinator and
                                                   unfinished tasks stop, git worktree remove (--force:
-                                                  even with uncommitted changes); its branch is kept
+                                                  even with uncommitted changes); its branch is kept.
+                                                  With a cleanup prompt, its coordinator first runs that
+                                                  as a task, and the rest follows when that's merged
+                                                  (--skip-cleanup: remove now, and call that off)
   hcoord project delete <slug> [--files] [--dry-run]
                                                   stop its agents and move its hcoord data to
                                                   deleted/; --files also deletes the repo and its
@@ -263,15 +267,23 @@ async function main(argv: string[]): Promise<number> {
       return report_(await sayToLane(path, text, openOpts(values)));
     }
     case "lane remove": {
-      const { positionals, values } = parse(rest, { force: { type: "boolean" }, "dry-run": { type: "boolean" } }, 1);
+      const { positionals, values } = parse(rest, { force: { type: "boolean" }, "skip-cleanup": { type: "boolean" }, "dry-run": { type: "boolean" } }, 1);
       const path = positionals[0] ?? process.cwd();
       if (values["dry-run"]) {
         const plan = planRemoveWorktree(path);
         if (values.json) json(plan);
-        else out(`would remove ${plan.path}${plan.changed.length ? ` (${plan.changed.length} uncommitted files)` : ""}${plan.unfinished.length ? `; cancels ${plan.unfinished.join(", ")}` : ""}`);
+        else out(`would remove ${plan.path}${plan.changed.length ? ` (${plan.changed.length} uncommitted files)` : ""}${plan.unfinished.length ? `; cancels ${plan.unfinished.join(", ")}` : ""}${plan.cleanupPrompt ? "; runs the cleanup prompt first" : ""}`);
         return 0;
       }
-      return report_(await removeWorktreeLane(path, { force: values.force }));
+      const o = await removeWorktreeLane(path, { force: values.force, skipCleanup: values["skip-cleanup"], registerLane: laneForPath });
+      if (o.tell) {
+        const said = await sayToLane(path, o.tell, openOpts({ "no-show": true }));
+        o.lines.push(...said.lines);
+        o.ok &&= said.ok;
+      }
+      if (!values.json) return report_(o);
+      json({ path, ok: o.ok, cleanup: o.cleanup ?? null, lines: o.lines });
+      return o.ok ? 0 : 1;
     }
     case "project delete": {
       const { positionals, values } = parse(rest, { files: { type: "boolean" }, "dry-run": { type: "boolean" } }, 1);
