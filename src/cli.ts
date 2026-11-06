@@ -7,6 +7,7 @@ import { HcoordError, UsageError } from "./errors.ts";
 import { isTaskState, type Task } from "./model.ts";
 import { paths } from "./paths.ts";
 import { byNumber } from "./render.ts";
+import { loadSettings, saveSettings } from "./settings.ts";
 import {
   addTask,
   createProject,
@@ -82,6 +83,10 @@ Projects and worktrees
                                                   stop its agents and move its hcoord data to
                                                   deleted/; --files also deletes the repo and its
                                                   worktrees (to the Trash where macOS has trash)
+  hcoord settings show [<slug>] [--json]          the project's settings, shared by its worktrees
+  hcoord settings set [<slug>] --cleanup-prompt-file <file|-> [--json]
+                                                  save the cleanup prompt from a file or stdin (-),
+                                                  trimmed; empty text clears it
   hcoord board [--json]                           every project and its tasks (read only)
   hcoord sync [<slug>]                            check workers, start queued tasks (all projects)
   hcoord recover [<slug>] [--no-show]             after a reboot: coordinators back, lost workers retried
@@ -278,6 +283,25 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       return report_(await deleteProject(positionals[0], { files: values.files }));
+    }
+    case "settings show": {
+      const { positionals, values } = parse(rest, {}, 1);
+      const settings = loadSettings(positionals[0] ?? defaultProjectSlug());
+      if (values.json) json(settings);
+      else out(settings.cleanupPrompt ? `cleanup prompt:\n${settings.cleanupPrompt.replace(/^/gm, "  ")}` : "cleanup prompt: none");
+      return 0;
+    }
+    case "settings set": {
+      const { positionals, values } = parse(rest, { "cleanup-prompt-file": { type: "string" } }, 1);
+      const file = values["cleanup-prompt-file"];
+      if (file === undefined) throw new UsageError("hcoord settings set [<slug>] --cleanup-prompt-file <file|->");
+      // Before reading stdin, so an unknown project doesn't wait on it.
+      const meta = loadProject(positionals[0] ?? defaultProjectSlug());
+      const cleanupPrompt = (await readFileArg(file)).trim();
+      const settings = await saveSettings(meta.slug, { cleanupPrompt });
+      if (values.json) json(settings);
+      else out(cleanupPrompt ? `saved ${meta.slug}'s cleanup prompt` : `cleared ${meta.slug}'s cleanup prompt`);
+      return 0;
     }
     case "lane checkout": {
       const { positionals, values } = parse(rest, {}, 2);

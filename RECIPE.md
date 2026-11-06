@@ -359,6 +359,10 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   - `project delete <slug> --dry-run --json`: `{ checkouts: [{ path, changed }], workerDir, unpushed,
     unfinished: [id], coordinators: [address], archive, trash, … }`. Then `project delete <slug>
     [--files]`.
+  - `settings show <slug> --json`: `{ cleanupPrompt }`, `""` when none is set. A missing or older
+    `settings.json` gives the defaults.
+  - `settings set <slug> --cleanup-prompt-file -`, with the text on stdin. Surrounding whitespace is
+    trimmed and empty text clears it.
   - `task retry <id>`.
   - `log <id> --json` and `log --lane <key> <slug> --json`: `{ markdown, transcript }`, with `transcript`
     the file's path or null.
