@@ -7,6 +7,7 @@ import { depMet, isWorkerBranch, ROOT_LANE, type Task, type TaskState } from "./
 import { paths, root, rootWarning } from "./paths.ts";
 import { byNumber } from "./render.ts";
 import { listProjects, loadTasks, type CoordinatorRef } from "./store.ts";
+import { coordinatorState, type CoordinatorState } from "./workers.ts";
 
 export interface BoardTask {
   id: string;
@@ -36,6 +37,8 @@ export interface BoardLane {
   /** It still exists on disk. */
   present: boolean;
   coordinator: CoordinatorRef | null;
+  /** What became of `coordinator`, looked up in the core now ("none" too when the core can't be reached). */
+  coordinatorState: CoordinatorState;
 }
 
 export interface BoardProject {
@@ -114,6 +117,7 @@ export function board(): Board {
         branch: checkouts.find((c) => c.path === l.path)?.branch ?? l.branch,
         present: existsSync(l.path),
         coordinator: l.coordinator ?? null,
+        coordinatorState: coordinatorState(meta, key),
       }));
     return {
       slug: meta.slug,

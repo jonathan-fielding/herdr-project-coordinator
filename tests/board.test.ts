@@ -39,7 +39,7 @@ describe("board", () => {
     expect(b.projects).toHaveLength(1);
     const p = b.projects[0];
     expect(p).toMatchObject({ slug: "demo", prefix: "DM", repo, trusted: null });
-    expect(p.lanes).toEqual([{ key: "root", path: repo, branch: p.checkouts[0].branch, present: true, coordinator: null }]);
+    expect(p.lanes).toEqual([{ key: "root", path: repo, branch: p.checkouts[0].branch, present: true, coordinator: null, coordinatorState: "none" }]);
     expect(p.checkouts).toEqual([{ path: repo, branch: expect.any(String) }]);
     expect(p.tasks.map((t: any) => [t.id, t.state, t.lane, t.waitingOn, t.hasLog])).toEqual([
       ["DM-1", "todo", "root", [], false],
