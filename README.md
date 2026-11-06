@@ -181,7 +181,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 | **Needs you** | coordinator is waiting on you |
 | filled dot | coordinator finished its turn |
 | square | stopped by a restart: its terminal came back as an empty shell |
-| terminal icon | something else is running in the coordinator's terminal, such as a Claude you started there yourself |
+| terminal icon | something other than the coordinator is running in its terminal, such as a plain Claude you started there yourself |
 | **?** | the coordinator is running but reports no status (at a prompt such as Claude's trust question, or still starting) |
 
 - The default branch comes first, above the main checkout, even when nothing has it checked out (clicking it then makes its worktree).
@@ -190,7 +190,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 - The log icon opens the coordinator's transcript. Right-click for **Coordinator's log** and **Delete worktree…**.
 - **Stopped by a restart: click to bring back** shows under a stopped worktree, even when it's folded. Click it or the worktree: the coordinator carries on its conversation, or starts a new one if it has none to carry on.
 - **N coordinators stopped: bring back** shows under a project with more than one stopped. Click to bring them back one at a time, leaving you where you are.
-- **Something else is running in its terminal: exit it first** shows, even when folded, if you've used a stopped coordinator's terminal for something else. Click to look at it. Bringing a coordinator back never stops what's running there, so exit it yourself, then click the worktree.
+- **Plain Claude running, not the coordinator** shows, even when folded, if you've started Claude yourself in a stopped coordinator's terminal. Another program is named the same way, such as **vim running, not the coordinator**, and **Something else is running in its terminal: exit it first** means hcoord can't tell what it is. Click to look at it. Bringing a coordinator back never stops what's running there, so `/exit` that Claude or exit the program yourself, then click the worktree. The coordinator's own saved conversation comes back, not that Claude's session, which stays in its own transcript.
 - **Coordinator reports no status: look at it** lets you peek at a silent coordinator. The button at the end replaces it with a fresh Claude that carries on the same conversation.
 - **N workers lost: carry on** appears when workers' terminals have gone (after a reboot, say). Click to restart each one in its existing checkout, picking up from its commits.
 
@@ -242,7 +242,7 @@ Nothing resumes by itself when Herdr starts, because each coordinator that comes
 
 A stopped coordinator shows a square and **Stopped by a restart: click to bring back**. Click that, or switch to its space, and it carries on its conversation, or starts a new one if its transcript has gone. The space that's focused when Herdr starts doesn't count as a switch, so it waits for a click. With more than one stopped, **N coordinators stopped: bring back** does a whole project, one at a time, and leaves you where you are. A coordinator whose terminal has gone altogether shows a hollow dot, and a click or a switch to its space brings that back too.
 
-If something else is running in a stopped coordinator's terminal, such as a Claude you started there yourself, hcoord won't stop it. The row says so. Exit it, then click the worktree.
+If something else is running in a stopped coordinator's terminal, such as a plain Claude you started there yourself, hcoord won't stop it. The row says what's there. `/exit` it or exit the program, then click the worktree. The coordinator's own conversation comes back, not that Claude's session.
 
 Click **N workers lost: carry on** to restart workers in their checkouts. That line appears once hcoord next checks its workers, and bringing a coordinator back makes it check.
 

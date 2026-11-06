@@ -103,8 +103,31 @@ export function recordedCoordinator(meta: ProjectMeta, lane: string): HcTerminal
   return h && h.state === "live" && h.name === c!.name ? h : null;
 }
 
+/**
+ * The program in a terminal's foreground, by the name it was run as: "claude", "vim", or null when the
+ * core doesn't say. `foreground.name` won't do: it's the process's own name, Claude's version here.
+ * Status only decides when argv can't (npm's node, or Claude run by its versioned path): any other
+ * program may just have a status left over from what ran there before. `hc get` gives status as
+ * `{ app, state }`, which HcTerminal doesn't describe.
+ */
+export function foregroundProgram(t: HcTerminal | null): string | null {
+  const cmd = t?.foreground?.argv[0];
+  if (!cmd) return null;
+  const name = cmd.split("/").pop() || cmd;
+  if (name === "claude") return name;
+  const reports = (t!.status as unknown as { app?: string } | null | undefined)?.app;
+  return reports === "claude-code" && /^(node|bun|\d+(\.\d+)+)$/.test(name) ? "claude" : name;
+}
+
+/** A coordinator's state and, when occupied, what occupies it, from one look at its terminal. */
+export function coordinatorNow(meta: ProjectMeta, lane: string): { state: CoordinatorState; program: string | null } {
+  const t = recordedCoordinator(meta, lane);
+  const state = classifyCoordinator(t, meta.slug, loadConfig().agent.kind === "claude");
+  return { state, program: state === "occupied" ? foregroundProgram(t) : null };
+}
+
 export function coordinatorState(meta: ProjectMeta, lane: string): CoordinatorState {
-  return classifyCoordinator(recordedCoordinator(meta, lane), meta.slug, loadConfig().agent.kind === "claude");
+  return coordinatorNow(meta, lane).state;
 }
 
 /** A worktree's coordinator, if its terminal is still that exact live terminal and still runs our agent. */

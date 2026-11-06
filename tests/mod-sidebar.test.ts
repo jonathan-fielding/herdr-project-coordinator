@@ -548,6 +548,7 @@ describe("new worktree", () => {
 describe("coordinators a restart stopped", () => {
   const STOPPED = "Stopped by a restart: click to bring back";
   const OCCUPIED = "Something else is running in its terminal: exit it first";
+  const PLAIN_CLAUDE = "Plain Claude running, not the coordinator";
   const NO_STATUS = "Coordinator reports no status: look at it";
 
   /** A board whose worktrees have coordinators in these states (`/r` is the main checkout), their terminals live. */
@@ -826,6 +827,58 @@ describe("coordinators a restart stopped", () => {
       expect(byId(t, "occupied-/r").tip).toContain("Exit it first");
     });
 
+    describe("says what's there", () => {
+      /** The occupied line and worktree tooltip for this program, the lane with or without a saved session. */
+      async function shown(program: string | null | undefined, session = true) {
+        const [lane] = coordinators({ "/r": "occupied" });
+        if (program !== undefined) (lane as any).coordinatorProgram = program;
+        if (!session) delete (lane as any).coordinator.session;
+        const { v, cx } = await start();
+        const t = tree(v, cx);
+        return { text: textOf(t), tip: byId(t, "occupied-/r").tip as string, head: byId(t, "wt-/r").tip as string };
+      }
+
+      test("Claude with a saved session: that conversation comes back, not this one", async () => {
+        const { text, tip, head } = await shown("claude");
+        expect(text).toContain(PLAIN_CLAUDE);
+        expect(text).not.toContain(OCCUPIED);
+        expect(tip).toContain("started by hand and isn't the coordinator");
+        expect(tip).toContain("/exit it, then click the worktree");
+        expect(tip).toContain("saved conversation comes back, not this session, which stays in its own transcript");
+        expect(head).toContain(tip);
+      });
+
+      test("Claude with no saved session: a new conversation", async () => {
+        const { text, tip } = await shown("claude", false);
+        expect(text).toContain(PLAIN_CLAUDE);
+        expect(tip).toContain("/exit it");
+        expect(tip).toContain("starts a new conversation");
+        expect(tip).not.toContain("saved conversation");
+      });
+
+      for (const session of [true, false]) {
+        test(`another program is named${session ? "" : ", no saved session"}`, async () => {
+          const { text, tip } = await shown("vim", session);
+          expect(text).toContain("vim running, not the coordinator");
+          expect(text).not.toContain("Claude");
+          expect(tip).toContain("vim is running in the coordinator's terminal");
+          expect(tip).toContain("Exit it first");
+          expect(tip).not.toContain("conversation");
+        });
+
+        test(`unknown foreground keeps the generic line${session ? "" : ", no saved session"}`, async () => {
+          const { text, tip } = await shown(null, session);
+          expect(text).toContain(OCCUPIED);
+          expect(tip).toContain("Something else is running");
+          expect(tip).toContain("Exit it first");
+        });
+      }
+
+      test("a board from an older hcoord, with no such field: the generic line", async () => {
+        expect((await shown(undefined)).text).toContain(OCCUPIED);
+      });
+    });
+
     test("a click, on the line or the worktree, peeks and starts nothing", async () => {
       coordinators({ "/r": "occupied" });
       const { v, cx } = await start();
@@ -859,7 +912,7 @@ describe("coordinators a restart stopped", () => {
     test("Raise PR leaves the refusing to hcoord, whose message names what's running", async () => {
       coordinators({ "/r": "running", "/home/wt/a": "occupied" });
       world.board.projects[0].defaultBranch = { name: "main", path: "/r", checkedOut: true };
-      world.answers["lane say"] = { code: 1, stdout: "", stderr: "hcoord: vim is running in its place\n" };
+      world.answers["lane say"] = { code: 1, stdout: "", stderr: "`vim` is running in coord-1 (t1), not the coordinator. hcoord won't stop it.\n" };
       const { v, cx } = await start();
       const w = v.worktrees(p()).find((x: any) => x.path === "/home/wt/a");
       await v.raisePr(p(), w, cx);

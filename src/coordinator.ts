@@ -21,6 +21,7 @@ import {
 import {
   classifyCoordinator,
   coordinatorState,
+  foregroundProgram,
   laneOf,
   recordedCoordinator,
   retryTask,
@@ -109,11 +110,22 @@ async function saveCoordinator(slug: string, lane: string, c: CoordinatorRef | n
   });
 }
 
-/** What runs in a terminal now, as words for a message. */
-function runningThere(t: HcTerminal): string {
+/** Why a coordinator can't be opened in a terminal something else occupies, and how to get it back. */
+function occupiedRefusal(t: HcTerminal, name: string, path: string, resumes: boolean): string[] {
+  const here = `in ${name} (${t.address}), not the coordinator`;
+  const then = `(see it with: hc attach ${t.address}), then: hcoord lane open ${path}`;
+  if (foregroundProgram(t) === "claude") {
+    return [
+      `A plain Claude, started by hand, is running ${here}. hcoord won't stop it.`,
+      `/exit it ${then}`,
+      resumes
+        ? "The coordinator's saved conversation comes back, not this session, which stays in its own transcript."
+        : "That starts a new conversation. This session stays in its own transcript.",
+    ];
+  }
   const cmd = t.foreground?.argv.join(" ");
-  if (!cmd) return "something is running";
-  return `\`${cmd.length > 60 ? cmd.slice(0, 59) + "…" : cmd}\` is running`;
+  const what = cmd ? `\`${cmd.length > 60 ? cmd.slice(0, 59) + "…" : cmd}\`` : "Something else";
+  return [`${what} is running ${here}. hcoord won't stop it.`, `Exit it ${then}`];
 }
 
 /**
@@ -180,16 +192,11 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
       throw new HcoordError(`a terminal named ${name} is running but isn't this worktree's coordinator; stop it (hc kill ${name}) first`);
     }
   }
+  // Carry on the earlier conversation when there was one and its transcript is still there.
+  const earlier = meta.lanes[laneKey]?.coordinator?.session;
+  const resumes = () => claude && !opts.fresh && !!earlier && !!findTranscript(earlier);
   const state = classifyCoordinator(term, slug, claude);
-  if (state === "occupied") {
-    return {
-      ok: false,
-      lines: [
-        `${name} (${term!.address}) isn't the coordinator any more, and ${runningThere(term!)} in its place. hcoord won't stop that.`,
-        `Exit it (see it with: hc attach ${term!.address}), then: hcoord lane open ${lane.path}`,
-      ],
-    };
-  }
+  if (state === "occupied") return { ok: false, lines: occupiedRefusal(term!, name, lane.path, resumes()) };
   if (state === "prompt" && recorded && !opts.restart) {
     return {
       ok: false,
@@ -213,9 +220,7 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
     lines.push(`stopped ${name} (${term!.address}): ${recorded ? "" : "an earlier coordinator of this worktree, "}${why}`);
   }
 
-  // Carry on the earlier conversation when there was one and its transcript is still there.
-  const earlier = meta.lanes[laneKey]?.coordinator?.session;
-  const resume = claude && !opts.fresh && !!earlier && !!findTranscript(earlier);
+  const resume = resumes();
   const session = claude ? (resume ? earlier! : crypto.randomUUID()) : undefined;
 
   const newSpace = opts.show !== false && !!opts.newSpace && app(["status"]) !== null;

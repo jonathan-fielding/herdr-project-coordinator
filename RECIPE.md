@@ -57,8 +57,9 @@ Rows in the list, all radius 8 and `hover` under the pointer unless noted:
   `Coordinator reports no status: look at it` in `unknown` with an 18px square-pen button at the
   end, and `2 workers lost: carry on` (`1 worker lost: carry on`) in `blocked`. Above them, and on a
   folded worktree too, because they're what the person has to act on, one of two in `unknown` with no
-  button: `Stopped by a restart: click to bring back`, or `Something else is running in its terminal:
-  exit it first`.
+  button: `Stopped by a restart: click to bring back`, or the occupied line: `Plain Claude running, not
+  the coordinator` when `coordinatorProgram` is `claude`, `<program> running, not the coordinator` for
+  any other program, and `Something else is running in its terminal: exit it first` when it's null.
 - **Empty worktree line**, 11.5px `dim`, same padding, no hover, one of: `No tasks yet: tell the
   coordinator what to do.` (coordinator running), `Not checked out: click to check it out and start
   a coordinator.` (default branch with no checkout), `No tasks yet.` (registered, coordinator not
@@ -183,7 +184,7 @@ forgets being open on reload. The other groups never fold. Reasons and summaries
 - `Coordinator reports no status`: peeks at it. Its square-pen button replaces it with a fresh Claude
   carrying on the conversation, through `lane open --restart`.
 - `Stopped by a restart`: the same as clicking the worktree row.
-- `Something else is running`: `terminal.peek`. There is no replace button, and nothing in the mod
+- The occupied line: `terminal.peek`. There is no replace button, and nothing in the mod
   stops that terminal.
 - `N coordinators stopped: bring back`: runs `lane open <path> --no-focus --json` for each stopped
   coordinator in turn, in its own space if it has one, else a new one. It selects no space, so the
@@ -218,9 +219,13 @@ projects come first in saved order, new ones after them in the CLI's order.
 **Hovers**: project, worktree, task and notice rows and every icon button have tooltips. A project shows `<name>: ~/path`. A worktree
 shows its path and `Click: show its coordinator`, `Click: start its coordinator` or `This worktree is
 gone`; a stopped one `Stopped by a restart. Click: bring it back, carrying on its conversation` (`as a
-new conversation` when it has no session); one with something else in its terminal `Something else is
-running in the coordinator's terminal. Exit it first, then click to start the coordinator. Click: look
-at it`; the unchecked-out default branch says what a click will do. A task shows `<id> <title>` and `Click: peek at its terminal` or `Click: its log`.
+new conversation` when it has no session). An occupied one, and its line, show `This Claude was started
+by hand and isn't the coordinator. To bring the coordinator back, /exit it, then click the worktree. The
+coordinator's saved conversation comes back, not this session, which stays in its own transcript. Click:
+look at it` (with no session, `That starts a new conversation. This session stays in its own transcript.`
+in place of the third sentence); for another program `<program> is running in the coordinator's terminal.
+Exit it first, then click the worktree to start the coordinator. Click: look at it`, and with
+`coordinatorProgram` null the same with `Something else` for `<program>`; the unchecked-out default branch says what a click will do. A task shows `<id> <title>` and `Click: peek at its terminal` or `Click: its log`.
 
 **Dialogs**
 
@@ -333,7 +338,9 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
     - `none`: starts or resumes.
     - `prompt`: fails with a message saying to look at it. With `--restart`, replaces it and resumes.
       A coordinator whose record was lost is replaced without the flag.
-    - `occupied`: fails, with or without `--restart`, naming what runs there and saying to exit it.
+    - `occupied`: fails, with or without `--restart`, naming what runs there and saying to exit it. For
+      Claude it says a plain Claude started by hand is there, to `/exit` it, and whether the saved
+      conversation or a new one comes back.
       **A terminal with something else running in it is never killed.**
 
     Resuming uses the saved session when its transcript still exists, otherwise a new session.
@@ -362,7 +369,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
       slug, name, prefix, repo, dir, trusted: true | false | null,
       lanes: [{ key, path, branch, present,
                 coordinator: { address, name, session? } | null,
-                coordinatorState: "running" | "prompt" | "shell" | "occupied" | "none" }],
+                coordinatorState: "running" | "prompt" | "shell" | "occupied" | "none",
+                coordinatorProgram: string | null }],
       checkouts: [{ path, branch }],
       defaultBranch: { name, path, checkedOut } | null,
       tasks: [{ id, title, state, lane, hasLog, waitingOn: [id], updatedAt,
@@ -383,6 +391,12 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   - `occupied`: replaced by that shell, and something else runs in it now, or the foreground isn't
     known yet (a new shell shows none for a moment, so a rerun clears that).
   - `none`: no such terminal running, or the core can't be reached. A lost record also reads as this.
+
+  `coordinatorProgram` is set only for `occupied`: the foreground program's name, `argv[0]`'s basename
+  such as `vim`, or `claude` for Claude. It's null when the foreground isn't known. `foreground.name`
+  can't be used, as it's Claude's version number. `status.app` of `claude-code` also means Claude, but
+  only when `argv[0]` is `node`, `bun` or a version number, because any other program may just have a
+  status left from what ran there before.
 
   Replaced means a kept terminal whose argv no longer starts `env … HCOORD_PROJECT=<slug>`. Status
   can't tell, because a Claude started by hand reports one too.
