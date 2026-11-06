@@ -220,6 +220,8 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
   - **Remove from Herdr** stops its coordinators, cancels unfinished tasks and moves its hcoord data to `~/.herdr-coordinator/deleted/`. The repo stays on disk.
   - **Delete files too** also moves the repo, its worktrees and the workers' checkouts to the Trash. The dialog warns about uncommitted files and commits that haven't been pushed.
 - **Delete worktree…** stops its coordinator, cancels its unfinished tasks, closes its space and runs `git worktree remove`. The branch is kept.
+  - If the project has a cleanup prompt, its unfinished tasks are cancelled and the coordinator runs the prompt first. The row shows `Cleaning up…`, and the worktree and its space go once that finishes.
+  - If the cleanup fails, the row shows `Cleanup failed` and the worktree is kept. Open **Delete worktree…** again and choose **Delete without cleanup** to remove it straight away.
 
 **Warnings.** A red line under the header means something's wrong with the setup, such as a data folder macOS may empty. Click it for the cause and the fix.
 
@@ -227,7 +229,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 
 ### Will it touch my branches on its own?
 
-Only to merge. When a worker reports done, hcoord merges that worker's branch into the worktree it belongs to, locally. If the merge can't go through cleanly it's aborted, and your worktree is left exactly as it was. hcoord never pushes, rebases or deletes a branch. `hcoord task clean` removes a worker's checkout only when git says it's clean and merged, and it keeps the branch. Deleting a worktree or a project from the sidebar always asks first.
+Only to merge. When a worker reports done, hcoord merges that worker's branch into the worktree it belongs to, locally. If the merge can't go through cleanly it's aborted, and your worktree is left exactly as it was. hcoord never pushes, rebases or deletes a branch. `hcoord task clean` removes a worker's checkout only when git says it's clean and merged, and it keeps the branch. Deleting a worktree or a project from the sidebar always asks first, and a worktree whose cleanup prompt fails is kept until you say otherwise.
 
 ### What can the coordinator do without asking?
 
