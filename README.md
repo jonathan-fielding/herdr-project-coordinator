@@ -163,7 +163,7 @@ bun install
 hcoord mod install
 ```
 
-Running coordinators and workers keep going. A coordinator picks up a changed skill when it restarts: `hcoord lane open <worktree path> --restart` replaces it with a fresh Claude that carries on the same conversation.
+Running coordinators and workers keep going. A coordinator picks up a changed skill when it next starts: quit it (`/exit` in its terminal), then click its worktree or run `hcoord lane open <worktree path>`, and a fresh Claude carries on the same conversation. `--restart` won't do this, because it leaves a running coordinator alone.
 
 ## Using the Projects section
 
@@ -180,12 +180,17 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 | spinner | coordinator is working |
 | **Needs you** | coordinator is waiting on you |
 | filled dot | coordinator finished its turn |
-| **?** | the terminal runs but reports no status (a prompt, or a plain shell after a restart) |
+| square | stopped by a restart: its terminal came back as an empty shell |
+| terminal icon | something else is running in the coordinator's terminal, such as a Claude you started there yourself |
+| **?** | the coordinator is running but reports no status (at a prompt such as Claude's trust question, or still starting) |
 
 - The default branch comes first, above the main checkout, even when nothing has it checked out (clicking it then makes its worktree).
-- Click to go to the worktree's space and coordinator. If none is running, one starts, resuming its last conversation when there is one.
-- **Raise PR** (on a row whose branch isn't the default one, and in its right-click menu) asks the worktree's coordinator to raise a PR against the default branch.
+- Click to go to the worktree's space and coordinator. If none is running, one starts, resuming its last conversation when there is one. Switching to the worktree's space does the same, once a minute at most.
+- **Raise PR** (on a row whose branch isn't the default one, and in its right-click menu) asks the worktree's coordinator to raise a PR against the default branch, bringing it back first if it's stopped.
 - The log icon opens the coordinator's transcript. Right-click for **Coordinator's log** and **Delete worktree…**.
+- **Stopped by a restart: click to bring back** shows under a stopped worktree, even when it's folded. Click it or the worktree: the coordinator carries on its conversation, or starts a new one if it has none to carry on.
+- **N coordinators stopped: bring back** shows under a project with more than one stopped. Click to bring them back one at a time, leaving you where you are.
+- **Something else is running in its terminal: exit it first** shows, even when folded, if you've used a stopped coordinator's terminal for something else. Click to look at it. Bringing a coordinator back never stops what's running there, so exit it yourself, then click the worktree.
 - **Coordinator reports no status: look at it** lets you peek at a silent coordinator. The button at the end replaces it with a fresh Claude that carries on the same conversation.
 - **N workers lost: carry on** appears when workers' terminals have gone (after a reboot, say). Click to restart each one in its existing checkout, picking up from its commits.
 
@@ -233,7 +238,15 @@ A coordinator starts with `hcoord` and the read-only herdr-core commands (`hc ls
 
 ### What happens after a reboot?
 
-Click a worktree to bring its coordinator back with its conversation intact, and click **N workers lost: carry on** to restart workers in their checkouts. `hcoord recover` does both for every project from a terminal.
+Nothing resumes by itself when Herdr starts, because each coordinator that comes back uses a Claude turn. You choose what comes back and when.
+
+A stopped coordinator shows a square and **Stopped by a restart: click to bring back**. Click that, or switch to its space, and it carries on its conversation, or starts a new one if its transcript has gone. The space that's focused when Herdr starts doesn't count as a switch, so it waits for a click. With more than one stopped, **N coordinators stopped: bring back** does a whole project, one at a time, and leaves you where you are. A coordinator whose terminal has gone altogether shows a hollow dot, and a click or a switch to its space brings that back too.
+
+If something else is running in a stopped coordinator's terminal, such as a Claude you started there yourself, hcoord won't stop it. The row says so. Exit it, then click the worktree.
+
+Click **N workers lost: carry on** to restart workers in their checkouts. That line appears once hcoord next checks its workers, and bringing a coordinator back makes it check.
+
+`hcoord recover` does all of this from a terminal, for every project in one go: it brings back every coordinator that isn't running and retries lost workers. If something else is running in a coordinator's terminal, it reports that, leaves it alone and exits with 1.
 
 ### Does anything leave my machine?
 
@@ -280,8 +293,8 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 | Command | Does |
 |---|---|
 | `hcoord project new <name> --repo <path>` | make a project |
-| `hcoord lane open [<path>] [--no-focus]` | start or show the coordinator of the worktree at `<path>`; `--no-focus` leaves the focus where it is (with `--json`, prints the coordinator's terminal) |
-| `hcoord lane say <path> <text>` | tell the worktree's coordinator something, as if typed to it (started first if it isn't running) |
+| `hcoord lane open [<path>] [--restart] [--no-focus]` | start, resume or show the coordinator of the worktree at `<path>`. A stopped one resumes with no flag. `--restart` only replaces one that reports no status: a running one is left alone, and what else runs in its terminal is never stopped. `--no-focus` leaves the focus where it is (with `--json`, prints the coordinator's terminal) |
+| `hcoord lane say <path> <text>` | tell the worktree's coordinator something, as if typed to it (started first if it isn't running; refused if something else runs in its terminal) |
 | `hcoord lane new <branch> [<slug>] [--base <ref>]` | a new branch (from the default branch, or `<ref>`) and its worktree, registered. A base branch on origin is fetched first, so the branch starts from up-to-date code (a failed fetch warns and uses the local copy) |
 | `hcoord lane branches [<slug>] [--json]` | the branches a new one can start from: local ones, plus origin's with no local branch, by name, the default marked |
 | `hcoord board` | every project and its tasks |
@@ -291,7 +304,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 | `hcoord task merge <id>` | retry a merge after a conflict |
 | `hcoord task retry <id>` / `cancel` / `clean` | rerun, stop, or remove a merged task's checkout |
 | `hcoord log <id>` | a worker's transcript and reports, as markdown |
-| `hcoord recover` | after a reboot: bring coordinators back and retry lost workers |
+| `hcoord recover [<slug>]` | after a reboot: bring back every coordinator that isn't running and retry lost workers, in every project or just `<slug>`. A coordinator that reports no status is replaced. A terminal with something else running in it is reported and left alone, and the exit code is 1 |
 
 ### How it's built
 

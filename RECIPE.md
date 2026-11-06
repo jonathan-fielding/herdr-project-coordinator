@@ -43,6 +43,9 @@ Rows in the list, all radius 8 and `hover` under the pointer unless noted:
   plus button.
 - **Trust row**, under the project row when Claude doesn't trust the repo. 22px left and 8px right
   padding, 3px vertical, 11.5px `blocked`: `Claude doesn't trust ~/path yet`.
+- **Bring-back row**, under an open project row and any trust row, when more than one of its
+  coordinators is stopped by a restart. Same padding and type: `3 coordinators stopped: bring back`,
+  or `Bringing coordinators back…` while it runs.
 - **Worktree row**, 28px tall, 22px left and 6px right padding, 6px gap, `selected` background when
   it's the focused space. The fold button, a 12px `dim` icon (folder for the main checkout,
   git-branch for the rest), then the branch, or the folder's name if detached, truncated: `dim` when
@@ -52,7 +55,10 @@ Rows in the list, all radius 8 and `hover` under the pointer unless noted:
   a session, and the coordinator's status mark last.
 - **Notice rows** under an open worktree, 44px left and 8px right padding, 3px vertical, 11.5px:
   `Coordinator reports no status: look at it` in `unknown` with an 18px square-pen button at the
-  end, and `2 workers lost: carry on` (`1 worker lost: carry on`) in `blocked`.
+  end, and `2 workers lost: carry on` (`1 worker lost: carry on`) in `blocked`. Above them, and on a
+  folded worktree too, because they're what the person has to act on, one of two in `unknown` with no
+  button: `Stopped by a restart: click to bring back`, or `Something else is running in its terminal:
+  exit it first`.
 - **Empty worktree line**, 11.5px `dim`, same padding, no hover, one of: `No tasks yet: tell the
   coordinator what to do.` (coordinator running), `Not checked out: click to check it out and start
   a coordinator.` (default branch with no checkout), `No tasks yet.` (registered, coordinator not
@@ -76,7 +82,7 @@ the same colors. A dot is 7px, radius 4, 3px side margin. A state icon is 12px, 
 **On the sidebar's narrow rail** (the block `sidebar` under 160px) there's no header and no notices.
 The list has no side padding and each project is one 26px row, 8px side padding, 4px gap, square
 `hover`: its task prefix right-aligned at 11px `muted`, then a 14px slot holding the red count, or a
-12px `working` spinner, or a hollow dot. Below the list a 28px row is centered on the folder-plus
+12px `working` spinner, or a hollow dot (a stopped coordinator has no mark of its own here). Below the list a 28px row is centered on the folder-plus
 icon, or on a 14px `minus` icon when not set up.
 
 **The log pane** opens to the right: the `background` color, markdown at 13px, 18px side and 12px
@@ -116,11 +122,13 @@ their own background. All go to 88% opacity under the pointer; a button that isn
 |---|---|
 | Not running | hollow 7px dot, 1.5px `dim` border at 50% |
 | Being opened from here | 12px `dim` spinner |
+| Stopped by a restart (`shell`) | 12px `square` icon in `unknown` |
+| Something else in its terminal (`occupied`) | 12px `terminal` icon in `unknown` |
 | working | 12px `working` spinner |
 | blocked | `Needs you` pill in `blocked` |
 | done | filled 7px dot in `done` |
 | idle | hollow 7px dot, 1.5px border in `idle` (`dim` if the theme has none) |
-| Running, no agent status | `?` badge in `unknown` |
+| Running, no agent status (at a prompt, or still starting) | `?` badge in `unknown` |
 
 Spinners turn once every 900 ms, natively. Nothing else animates.
 
@@ -148,13 +156,16 @@ forgets being open on reload. The other groups never fold. Reasons and summaries
 
 - Project row: folds or unfolds it. Plus button: the New worktree dialog.
 - A project with no saved fold state starts open when the focused space is in it, when something needs
-  you, or when it's the only project. A worktree starts open when it's the focused space, or has
+  you, when a coordinator of its is stopped, or when it's the only project. A worktree starts open when it's the focused space, or has
   tasks needing you or working. Clicking a fold saves it.
 - Worktree row: goes there. If the coordinator runs, `agent.focus`. Otherwise it selects the
   worktree's space if there is one and starts or resumes the coordinator there; with no space, the
   coordinator starts in a new one named `<project>` for the main checkout or `<project> · <branch>`.
   The row shows the spinner meanwhile, and a failure is an error toast for 12 s. A row whose worktree
-  is gone does nothing.
+  is gone does nothing. A stopped coordinator goes the same way and `lane open` resumes it, in the
+  space that holds its pane, so that space is used even when no folder matches. With something else in
+  its terminal the click only does `terminal.peek`. One at a prompt reporting no agent gets the toast,
+  because `lane open` refuses without `--restart`; its notice row is the way in.
 - The default branch with no checkout appears as a row anyway: clicking it checks the branch out
   where Herdr puts worktrees (`~/.herdr/worktrees/<repo>/<branch>`), then goes there.
 - Worktree order: the default branch first, then the main checkout if it's on another branch, then
@@ -162,13 +173,22 @@ forgets being open on reload. The other groups never fold. Reasons and summaries
   tasks.
 - Raise PR button, on a worktree with a branch other than the default one: types `Raise a PR for this
   worktree's branch (<branch>) against <default>.` to its coordinator, starting one if needed, then
-  shows the toast `Asked <branch>'s coordinator` for 6 s.
+  shows the toast `Asked <branch>'s coordinator` for 6 s. It goes through `lane say`, which brings a
+  stopped coordinator back first and refuses if something else runs in its terminal; that refusal is
+  the error toast.
 - A file-text button opens the log pane to the right. On a worktree row it's the coordinator's log; on
   a task row, the task's.
 - Task row: `terminal.peek` when its worker's terminal is live, else the log if it has one, else
   nothing. Only the first two get the pointer cursor and hover.
 - `Coordinator reports no status`: peeks at it. Its square-pen button replaces it with a fresh Claude
-  carrying on the conversation.
+  carrying on the conversation, through `lane open --restart`.
+- `Stopped by a restart`: the same as clicking the worktree row.
+- `Something else is running`: `terminal.peek`. There is no replace button, and nothing in the mod
+  stops that terminal.
+- `N coordinators stopped: bring back`: runs `lane open <path> --no-focus --json` for each stopped
+  coordinator in turn, in its own space if it has one, else a new one. It selects no space, so the
+  person stays where they are, and one failure is an error toast `Couldn't bring back <name>` while the
+  rest carry on.
 - `N workers lost: carry on`, shown for failed tasks whose summary says the terminal `no longer
   exists`: retries each one.
 - Trust row: a new tab named `trust <repo folder>` running `claude` in the repo, to answer its prompt.
@@ -197,7 +217,10 @@ projects come first in saved order, new ones after them in the CLI's order.
 
 **Hovers**: project, worktree, task and notice rows and every icon button have tooltips. A project shows `<name>: ~/path`. A worktree
 shows its path and `Click: show its coordinator`, `Click: start its coordinator` or `This worktree is
-gone`; the unchecked-out default branch says what a click will do. A task shows `<id> <title>` and `Click: peek at its terminal` or `Click: its log`.
+gone`; a stopped one `Stopped by a restart. Click: bring it back, carrying on its conversation` (`as a
+new conversation` when it has no session); one with something else in its terminal `Something else is
+running in the coordinator's terminal. Exit it first, then click to start the coordinator. Click: look
+at it`; the unchecked-out default branch says what a click will do. A task shows `<id> <title>` and `Click: peek at its terminal` or `Click: its log`.
 
 **Dialogs**
 
@@ -239,9 +262,16 @@ the agent as it works. A failure shows `Couldn't read the log: <why>`.
   refresh is one `hcoord board --json`.
 - When a watched terminal (a coordinator, or a worker of an active task) changes state, it runs
   `hcoord sync`, which marks exited workers and starts queued tasks, then refreshes. Not on first load.
+  It never restarts a lost worker: that's `N workers lost: carry on`, or `hcoord recover`.
 - Switching to a space in a project's worktree starts its coordinator if it isn't running, without
-  moving focus, at most once a minute per worktree. A space not known yet is looked at again after
-  each refresh.
+  moving focus, at most once a minute per worktree. That includes resuming a stopped one, but never a
+  terminal with something else running in it. A space not known yet is looked at again after each
+  refresh.
+- Nothing resumes by itself at Herdr start, because each resume uses a Claude turn. The first space
+  focused after the mod loads isn't a switch, even if the focus or the board arrives late, so it waits
+  for a click or a later switch. Nor is the focus moving while a coordinator is being replaced: no
+  switch starts anything while a worktree is being opened, and a real switch in that moment waits for
+  the next one.
 - A new local space in a git repo no project has gets one toast, `Make <repo> a project?`, for 15 s;
   clicking it sets the project up. It asks once per repo, ever. A space inside a project's repo but in
   a checkout it doesn't know triggers a refresh instead. Spaces are first checked after 2 s, or up to
@@ -279,8 +309,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 - `herdr` functions: `agents`, `terminals`, `panes`, `spaces`, `focused`, `layout`, `theme`, `home`,
   `props`, `run`, `exec`, `notify`, `nextCommand`, `pickFolder`, `watchFolder`, `openOverlay`,
   `closeOverlay`, `shared`, `setShared`. Also `localStorage`, and `cx.open_url` for the setup link.
-- Commands through `run`: `agent.focus {terminal}`, `space.select {id}`, `space.close {id, confirmed:
-  true}`, `terminal.peek {terminal}`, `tab.new {name, folder, argv: ["claude"]}`, `pane.split
+- Commands through `run`: `agent.focus {terminal}`, `space.select {id}`, `space.rename {id, name}`,
+  `space.move {id, index}`, `space.close {id, confirmed: true}`, `terminal.peek {terminal}`, `tab.new {name, folder, argv: ["claude"]}`, `pane.split
   {direction, mod, props}`, its own `hcoord.raise-pr`, and its own `hcoord.project-made`.
 - Commands it receives through `nextCommand()`: `new` (the folder-plus flow; nothing ships a key for
   it), `adopt` (the toast's `action: { name: "hcoord.adopt" }`), `raise-pr` (from the menu copy, which
@@ -297,7 +327,16 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   - `board --json`, shape below.
   - `sync`.
   - `lane open <path> [--space <id> | --new-space <name>] [--restart] [--no-focus --json]`. The JSON
-    form gives `{ project, lane, ok, terminal, lines }`.
+    form gives `{ project, lane, ok, terminal, lines }`. What it does depends on `coordinatorState`:
+    - `running`: shows it. `--restart` changes nothing, so a working coordinator is never replaced.
+    - `shell`: stops the shell and resumes, no flag needed.
+    - `none`: starts or resumes.
+    - `prompt`: fails with a message saying to look at it. With `--restart`, replaces it and resumes.
+      A coordinator whose record was lost is replaced without the flag.
+    - `occupied`: fails, with or without `--restart`, naming what runs there and saying to exit it.
+      **A terminal with something else running in it is never killed.**
+
+    Resuming uses the saved session when its transcript still exists, otherwise a new session.
   - `lane say <path> <text> [--space <id> | --new-space <name>]`.
   - `lane checkout <branch> <slug> --json` and `lane new <branch> <slug> [--base <ref>] --json`, both
     `{ project, lane, path, branch, created }`, `lane new` also `base`.
@@ -322,7 +361,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   { version: 2, root, worktreeRoot, agent, warnings: [string], projects: [{
       slug, name, prefix, repo, dir, trusted: true | false | null,
       lanes: [{ key, path, branch, present,
-                coordinator: { address, name, session? } | null }],
+                coordinator: { address, name, session? } | null,
+                coordinatorState: "running" | "prompt" | "shell" | "occupied" | "none" }],
       checkouts: [{ path, branch }],
       defaultBranch: { name, path, checkedOut } | null,
       tasks: [{ id, title, state, lane, hasLog, waitingOn: [id], updatedAt,
@@ -331,13 +371,27 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 
   `state` is one of `todo`, `queued`, `starting`, `working`, `needs_you`, `done`, `merged`, `failed`,
   `cancelled`. `terminal` and `coordinator.address` are hc addresses, matched against `terminals()`
-  and `agents()`. A coordinator is live only if a live terminal has both its address and its name.
+  and `agents()`. A coordinator is live only if a live terminal has both its address and its name, and
+  its `coordinatorState` isn't `shell` or `occupied`. In those two, ignore any agent Herdr reports in
+  the terminal: a Claude started by hand in that shell isn't the coordinator.
+- `coordinatorState` says what became of a coordinator, read from the recorded terminal:
+  - `running`: hcoord's agent, reporting a status.
+  - `prompt`: hcoord's agent reporting no status (Claude's trust question, or still starting).
+  - `shell`: stopped by a restart. A coordinator's terminal is kept, so after a reboot or a lost
+    program it comes back as a shell with the same name, and nothing runs there. It counts from the
+    moment the program is lost, before the shell has started.
+  - `occupied`: replaced by that shell, and something else runs in it now, or the foreground isn't
+    known yet (a new shell shows none for a moment, so a rerun clears that).
+  - `none`: no such terminal running, or the core can't be reached. A lost record also reads as this.
+
+  Replaced means a kept terminal whose argv no longer starts `env … HCOORD_PROJECT=<slug>`. Status
+  can't tell, because a Claude started by hand reports one too.
 - A task's lane is `lanes[].key`. A worktree row comes from `checkouts`, joined to `lanes` by `path`. A
   space maps to a worktree through its first terminal's `cwd` (`panes()`), else `space.folder`, picking
   the deepest checkout containing it and ignoring anything under `worktreeRoot`.
 - Icons, all `mods/workspace-chrome/<name>.svg`, tinted by text color: `spinner`, `x`, `git-compare`,
   `check`, `minus`, `clock`, `chevron-right`, `chevron-down`, `folder`, `folder-plus`, `git-branch`,
-  `file-text`, `square-pen`, `plus`.
+  `file-text`, `square-pen`, `plus`, `square`, `terminal`.
 - Saved in `localStorage`: `open` (`p:<slug>` and `w:<path>` to true or false), `dismissed` (repos
   already offered), `order` (project slugs). Timers: 8 s refresh, 1.5 s new-space look, 30 s log reload.
 
@@ -347,8 +401,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   - It runs programs: `bun` with the hcoord CLI, `git` and `open`, plus `claude` in a new tab from the
     trust row. It doesn't call `hc` itself. The CLI it runs does call `hc`, `herdr-app`, `git`,
     `/usr/bin/trash` (Delete files too) and, through `hc`, `claude`, so it starts Claude Code agents
-    on its own: a coordinator when you switch to a project's space, and workers when `hcoord sync`
-    finds queued tasks that can run.
+    on its own: a coordinator when you switch to a project's space (never at Herdr start), and workers
+    when `hcoord sync` finds queued tasks that can run.
   - It reads outside its folder. The mod watches `~/.herdr-coordinator/projects` (or the `root` the CLI
     reports) and the folder holding a shown transcript, normally under `~/.claude/projects`, and uses
     icons from `mods/workspace-chrome`. It opens no files itself: the CLI reads and writes
@@ -405,6 +459,17 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 - Dragging: a press on a button inside a project row must not start a drag. The button's mouse-down runs
   first and records the position; the row's handler skips a press at that same position. Don't use
   `stop_propagation` for this.
+- Replacing a coordinator can close its space. `lane open` kills the old terminal before starting the
+  new one, and a space's only tab going closes the space. Herdr makes it again with the same id but
+  unnamed and last, and the focus lands elsewhere. So note the space's name and index first, then
+  restore them with `space.rename` and `space.move`. After a bring-back, `agent.focus` the new terminal
+  if the person was on that space. Don't let that focus change count as a switch, or it starts another
+  coordinator.
+- Find a stopped coordinator's space from its pane. A shell reports no agent, and the folder match can
+  pick the wrong space or none.
+- Never stop a coordinator's terminal from the mod. Only `lane open` and `recover` replace one, after
+  checking that nothing else runs there. The one exception is what the person confirms in a delete
+  dialog: `lane remove` and `project delete` stop the terminal whatever runs in it.
 - Don't call `space.new` for a worktree with no space, or a shell shows first. Use `lane open --new-space`
   so Herdr makes the space around the coordinator.
 - New worktree: focus Branch in `init` and again after 600 ms, if it's still the field in use. Pass `--base` only when the choice differs from `selected`, so the CLI picks local or origin's.
@@ -441,6 +506,14 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   when it finishes, hollow once looked at.
 - Clicking a worktree with no coordinator starts one and shows its space. Clicking again focuses it.
 - Switching to a project's worktree space with no running coordinator starts one, once a minute at most.
+- After a restart (`hc server stop`, then `hc server start`) nothing resumes when Herdr comes up, even with
+  the sidebar reloaded. Each stopped worktree shows the square and `Stopped by a restart: click to bring
+  back`, even folded, and `hcoord board --json` gives `coordinatorState: "shell"`. Clicking one resumes its
+  conversation in its own space, with the space's name and place kept. With two stopped, `2 coordinators
+  stopped: bring back` resumes both and the focus stays put.
+- With something running in a stopped coordinator's terminal, the row shows the `terminal` mark and `Something
+  else is running in its terminal: exit it first`. A click, a space switch, `lane open --restart` and
+  `recover` all leave it running. Once it's exited, clicking resumes the coordinator.
 - A task's file-text button opens a log pane on the right that grows as the agent works. Clicking a running
   task's row peeks at its terminal.
 - Right-clicking a project shows New worktree and Delete project…; right-clicking the main checkout shows
