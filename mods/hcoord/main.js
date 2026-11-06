@@ -72,6 +72,30 @@ const GROUPS = [
   { id: "merged", label: "Merged", states: ["merged", "cancelled"], folded: true },
 ];
 
+/** What an occupied coordinator's row and tooltip say. The row leads with the program, as it may be cut short. */
+function occupiedWords({ program, session }) {
+  const look = "Click: look at it";
+  if (program === "claude") {
+    const after = session
+      ? "The coordinator's saved conversation comes back, not this session, which stays in its own transcript."
+      : "That starts a new conversation. This session stays in its own transcript.";
+    return {
+      row: "Plain Claude running, not the coordinator",
+      tip: `This Claude was started by hand and isn't the coordinator. To bring the coordinator back, /exit it, then click the worktree. ${after} ${look}`,
+    };
+  }
+  if (program) {
+    return {
+      row: `${program} running, not the coordinator`,
+      tip: `${program} is running in the coordinator's terminal. Exit it first, then click the worktree to start the coordinator. ${look}`,
+    };
+  }
+  return {
+    row: "Something else is running in its terminal: exit it first",
+    tip: `Something else is running in the coordinator's terminal. Exit it first, then click the worktree to start the coordinator. ${look}`,
+  };
+}
+
 /** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
 const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
 
@@ -325,7 +349,7 @@ export default class Projects extends View {
     const t = all.find((x) => x.address === c.address && x.name === c.name && x.state === "live");
     // Replaced: the terminal lives on but the coordinator doesn't, even if Herdr reports an agent there
     // (a Claude started by hand in that shell isn't it).
-    if (!t || state === "shell" || state === "occupied") return { live: false, address: c.address, session: c.session, state };
+    if (!t || state === "shell" || state === "occupied") return { live: false, address: c.address, session: c.session, state, program: w.lane.coordinatorProgram ?? null };
     const a = ags.find((x) => x.address === t.address);
     return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session, state };
   }
@@ -751,7 +775,7 @@ export default class Projects extends View {
     const stopped = c.state === "shell" && !w.gone;
     const occupied = c.state === "occupied" && !w.gone;
     const bringBackTip = `Stopped by a restart. Click: bring it back, ${c.session ? "carrying on its conversation" : "as a new conversation"}`;
-    const occupiedTip = "Something else is running in the coordinator's terminal. Exit it first, then click to start the coordinator. Click: look at it";
+    const { row: occupiedRow, tip: occupiedTip } = occupiedWords(c);
 
     const head = h_flex()
       .id(`wt-${w.path}`)
@@ -805,7 +829,7 @@ export default class Projects extends View {
         .hover((el) => el.bg(t.hover))
         .tooltip(occupiedTip)
         .on_click(() => run("terminal.peek", { terminal: c.address }))
-        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child("Something else is running in its terminal: exit it first")));
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child(occupiedRow)));
     }
     if (!isOpen) return rows;
     if (c.live && (!c.agent || c.state === "prompt")) {

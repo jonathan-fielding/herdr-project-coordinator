@@ -4,10 +4,10 @@
  * grace delay, so these tests lose their coordinators with SIGKILL, on a private core.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { HcTerminal } from "../src/hc.ts";
-import { classifyCoordinator } from "../src/workers.ts";
+import { classifyCoordinator, foregroundProgram } from "../src/workers.ts";
 import { TestCore } from "./hccore.ts";
 import { cli, tempDir, tempRepo } from "./helpers.ts";
 
@@ -65,6 +65,34 @@ describe("classifyCoordinator", () => {
     expect(classify({ argv: ["sleep", "300"], keep: false })).toBe("prompt");
     expect(classifyCoordinator({ address: "t1", state: "live", status: "idle" }, "demo", true)).toBe("running");
     expect(classifyCoordinator({ address: "t1", state: "live" }, "demo", true)).toBe("prompt");
+  });
+});
+
+describe("foregroundProgram", () => {
+  const term = (argv: string[] | null, status?: unknown) =>
+    ({ address: "t1", state: "live", status, foreground: argv && { argv, pid: 20, name: "2.1.318" } }) as HcTerminal;
+  const claudeCode = { app: "claude-code", state: "idle" };
+
+  test("argv[0]'s basename, bare or a full path; never foreground.name", () => {
+    expect(foregroundProgram(term(["claude"]))).toBe("claude");
+    expect(foregroundProgram(term(["/Users/me/.local/bin/claude", "--resume"]))).toBe("claude");
+    expect(foregroundProgram(term(["vim", "notes.md"]))).toBe("vim");
+    expect(foregroundProgram(term(["/usr/bin/vim"]))).toBe("vim");
+  });
+
+  test("status.app decides only where argv can't", () => {
+    expect(foregroundProgram(term(["node", "/opt/lib/cli.js"], claudeCode))).toBe("claude");
+    expect(foregroundProgram(term(["/Users/me/.local/share/claude/versions/2.1.318"], claudeCode))).toBe("claude");
+    expect(foregroundProgram(term(["node", "server.js"]))).toBe("node");
+    expect(foregroundProgram(term(["node", "server.js"], { app: "other", state: "idle" }))).toBe("node");
+    // Left there by a Claude that has since exited.
+    expect(foregroundProgram(term(["vim"], claudeCode))).toBe("vim");
+  });
+
+  test("nothing known: null, status or not", () => {
+    expect(foregroundProgram(null)).toBeNull();
+    expect(foregroundProgram(term(null, claudeCode))).toBeNull();
+    expect(foregroundProgram(term([]))).toBeNull();
   });
 });
 
@@ -149,6 +177,17 @@ async function occupied(address: string) {
   await until("something in the foreground", () => get(address).foreground?.argv[0] === "sleep" && !!get(address).status);
 }
 
+/** A stand-in for a Claude started by hand: `sleep` under the name `claude`. Bare: found on PATH, as typed by hand. */
+async function plainClaude(address: string, how: "bare" | "full path") {
+  await replaced(address);
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  symlinkSync("/bin/sleep", join(bin, "claude"));
+  core.hc("send", address, how === "bare" ? `PATH="${bin}:$PATH" claude 300` : `"${bin}/claude" 300`);
+  await until("Claude in the foreground", () => get(address).foreground?.argv.at(-1) === "300" && get(address).foreground.argv[0].endsWith("claude"));
+}
+
+const laneOnBoard = async () => JSON.parse((await hcoord("board", "--json")).stdout).projects[0].lanes[0];
 const stateOnBoard = async () => JSON.parse((await hcoord("board", "--json")).stdout).projects[0].lanes[0].coordinatorState;
 
 describe("lane open", () => {
@@ -213,16 +252,18 @@ describe("lane open", () => {
     for (const flags of [[], ["--restart"]]) {
       const r = await open(...flags);
       expect(r.code).toBe(1);
-      expect(r.stdout).toContain("`sleep 300` is running");
+      expect(r.stdout).toContain(`\`sleep 300\` is running in ${NAME} (${address}), not the coordinator`);
       expect(r.stdout).toContain(`hc attach ${address}`);
       expect(get(address).state).toBe("live");
       expect(get(address).foreground.argv).toEqual(["sleep", "300"]);
     }
     expect(starts()).toHaveLength(1);
     expect(record().address).toBe(address);
+    expect(await laneOnBoard()).toMatchObject({ coordinatorState: "occupied", coordinatorProgram: "sleep" });
 
     core.hc("keys", address, "ctrl+c");
     await until("back at the shell", () => get(address).foreground?.pid === get(address).pid);
+    expect(await laneOnBoard()).toMatchObject({ coordinatorState: "shell", coordinatorProgram: null });
     expect((await open()).code).toBe(0);
     expect(flagOf(await startLine(2), "--resume")).toBe(session);
   }, 30_000);
@@ -272,6 +313,29 @@ describe("lane open", () => {
     expect(get(address).state).toBe("live");
     expect(starts()).toHaveLength(1);
   }, 30_000);
+
+  for (const how of ["bare", "full path"] as const) {
+    test(`occupied by a plain Claude, ${how}: the board says so and the refusal says how to get back`, async () => {
+      const { address, session } = await started();
+      transcript(session);
+      await plainClaude(address, how);
+      expect(await laneOnBoard()).toMatchObject({ coordinatorState: "occupied", coordinatorProgram: "claude" });
+
+      const saved = await open();
+      expect(saved.code).toBe(1);
+      expect(saved.stdout).toContain(`A plain Claude, started by hand, is running in ${NAME} (${address}), not the coordinator`);
+      expect(saved.stdout).toContain(`/exit it (see it with: hc attach ${address})`);
+      expect(saved.stdout).toContain("saved conversation comes back, not this session");
+
+      rmSync(join(claudeDir, "projects"), { recursive: true });
+      const unsaved = await open();
+      expect(unsaved.code).toBe(1);
+      expect(unsaved.stdout).toContain("That starts a new conversation");
+      expect(unsaved.stdout).not.toContain("saved conversation");
+      expect(get(address).state).toBe("live");
+      expect(starts()).toHaveLength(1);
+    }, 30_000);
+  }
 
   test("its record lost: an earlier coordinator that's a shell is replaced, an occupied one is refused", async () => {
     const { address } = await started();
@@ -413,13 +477,23 @@ describe("recover", () => {
     expect(record().session).not.toBe(session);
   }, 30_000);
 
+  test("occupied by a plain Claude: recover says what it is and how to get back", async () => {
+    const { address } = await started();
+    await plainClaude(address, "bare");
+    const r = await recover();
+    expect(r.code).toBe(1);
+    expect(r.stdout).toContain("A plain Claude, started by hand, is running in");
+    expect(r.stdout).toContain("/exit it");
+    expect(starts()).toHaveLength(1);
+  }, 30_000);
+
   test("occupied: a Claude started by hand isn't the coordinator; reported, left alone", async () => {
     const { address } = await started();
     await occupied(address);
     const r = await recover();
     expect(r.code).toBe(1);
     expect(r.stdout).not.toContain("is running\n");
-    expect(r.stdout).toContain("`sleep 300` is running");
+    expect(r.stdout).toContain("`sleep 300` is running in");
     expect(r.stdout).toContain("Exit it");
     expect(get(address).foreground.argv).toEqual(["sleep", "300"]);
     expect(starts()).toHaveLength(1);
