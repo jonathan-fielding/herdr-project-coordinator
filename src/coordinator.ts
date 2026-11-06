@@ -4,7 +4,7 @@ import { coordinatorArgv } from "./agents.ts";
 import { loadConfig } from "./config.ts";
 import { HcoordError } from "./errors.ts";
 import { withLock } from "./fsutil.ts";
-import { hcGet, hcKill, hcRunBg } from "./hc.ts";
+import { hcGet, hcKill, hcRunBg, type HcTerminal } from "./hc.ts";
 import { findTranscript } from "./log.ts";
 import { isWorkerBranch, LANE_RE, ROOT_LANE, slugify } from "./model.ts";
 import { paths } from "./paths.ts";
@@ -18,7 +18,16 @@ import {
   type CoordinatorRef,
   type ProjectMeta,
 } from "./store.ts";
-import { laneOf, liveCoordinator, retryTask, sync, trustWarnings, type Outcome } from "./workers.ts";
+import {
+  classifyCoordinator,
+  coordinatorState,
+  laneOf,
+  recordedCoordinator,
+  retryTask,
+  sync,
+  trustWarnings,
+  type Outcome,
+} from "./workers.ts";
 
 /** hc terminal name of a worktree's coordinator ([a-z0-9_-]{1,32}). */
 export const coordinatorName = (meta: ProjectMeta, lane: string) =>
@@ -100,6 +109,22 @@ async function saveCoordinator(slug: string, lane: string, c: CoordinatorRef | n
   });
 }
 
+/** What runs in a terminal now, as words for a message. */
+function runningThere(t: HcTerminal): string {
+  const cmd = t.foreground?.argv.join(" ");
+  if (!cmd) return "something is running";
+  return `\`${cmd.length > 60 ? cmd.slice(0, 59) + "…" : cmd}\` is running`;
+}
+
+/**
+ * Ends a terminal so its name can be used again. `hc kill` closes even a kept terminal and returns
+ * once it has finished (it hangs up, then terminates, then kills), so only a failed kill leaves it live.
+ */
+function stopTerminal(t: HcTerminal, name: string): void {
+  const k = hcKill(t.address);
+  if (hcGet(t.address)?.state === "live") throw new HcoordError(`couldn't stop ${name} (${t.address}): ${k.error ?? "it's still running"}`);
+}
+
 export interface OpenOptions {
   /** Show it in Herdr (default true). */
   show?: boolean;
@@ -111,7 +136,10 @@ export interface OpenOptions {
    * no shell shows before it, as it would in a space made with space.new.
    */
   newSpace?: string;
-  /** A coordinator that came back from a reboot as a plain shell is replaced (resuming its session). */
+  /**
+   * Replace a coordinator that reports no status (one that's only a shell now is replaced anyway).
+   * What someone started in that shell is never stopped, with or without this.
+   */
   restart?: boolean;
   /** Start a new conversation even when an earlier session could be resumed. */
   fresh?: boolean;
@@ -140,48 +168,49 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
   const claude = loadConfig().agent.kind === "claude";
   const lines: string[] = [];
 
-  let live = liveCoordinator(meta, laneKey);
-  const silent = live && claude && !hcGet(live.address)?.status;
-  if (live && silent && opts.restart) {
-    // A kept coordinator comes back from a reboot as a plain shell: replace it.
-    hcKill(live.address);
-    lines.push(`stopped ${name} (${live.address}): it was a shell, not Claude (after a restart?)`);
-    live = null;
-  } else if (live && silent) {
-    return {
-      ok: false,
-      lines: [
-        `${name} (${live.address}) is running but reports no agent status: Claude may have been replaced by a shell after a restart, or be at a prompt.`,
-        `Look with: hc attach ${live.address}. To replace it: hcoord lane open ${lane.path} --restart`,
-      ],
-    };
-  }
-  if (live) {
-    const shown = opts.show !== false && (opts.noFocus || app(["do", "agent.focus", "--terminal", live.address]) !== null);
-    lines.push(`coordinator ${name} (${live.address}) is already running${shown && !opts.noFocus ? "; showing it" : ""}`);
-    if (!shown) lines.push(`attach with: hc attach ${live.address}`);
-    return { ok: true, lines, terminal: live.address };
-  }
-  const holder = hcGet(name);
-  if (holder?.state === "live") {
-    // Our name is taken. An earlier coordinator of this same worktree that hcoord lost track of (the
-    // project was made again, or its record was lost) carries our labels: take it back, or replace
-    // it when it's only a shell now. Anything else is someone else's terminal: leave it alone.
-    const l = holder.labels ?? {};
+  // The recorded terminal, or (the project was made again, its record lost) a terminal holding our name.
+  const recorded = recordedCoordinator(meta, laneKey);
+  const named = recorded ? null : hcGet(name);
+  const term = recorded ?? (named?.state === "live" ? named : null);
+  if (term && !recorded) {
+    // An earlier coordinator of this same worktree carries our labels. Anything else is someone else's.
+    const l = term.labels ?? {};
     const ours = l["hcoord.project"] === slug && l["hcoord.lane"] === laneKey && l["hcoord.role"] === "coordinator";
     if (!ours) {
       throw new HcoordError(`a terminal named ${name} is running but isn't this worktree's coordinator; stop it (hc kill ${name}) first`);
     }
-    if (claude && !holder.status) {
-      hcKill(holder.address);
-      lines.push(`stopped ${name} (${holder.address}): an earlier coordinator of this worktree, now a plain shell`);
-    } else {
-      await saveCoordinator(slug, laneKey, { address: holder.address, name });
-      const shown = opts.show !== false && (opts.noFocus || app(["do", "agent.focus", "--terminal", holder.address]) !== null);
-      lines.push(`took back the running coordinator ${name} (${holder.address})${shown && !opts.noFocus ? "; showing it" : ""}`);
-      if (!shown) lines.push(`attach with: hc attach ${holder.address}`);
-      return { ok: true, lines, terminal: holder.address };
-    }
+  }
+  const state = classifyCoordinator(term, slug, claude);
+  if (state === "occupied") {
+    return {
+      ok: false,
+      lines: [
+        `${name} (${term!.address}) isn't the coordinator any more, and ${runningThere(term!)} in its place. hcoord won't stop that.`,
+        `Exit it (see it with: hc attach ${term!.address}), then: hcoord lane open ${lane.path}`,
+      ],
+    };
+  }
+  if (state === "prompt" && recorded && !opts.restart) {
+    return {
+      ok: false,
+      lines: [
+        `${name} (${term!.address}) is running but reports no agent status: it may be at a prompt, such as Claude's trust question.`,
+        `Look with: hc attach ${term!.address}. To replace it: hcoord lane open ${lane.path} --restart`,
+      ],
+    };
+  }
+  if (state === "running") {
+    if (!recorded) await saveCoordinator(slug, laneKey, { address: term!.address, name });
+    const shown = opts.show !== false && (opts.noFocus || app(["do", "agent.focus", "--terminal", term!.address]) !== null);
+    const what = recorded ? `coordinator ${name} (${term!.address}) is already running` : `took back the running coordinator ${name} (${term!.address})`;
+    lines.push(`${what}${shown && !opts.noFocus ? "; showing it" : ""}`);
+    if (!shown) lines.push(`attach with: hc attach ${term!.address}`);
+    return { ok: true, lines, terminal: term!.address };
+  }
+  if (state === "shell" || state === "prompt") {
+    stopTerminal(term!, name);
+    const why = state === "shell" ? "only a shell now (after a restart?)" : "reporting no agent status";
+    lines.push(`stopped ${name} (${term!.address}): ${recorded ? "" : "an earlier coordinator of this worktree, "}${why}`);
   }
 
   // Carry on the earlier conversation when there was one and its transcript is still there.
@@ -196,17 +225,17 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
   if (space && tab) Object.assign(labels, { "herdr.space": space, "herdr.tab": tab });
 
   // No parent: it must outlive whoever opened it. Keep: a lost coordinator comes back as a shell
-  // (never a rerun), and `--restart` resumes it.
+  // (never a rerun), and opening it again resumes it.
   const argv = coordinatorArgv(loadConfig(), slug, laneKey, name, session, resume);
-  const term = hcRunBg({ name, cwd: lane.path, argv, labels, parent: null, keep: true });
-  await saveCoordinator(slug, laneKey, { ...term, ...(session ? { session } : {}) });
-  lines.push(`${resume ? "resumed" : "started"} coordinator ${name} (${term.address}) in ${lane.path}`);
+  const started = hcRunBg({ name, cwd: lane.path, argv, labels, parent: null, keep: true });
+  await saveCoordinator(slug, laneKey, { ...started, ...(session ? { session } : {}) });
+  lines.push(`${resume ? "resumed" : "started"} coordinator ${name} (${started.address}) in ${lane.path}`);
 
   if (space && tab) {
     // Herdr adopts labelled terminals within a moment; then name the tab and show it.
     let adopted = false;
     for (let i = 0; i < 40 && !adopted; i++) {
-      adopted = tabOf(term.address) === tab;
+      adopted = tabOf(started.address) === tab;
       if (!adopted) await Bun.sleep(150);
     }
     if (adopted) {
@@ -215,19 +244,19 @@ export async function openLane(project: string, laneKey: string, opts: OpenOptio
       app(["do", "tab.rename", "--id", tab, "--name", `coord ${laneKey}`]);
       if (!opts.noFocus) {
         if (newSpace) app(["do", "space.select", "--id", space]);
-        app(["do", "agent.focus", "--terminal", term.address]);
+        app(["do", "agent.focus", "--terminal", started.address]);
       }
       lines.push(`${opts.noFocus ? "in" : "showing it in"} the tab "coord ${laneKey}"`);
     } else {
-      lines.push(`Herdr didn't show it yet; attach with: hc attach ${term.address}`);
+      lines.push(`Herdr didn't show it yet; attach with: hc attach ${started.address}`);
     }
   } else {
     const why = opts.show === false ? "not shown in Herdr (--no-show)" : "no Herdr window found";
-    lines.push(`${why}; attach with: hc attach ${term.address}`);
+    lines.push(`${why}; attach with: hc attach ${started.address}`);
   }
   meta = loadProject(slug);
   lines.push(...trustWarnings(meta));
-  return { ok: true, lines, terminal: term.address };
+  return { ok: true, lines, terminal: started.address };
 }
 
 /** Appends a dated bullet to the project's MEMORY.md (the coordinators' shared notes). */
@@ -243,7 +272,7 @@ export async function addMemory(project: string, text: string): Promise<Outcome>
 
 /**
  * After a reboot (or a core restart): checks workers, brings back each worktree's coordinator that
- * had one (resuming its conversation), and restarts tasks whose worker vanished, in their checkouts,
+ * had one (resuming its conversation) unless its terminal is in use, and restarts tasks whose worker vanished, in their checkouts,
  * with what's there so far.
  */
 export async function recoverProject(project: string, opts: { show?: boolean } = {}): Promise<Outcome> {
@@ -255,16 +284,17 @@ export async function recoverProject(project: string, opts: { show?: boolean } =
   };
   add(await sync(slug));
   const meta = loadProject(slug);
-  const claude = loadConfig().agent.kind === "claude";
   for (const [key, lane] of Object.entries(meta.lanes)) {
     if (!lane.coordinator) continue;
     if (!existsSync(lane.path)) {
       out.lines.push(`worktree ${key} (${lane.path}) is gone; its coordinator isn't restarted`);
       continue;
     }
-    const live = liveCoordinator(meta, key);
-    if (live && (!claude || hcGet(live.address)?.status)) out.lines.push(`${key}: coordinator ${live.name} (${live.address}) is running`);
-    else {
+    if (coordinatorState(meta, key) === "running") {
+      const { name, address } = lane.coordinator;
+      out.lines.push(`${key}: coordinator ${name} (${address}) is running`);
+    } else {
+      // Refuses, and says why, when something else runs in the coordinator's terminal.
       try {
         add(await openLane(slug, key, { show: opts.show, restart: true }));
       } catch (e) {

@@ -17,6 +17,25 @@ export interface HcTerminal {
   turn?: number;
   /** Present on `hc get`, not on `hc ls`. */
   labels?: Record<string, string>;
+  /**
+   * The program the terminal was started with (`hc get` only). When a kept terminal loses its program
+   * the core swaps this for the shell it replaced it with.
+   */
+  argv?: string[];
+  /** Started with --keep: a lost program is replaced by a shell (`hc get` only). */
+  keep?: boolean;
+  /** That program's pid (`hc get` only). Null while a kept terminal waits for its shell. */
+  pid?: number | null;
+  /** What runs in the terminal right now (`hc get` only). Null when no program runs, or the core can't tell yet. */
+  foreground?: HcForeground | null;
+}
+
+export interface HcForeground {
+  argv: string[];
+  pid: number;
+  /** The process's own name: often not the command ("2.1.318" for Claude). */
+  name?: string | null;
+  cwd?: string | null;
 }
 
 interface HcResult {
