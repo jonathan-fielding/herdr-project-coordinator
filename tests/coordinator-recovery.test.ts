@@ -318,6 +318,78 @@ describe("lane say", () => {
   }, 30_000);
 });
 
+describe("worker notes", () => {
+  const NOTE = "DM-1 needs_you";
+  const screen = (t: string) => JSON.stringify(core.hc("read", t));
+
+  /** A coordinator, up, with DM-1 working under `parent` (default: that coordinator). */
+  async function withWorker(parent?: string): Promise<{ address: string; session: string; worker: string }> {
+    const c = await started();
+    await hcoord("task", "add", "demo", "--title", "Work", "--brief", "b");
+    const r = await hcoord("task", "start", "DM-1", ...(parent ? ["--parent", parent] : []));
+    if (r.code !== 0) throw new Error(r.stdout + r.stderr);
+    return { ...c, worker: taskOne().terminal.address };
+  }
+  const taskOne = () => JSON.parse(readFileSync(join(home, "projects", "demo", "tasks.json"), "utf8")).tasks[0];
+  /** Both ways a note goes out: the Stop hook, then a report. Returns what the report printed. */
+  async function sendNotes(worker: string): Promise<string> {
+    const stopped = await cli(home, ["worker-stopped", "DM-1"], undefined, { ...env, HC_TERMINAL_ID: worker });
+    expect(stopped.code).toBe(0);
+    const r = await cli(home, ["report", "DM-1", "--state", "needs_you", "--file", "-"], "A question.", env);
+    expect(r.code).toBe(0);
+    expect(taskOne().state).toBe("needs_you");
+    return r.stdout;
+  }
+
+  test("running: the coordinator gets them", async () => {
+    const { address, worker } = await withWorker();
+    expect(await stateOnBoard()).toBe("running");
+    expect(await sendNotes(worker)).toContain(`notified the coordinator (${address})`);
+    await until("the notes in its terminal", () => screen(address).includes(NOTE));
+  }, 30_000);
+
+  test("shell: nothing is typed, the state is saved, and the resumed coordinator gets the next note", async () => {
+    const { address, session, worker } = await withWorker();
+    transcript(session);
+    await replaced(address);
+    expect(await sendNotes(worker)).toContain("no coordinator terminal to notify");
+    await Bun.sleep(300);
+    expect(screen(address)).not.toContain(NOTE);
+
+    expect((await open()).code).toBe(0);
+    const again = await cli(home, ["report", "DM-1", "--state", "needs_you", "--file", "-"], "Another.", env);
+    expect(again.stdout).toContain(`notified the coordinator (${record().address})`);
+  }, 30_000);
+
+  test("occupied: nothing reaches what runs there", async () => {
+    const { address, worker } = await withWorker();
+    await occupied(address);
+    expect(await stateOnBoard()).toBe("occupied");
+    expect(await sendNotes(worker)).toContain("no coordinator terminal to notify");
+    await Bun.sleep(300);
+    expect(screen(address)).not.toContain(NOTE);
+  }, 30_000);
+
+  for (const [name, replace] of [["shell", replaced], ["occupied", occupied]] as const) {
+    test(`--parent another live terminal, the coordinator ${name}: that terminal gets them`, async () => {
+      const boss = core.hc("run", "--bg", "--no-parent", "--outlive-parent", "--name", "boss", "--", "sleep", "300").address;
+      const { address, worker } = await withWorker(boss);
+      await replace(address);
+      expect(await sendNotes(worker)).toContain(`notified the coordinator (${boss})`);
+      await until("the notes in its terminal", () => screen(boss).includes(NOTE));
+      expect(screen(address)).not.toContain(NOTE);
+    }, 30_000);
+  }
+
+  test("a task started while the coordinator is a shell doesn't report to that shell", async () => {
+    const { address } = await started();
+    await replaced(address);
+    await hcoord("task", "add", "demo", "--title", "Work", "--brief", "b");
+    expect((await hcoord("task", "start", "DM-1")).stdout).toContain(", no coordinator");
+    expect(taskOne().parent).toBeUndefined();
+  }, 30_000);
+});
+
 describe("recover", () => {
   const recover = () => hcoord("recover", "demo", "--no-show");
 
@@ -353,14 +425,23 @@ describe("recover", () => {
     expect(starts()).toHaveLength(1);
   }, 30_000);
 
-  test("prompt: replaced, as it always was", async () => {
+  test("prompt: reported and left alone, however often it's run; lane open --restart still replaces it", async () => {
     writeFileSync(`${log}.silent`, "");
     await hcoord("project", "new", "demo", "--repo", repo, "--prefix", "DM");
     expect((await open()).code).toBe(0);
     const { address } = record();
     await until("our program running", () => get(address).foreground?.argv[0] === "sleep");
-    const r = await recover();
-    expect(r.code).toBe(0);
+    for (let i = 0; i < 2; i++) {
+      const r = await recover();
+      expect(r.code).toBe(1);
+      expect(r.stdout).toContain("reports no agent status");
+      expect(r.stdout).toContain(`hc attach ${address}`);
+      expect(get(address).state).toBe("live");
+      expect(record().address).toBe(address);
+    }
+    expect(starts()).toHaveLength(1);
+
+    expect((await open("--restart")).code).toBe(0);
     expect(get(address).state).toBe("finished");
     expect(await startLine(2)).toContain("--session-id");
   }, 30_000);

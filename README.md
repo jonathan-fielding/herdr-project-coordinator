@@ -246,7 +246,7 @@ If something else is running in a stopped coordinator's terminal, such as a Clau
 
 Click **N workers lost: carry on** to restart workers in their checkouts. That line appears once hcoord next checks its workers, and bringing a coordinator back makes it check.
 
-`hcoord recover` does all of this from a terminal, for every project in one go: it brings back every coordinator that isn't running and retries lost workers. If something else is running in a coordinator's terminal, it reports that, leaves it alone and exits with 1.
+`hcoord recover` does all of this from a terminal, for every project in one go: it brings back every coordinator that isn't running and retries lost workers. If something else is running in a coordinator's terminal, or a coordinator is at a prompt or still starting, it reports that, leaves it alone and exits with 1.
 
 ### Does anything leave my machine?
 
@@ -304,7 +304,7 @@ The section and the coordinators drive it, so you rarely need it. `hcoord --help
 | `hcoord task merge <id>` | retry a merge after a conflict |
 | `hcoord task retry <id>` / `cancel` / `clean` | rerun, stop, or remove a merged task's checkout |
 | `hcoord log <id>` | a worker's transcript and reports, as markdown |
-| `hcoord recover [<slug>]` | after a reboot: bring back every coordinator that isn't running and retry lost workers, in every project or just `<slug>`. A coordinator that reports no status is replaced. A terminal with something else running in it is reported and left alone, and the exit code is 1 |
+| `hcoord recover [<slug>]` | after a reboot: bring back every coordinator that isn't running and retry lost workers, in every project or just `<slug>`. A coordinator that reports no status, or a terminal with something else running in it, is reported and left alone, and the exit code is 1 |
 
 ### How it's built
 
