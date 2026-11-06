@@ -40,7 +40,7 @@ Rows in the list, all radius 8 and `hover` under the pointer unless noted:
   11px chevron-down when open, chevron-right when folded, `hover` background and `foreground` under
   the pointer), the project's name truncated in medium weight (`foreground` when the focused space
   is in this project, else `muted`), when folded a red count of tasks needing you, then an 18px
-  plus button.
+  settings (cog) button and an 18px plus button.
 - **Trust row**, under the project row when Claude doesn't trust the repo. 22px left and 8px right
   padding, 3px vertical, 11.5px `blocked`: `Claude doesn't trust ~/path yet`.
 - **Bring-back row**, under an open project row and any trust row, when more than one of its
@@ -111,6 +111,12 @@ their own background. All go to 88% opacity under the pointer; a button that isn
   branch, an `origin` or `default` tag at 11px `dim`, and ▾ (▴ when open). Open, it adds a 30px filter
   field and a bordered scrolling list of 28px rows, the chosen branch in `accent`, the highlighted
   row `selected`. Buttons Cancel (`raised`) and Create (`solid`).
+- **Project settings**, 520×420: title `Settings for <name>`, then a form that scrolls if settings
+  outgrow it, 12px between settings. Each setting is its label (11.5px `dim`), its control and a line
+  of helper text in `muted`, 4px apart. One so far: `Cleanup prompt`, a 170px multi-line box, 10px
+  side and 8px vertical padding, radius 6, a 1px border (`accent` when focused, else `input`), on
+  `background`, with `The worktree's coordinator runs this when a worktree of this project is deleted,
+  before its folder is removed.` under it. Buttons Cancel (`raised`) and Save (`solid`).
 - **Where hcoord keeps its data**, 520×400: selectable, scrolling markdown, then Show in Finder
   (`raised`) and Close (`solid`). A warning about a temporary folder explains what's in the folder,
   why it's at risk, how it got there and the fix. Any other warning shows only its own text.
@@ -155,7 +161,8 @@ forgets being open on reload. The other groups never fold. Reasons and summaries
 
 **Clicks**
 
-- Project row: folds or unfolds it. Plus button: the New worktree dialog.
+- Project row: folds or unfolds it. Cog button: the project settings dialog. Plus button: the New
+  worktree dialog.
 - A project with no saved fold state starts open when the focused space is in it, when something needs
   you, when a coordinator of its is stopped, or when it's the only project. A worktree starts open when it's the focused space, or has
   tasks needing you or working. Clicking a fold saves it.
@@ -246,6 +253,12 @@ Exit it first, then click the worktree to start the coordinator. Click: look at 
   `Type a name for the new branch.`. Create shows `Creating the branch and its checkout…` then
   `Starting its coordinator…`, closes the dialog and goes to the new space with one `agent.focus`, so
   the window moves only once it's ready.
+- Project settings: loads with `settings show`, the box reading `Loading…` and Save at 50% until the
+  answer comes, so a slow load can't save over the setting with an empty box. A failed load, or an
+  answer with no `cleanupPrompt`, reads `Couldn't load this setting.` with the reason in `blocked`, and
+  Save stays at 50%. Once loaded the box has the focus. Enter adds a line: only the Save button saves.
+  Save shows `Saving…` with both buttons at 50% and Esc ignored, then closes the dialog. An error
+  stays in the dialog in `blocked`, the text is kept, and typing clears it. Esc closes it otherwise.
 - Git dialog, 520 by 460: `Set up git in <name>?`, then `~/path isn't a git repo yet. Workers each get
   a checkout of it, and for that it needs a first commit of its files.` With no `.gitignore` and files
   to commit, a `blocked` line: `There's no .gitignore, so everything listed gets committed, including
@@ -306,14 +319,15 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   | `info` | data dialog; `{ warning, root, worktreeRoot }` | `openOverlay`, `kind: "dialog"`, 520×400 |
   | `newWorktree` | New worktree dialog; `{ project, name, defaultBranch }` | `openOverlay`, `kind: "dialog"`, 460×420 |
   | `gitInit` | git dialog; `{ name, folder, plan }`, `plan` being the dry run below | `openOverlay`, `kind: "dialog"`, 520×460 |
+  | `settings` | project settings dialog; `{ project, name }` | `openOverlay`, `kind: "dialog"`, 520×420 |
   | none | the section | a layout block |
 
 - Shipped mods used: only `workspace-chrome`, for its icons. Nothing of its code.
 - Imports. `gpui-kit`: `View`, `div`, `svg`. `gpui-base`: `v_flex`, `h_flex`, `TextView`, `InputState`,
-  `Input`, `Scrollbar`.
+  `Input`, `TextareaState`, `Textarea` (`InputState` is one line only), `Scrollbar`.
 - `herdr` functions: `agents`, `terminals`, `panes`, `spaces`, `focused`, `layout`, `theme`, `home`,
-  `props`, `run`, `exec`, `notify`, `nextCommand`, `pickFolder`, `watchFolder`, `openOverlay`,
-  `closeOverlay`, `shared`, `setShared`. Also `localStorage`, and `cx.open_url` for the setup link.
+  `props`, `run`, `exec`, `notify`, `nextCommand`, `pickFolder`, `watchFolder`, `writeTextFile`,
+  `openOverlay`, `closeOverlay`, `shared`, `setShared`. Also `localStorage`, and `cx.open_url` for the setup link.
 - Commands through `run`: `agent.focus {terminal}`, `space.select {id}`, `space.rename {id, name}`,
   `space.move {id, index}`, `space.close {id, confirmed: true}`, `terminal.peek {terminal}`, `tab.new {name, folder, argv: ["claude"]}`, `pane.split
   {direction, mod, props}`, its own `hcoord.raise-pr`, and its own `hcoord.project-made`.
@@ -326,6 +340,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   - `HCOORD[0]` with `HCOORD.slice(1)` and the hcoord arguments below.
   - `git rev-parse --path-format=absolute --git-common-dir` with `cwd` at a new space's folder.
   - `open <data folder>` from Show in Finder.
+  - `mktemp -d -t hcoord.XXXXXX`, then `rm -f` and `rmdir` afterwards: `exec` has no stdin, so saving a
+    setting writes its text to a file in that private folder with `writeTextFile` and passes the path.
   - The mod doesn't call `hc`, and `tab.new` runs `claude` only for the trust row.
 - `hcoord` calls. Add `--json` where shown. Non-zero exit means failure; the text shown is stdout plus
   stderr, trimmed.
@@ -345,6 +361,8 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 
     Resuming uses the saved session when its transcript still exists, otherwise a new session.
   - `lane say <path> <text> [--space <id> | --new-space <name>]`.
+  - `settings show <slug> --json`: `{ cleanupPrompt }`, `""` for none. `settings set <slug>
+    --cleanup-prompt-file <file>` saves it, trimmed, and an empty file clears it.
   - `lane checkout <branch> <slug> --json` and `lane new <branch> <slug> [--base <ref>] --json`, both
     `{ project, lane, path, branch, created }`, `lane new` also `base`.
   - `lane branches <slug> --json`: `{ default, selected, branches: [{ name, ref, remote }] }`, where
@@ -416,7 +434,7 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
 ## Watch out
 
 - **What this mod reaches.** Before adding it, tell the person:
-  - It runs programs: `bun` with the hcoord CLI, `git` and `open`, plus `claude` in a new tab from the
+  - It runs programs: `bun` with the hcoord CLI, `git`, `open`, `mktemp`, `rm` and `rmdir`, plus `claude` in a new tab from the
     trust row. It doesn't call `hc` itself. The CLI it runs does call `hc`, `herdr-app`, `git`,
     `/usr/bin/trash` (Delete files too) and, through `hc`, `claude`, so it starts Claude Code agents
     on its own: a coordinator when you switch to a project's space (never at Herdr start), and workers

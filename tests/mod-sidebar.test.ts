@@ -41,6 +41,14 @@ const world = {
   picked: 0,
   /** Set: `lane open` waits for this, so a test can see what's happening while one runs. */
   hold: null as Promise<void> | null,
+  /** Set: `settings show` waits for this. */
+  holdSettings: null as Promise<void> | null,
+  /** Each project's saved cleanup prompt, as hcoord would keep it. */
+  saved: {} as Record<string, string>,
+  /** The temp files on disk, as writeTextFile left them. */
+  files: {} as Record<string, string>,
+  /** Set: writeTextFile fails with this. */
+  writeError: null as Error | null,
 };
 
 /** A stand-in text field: a value, and handlers the test can fire. */
@@ -69,7 +77,7 @@ class FakeInput {
 const inputs: FakeInput[] = [];
 
 mock.module("gpui-kit", () => ({ View: class {}, div: el, svg: el }));
-mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
+mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: FakeInput, Input: { new: () => ({}) }, TextareaState: FakeInput, Textarea: { new: el }, Scrollbar: { vertical: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => world.agents,
   terminals: () => world.terminals,
@@ -85,8 +93,22 @@ mock.module("herdr", () => ({
     world.events.push([cmd, ...args].join(" "));
     if (world.execError && cmd !== "git") throw world.execError;
     if (world.hold && args[0] === "lane" && args[1] === "open") await world.hold;
+    if (cmd === "mktemp") return { code: 0, stdout: "/tmp/hcoord.abc\n", stderr: "" };
+    if (cmd === "rm") {
+      delete world.files[args[1]];
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (cmd === "rmdir") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "settings" && args[1] === "show" && world.holdSettings) await world.holdSettings;
     const answer = world.answers[args.slice(0, 2).join(" ")];
     if (answer) return answer;
+    if (args[0] === "settings" && args[1] === "show") {
+      return { code: 0, stdout: JSON.stringify({ cleanupPrompt: world.saved[args[2]] ?? "" }), stderr: "" };
+    }
+    if (args[0] === "settings" && args[1] === "set") {
+      world.saved[args[2]] = world.files[args[args.indexOf("--cleanup-prompt-file") + 1]].trim();
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (args[0] === "board") {
       world.boardRuns++;
       return { code: 0, stdout: JSON.stringify(world.board), stderr: "" };
@@ -98,6 +120,13 @@ mock.module("herdr", () => ({
   notify: (n: any) => void world.notes.push(n),
   nextCommand: () => new Promise(() => {}),
   pickFolder: async () => (world.picked++, null),
+  writeTextFile: async (path: string, text: string, expected: string | null) => {
+    if (world.writeError) throw world.writeError;
+    if (expected !== null) throw new Error("expected a new file");
+    world.files[path] = text;
+    world.events.push(`write ${path}`);
+    return null;
+  },
   watchFolder: () => new Promise(() => {}),
   layout: () => world.layout,
   home: () => "/home",
@@ -159,6 +188,10 @@ beforeEach(() => {
   world.picked = 0;
   world.layout = null;
   world.hold = null;
+  world.holdSettings = null;
+  world.saved = {};
+  world.files = {};
+  world.writeError = null;
   inputs.length = 0;
 });
 
@@ -542,6 +575,169 @@ describe("new worktree", () => {
     await v.go(p(), w, cx);
     expect(world.runs.some(([name]) => name === "space.new")).toBe(false);
     expect(laneOpens()).toEqual([["hcoord", "lane", "open", "/home/wt/feature", "--new-space", "r · feature"]]);
+  });
+});
+
+describe("project settings", () => {
+  const dialog = (project = "r") => {
+    world.props = { overlay: "ov", settings: { project, name: `${project}-name` } };
+    const cx = makeCx();
+    const d: any = new Projects();
+    d.init({}, cx);
+    return { d, cx, box: inputs[inputs.length - 1] };
+  };
+  const key = (d: any, cx: any, k: string) => {
+    let stopped = false;
+    byId(d.render(cx), "hc-settings").keyDown({ key: k }, { ...cx, stop_propagation: () => (stopped = true) });
+    return stopped;
+  };
+  const clickSave = async (d: any, cx: any) => {
+    byId(d.render(cx), "save").click(null, cx);
+    await cx.settle();
+  };
+
+  test("the cog sits just before + on a project row, folded or not, and opens the dialog for that project", async () => {
+    const { v, cx } = await start();
+    const check = (tree: any) => {
+      const ids = walk(tree).map((e) => e?.elementId).filter(Boolean);
+      expect(ids.indexOf("newwt-r")).toBe(ids.indexOf("settings-r") + 1);
+      return byId(tree, "settings-r");
+    };
+    v.open["p:r"] = true;
+    const cog = check(v.render(cx));
+    expect(cog.tip).toBe("Project settings");
+    v.open["p:r"] = false;
+    check(v.render(cx));
+    const stop = { ...cx, stop_propagation() {} };
+    cog.click(null, stop);
+    expect(world.overlays).toHaveLength(1);
+    expect(world.overlays[0]).toMatchObject({ mod: "hcoord", kind: "dialog", props: { settings: { project: "r", name: "r" } } });
+  });
+
+  test("it says what it's for and which project, with Esc shown", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    const text = textOf(d.render(cx));
+    expect(text).toContain("Settings for r-name");
+    expect(text).toContain("Esc");
+    expect(text).toContain("Cleanup prompt");
+    expect(text).toContain("before its folder is removed");
+    expect(text).toContain("Cancel");
+    expect(text).toContain("Save");
+  });
+
+  test("the box shows no text field and Save does nothing until the setting has loaded", async () => {
+    world.saved.r = "old prompt";
+    let answer = () => {};
+    world.holdSettings = new Promise((r) => (answer = r));
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    expect(textOf(d.render(cx))).toContain("Loading…");
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    box.text = "typed while it loads"; // nothing on screen takes this, but a save mustn't send it anyway
+    await d.saveSettings(cx);
+    expect(world.calls.filter((c) => c.includes("set"))).toEqual([]);
+
+    answer();
+    await cx.settle();
+    expect(textOf(d.render(cx))).not.toContain("Loading…");
+    expect(box.value()).toBe("old prompt");
+    expect(byId(d.render(cx), "save").click).toBeFunction();
+  });
+
+  test("several lines save and come back, per project, through a file that doesn't stay", async () => {
+    const prompt = "stop the dev server\n\ndrop the test database\n  (indented, \"quoted\" $HOME)";
+    const a = dialog("r");
+    await a.cx.settle();
+    a.box.text = prompt;
+    await clickSave(a.d, a.cx);
+    expect(world.closed).toEqual(["ov"]);
+
+    const b = dialog("other");
+    await b.cx.settle();
+    expect(b.box.value()).toBe("");
+    b.box.text = "other's prompt";
+    await clickSave(b.d, b.cx);
+
+    const again = dialog("r");
+    await again.cx.settle();
+    expect(again.box.value()).toBe(prompt);
+    expect(world.saved.other).toBe("other's prompt");
+
+    const set = world.calls.find((c) => c.includes("set"))!;
+    expect(set).toEqual(["hcoord", "settings", "set", "r", "--cleanup-prompt-file", "/tmp/hcoord.abc/text"]);
+    expect(world.files).toEqual({});
+    expect(world.calls).toContainEqual(["rmdir", "/tmp/hcoord.abc"]);
+  });
+
+  test("a prompt can be emptied", async () => {
+    world.saved.r = "old prompt";
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    box.text = "";
+    await clickSave(d, cx);
+    expect(world.saved.r).toBe("");
+    expect(world.closed).toEqual(["ov"]);
+  });
+
+  test("a load that fails stays in the dialog and can't be saved", async () => {
+    world.answers["settings show"] = { code: 1, stdout: "", stderr: "hcoord: unknown project r" };
+    const { d, cx } = dialog();
+    await cx.settle();
+    const text = textOf(d.render(cx));
+    expect(text).toContain("unknown project r");
+    expect(text).not.toContain("hcoord:");
+    expect(text).not.toContain("Loading…");
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    await d.saveSettings(cx);
+    expect(world.calls.filter((c) => c.includes("set"))).toEqual([]);
+  });
+
+  test("an answer with no cleanup prompt is a failed load too, not an empty box to save", async () => {
+    world.answers["settings show"] = { code: 0, stdout: "{}", stderr: "" };
+    const { d, cx } = dialog();
+    await cx.settle();
+    expect(byId(d.render(cx), "save").click).toBeNull();
+    expect(textOf(d.render(cx))).toContain("no cleanup prompt");
+  });
+
+  test("a save that fails stays in the dialog, keeps the text, and typing clears the error", async () => {
+    const { d, cx, box } = dialog();
+    await cx.settle();
+    world.answers["settings set"] = { code: 1, stdout: "", stderr: "hcoord: disk full" };
+    box.text = "my prompt";
+    await clickSave(d, cx);
+    expect(textOf(d.render(cx))).toContain("disk full");
+    expect(world.closed).toEqual([]);
+    expect(box.value()).toBe("my prompt");
+    expect(world.files).toEqual({});
+    box.handlers.change(null, cx);
+    expect(textOf(d.render(cx))).not.toContain("disk full");
+  });
+
+  test("a temp file that can't be written stays in the dialog as well", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    world.writeError = new Error("no space left");
+    await clickSave(d, cx);
+    expect(textOf(d.render(cx))).toContain("no space left");
+    expect(world.closed).toEqual([]);
+    expect(world.calls).toContainEqual(["rmdir", "/tmp/hcoord.abc"]);
+  });
+
+  test("Esc and Cancel close it, Enter doesn't, and neither closes it during a save", async () => {
+    const { d, cx } = dialog();
+    await cx.settle();
+    expect(key(d, cx, "enter")).toBe(false);
+    expect(world.closed).toEqual([]);
+    d.saving = true;
+    expect(key(d, cx, "escape")).toBe(true);
+    expect(byId(d.render(cx), "cancel").click).toBeNull();
+    expect(world.closed).toEqual([]);
+    d.saving = false;
+    key(d, cx, "escape");
+    byId(d.render(cx), "cancel").click(null, cx);
+    expect(world.closed).toEqual(["ov", "ov"]);
   });
 });
 
