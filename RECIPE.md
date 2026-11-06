@@ -53,6 +53,13 @@ Rows in the list, all radius 8 and `hover` under the pointer unless noted:
   `muted`. Then when folded the working count (11px `working`) and the red count. Then an 18px
   git-branch button when the row can raise a PR, an 18px file-text button when the coordinator has
   a session, and the coordinator's status mark last.
+- **Removal row**, directly under a worktree row, open or folded, while the worktree has `removing`.
+  44px left and 8px right padding, 3px vertical, 11.5px, no hover or click: `Cleaning up…` in `dim`, or
+  `Cleanup failed` in `blocked` when its cleanup task can't finish by itself: `failed`, `cancelled`
+  or gone, `done` with a `mergeError`, or `merged` for over a minute with the worktree still there (git
+  refused to remove it). `done` with no `mergeError` is on its way to merged and still reads
+  `Cleaning up…`. The tooltip says what's happening; the failed one points to Delete worktree….
+  The worktree row itself works as usual.
 - **Notice rows** under an open worktree, 44px left and 8px right padding, 3px vertical, 11.5px:
   `Coordinator reports no status: look at it` in `unknown` with an 18px square-pen button at the
   end, and `2 workers lost: carry on` (`1 worker lost: carry on`) in `blocked`. Above them, and on a
@@ -99,7 +106,8 @@ margin) unless they're first. Disabled items are `dim`. The highlighted row is `
 side padding, radius 8, a 1px border. Cancel and Close have an `input` border, the others a border of
 their own background. All go to 88% opacity under the pointer; a button that isn't ready sits at 50%.
 
-- **Delete worktree**, 460×300: buttons Cancel (`raised`, `foreground`) and Delete worktree (`blocked`,
+- **Delete worktree**, 460×360: buttons Cancel (`raised`, `foreground`), then Delete without cleanup
+  (`solid`, `solid_foreground`) when the plan has a `cleanupPrompt`, and Delete worktree (`blocked`,
   `#ffffff`).
 - **Delete project**, 480×360: Cancel, Remove from Herdr (`solid`, `solid_foreground`) and Delete
   files too (`blocked`, `#ffffff`). The text has two headed parts, `Remove from Herdr` in medium
@@ -237,14 +245,25 @@ Exit it first, then click the worktree to start the coordinator. Click: look at 
 **Dialogs**
 
 - Delete asks hcoord for a dry run first, showing `Looking…`, and its action buttons stay at 50% until
-  the plan arrives. Worktree: `~/path goes, with its Herdr space. The branch <b> is kept.`, the
-  uncommitted files in `blocked` (first four named), `Its coordinator is stopped.` if one runs,
+  the plan arrives. Worktree: `~/path goes, with its Herdr space. The branch <b> is kept.`; with a
+  `cleanupPrompt`, `The coordinator runs the cleanup prompt first, and the worktree is removed once that
+  finishes.` (when `removing` is set, `Its cleanup <ID> hasn't finished. Delete worktree picks it up
+  again if it stopped; Delete without cleanup removes the worktree now.`), then the prompt's first line
+  in `dim`; the uncommitted files in `blocked` (first four named), `Its coordinator is stopped.` if one runs,
   unfinished tasks in `blocked`. Project: what Remove from Herdr does, including where tasks and logs
   move, then what Delete files too removes, line by line, with uncommitted counts and unpushed commits
   in `blocked`, and whether files go to the Trash or are deleted for good.
 - Confirming shows `Deleting…`. It closes the affected spaces first, then runs hcoord, then closes the
   dialog with an 8 s toast of the output's last three lines. An uncommitted worktree is removed with
   force, since the dialog already warned. An error stays in the dialog in `blocked`. Esc closes it.
+- Delete worktree with a `cleanupPrompt` leaves the spaces open, as the coordinator lives there, and the
+  toast is `Cleanup started for <branch>`. If the answer has no `cleanup`, the worktree went at once (its
+  cleanup had merged already), so the dialog closes the spaces and the toast is the usual one. Delete
+  without cleanup is the direct path with `--skip-cleanup`.
+- When a pending removal ends and its worktree has gone from the board, the sidebar closes the spaces and
+  toasts `Worktree <branch> deleted` (8 s). The pending removals are kept in `localStorage`, so one that
+  ended while the mod was away is noticed too. A removal called off leaves the worktree on the board, and
+  a deleted project isn't on it at all: neither closes anything.
 - New worktree: Branch has the focus. Enter in a field creates. Start from loads the repo's branches,
   reading `Loading branches…` until then, with the default selected. If that fails it's a plain text
   field with the default branch as its placeholder (`the main checkout's HEAD` when there is none). ↓
@@ -315,7 +334,7 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   |---|---|---|
   | `log` | log pane; a task id, or `{ project, lane }` for a coordinator | `pane.split {direction: "right", mod: "hcoord", props}` |
   | `menu` | right-click menu; `{ kind: "project" \| "worktree", … }` | `openOverlay`, `kind: "popup"`, 210×160 |
-  | `ask` | delete dialog; `{ what: "project" \| "worktree", … }` | `openOverlay`, `kind: "dialog"`, 480×360 or 460×300 |
+  | `ask` | delete dialog; `{ what: "project" \| "worktree", … }` | `openOverlay`, `kind: "dialog"`, 480×360 or 460×360 |
   | `info` | data dialog; `{ warning, root, worktreeRoot }` | `openOverlay`, `kind: "dialog"`, 520×400 |
   | `newWorktree` | New worktree dialog; `{ project, name, defaultBranch }` | `openOverlay`, `kind: "dialog"`, 460×420 |
   | `gitInit` | git dialog; `{ name, folder, plan }`, `plan` being the dry run below | `openOverlay`, `kind: "dialog"`, 520×460 |
@@ -367,8 +386,13 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
     `{ project, lane, path, branch, created }`, `lane new` also `base`.
   - `lane branches <slug> --json`: `{ default, selected, branches: [{ name, ref, remote }] }`, where
     `selected` is the default's `ref`.
-  - `lane remove <path> --dry-run --json`: `{ path, branch, changed: [file], coordinator, unfinished:
-    [id], … }`. Then `lane remove <path> [--force]`.
+  - `lane remove <path> --dry-run --json`: `{ project, path, branch, changed: [file], coordinator,
+    unfinished: [id], cleanupPrompt, removing: { task, force, since }, … }`, the last two null when
+    there's none. Then `lane remove <path> [--force]`, or `[--force] --skip-cleanup` to remove it now,
+    calling off any pending removal. With a `cleanupPrompt` and no `--skip-cleanup`, `lane remove <path>
+    [--force] --json` answers `{ path, ok, cleanup, lines }`: `cleanup` is the task the removal waits for,
+    null if the worktree has gone already. It can exit 1 with `cleanup` set: the removal is pending but
+    the coordinator couldn't be told.
   - `project new <name> --repo <folder> [--git-init] --json`: the project with its `slug`. A stderr
     line starting `warning:` is the trust warning.
   - `project new <name> --repo <folder> --git-init --dry-run --json`: `{ repo, gitInit, files, count,
@@ -514,8 +538,15 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   first to read it clears it.
 - `localStorage` belongs to one copy of the mod, so folds and order aren't shared with a copy in another
   layout.
-- Delete closes spaces before running hcoord, so no shell sits in a folder that's going. If hcoord then
-  fails, the spaces are already closed.
+- A direct delete closes spaces before running hcoord, so no shell sits in a folder that's going. If
+  hcoord then fails, the spaces are already closed. A deferred one mustn't close them: that would stop
+  the coordinator meant to run the cleanup.
+- A pending removal's end could be announced by the dialog or by any sidebar copy. Each claims it
+  in shared state (`hcoord.removals-announced`, by project and task id) first, so one toast shows. The
+  dialog claims before running hcoord, or the sidebar can see the worktree go first, and gives the claim
+  back if hcoord failed or the removal is still waiting.
+- Look for a removed worktree in the board's `lanes` and `checkouts`, not `worktrees()`: a worktree on the
+  default branch comes back there as `virtual`, at the same path.
 - The toast acts on the latest offer only, and the repo is marked as asked once offered, whether or not
   it's clicked. The folder button still makes it a project.
 - `.when()` takes a boolean, so wrap strings in `Boolean()`. Elements need `.id()` before `.hover()`,
@@ -558,6 +589,10 @@ already loaded stay on screen. Any other failed `board` run is the red error lin
   coordinator, and lands there. `git worktree list` shows it.
 - Delete worktree lists what goes and needs a confirm. Afterwards the folder and space are gone and the
   branch remains.
+- With a cleanup prompt set, Delete worktree toasts `Cleanup started for <branch>`, leaves the space open
+  and shows `Cleaning up…` until the cleanup merges. Then the space closes and the toast says it was
+  deleted. A cleanup that fails shows `Cleanup failed`, and Delete without cleanup from the right-click
+  dialog removes it at once.
 - Dragging one project over another moves it, shows the `accent` line, and the order survives a reload.
 - After `HCOORD_HOME=<a temporary folder> hcoord mod install --temp`, the section shows a red `Data folder
   is temporary` row. Clicking it opens the dialog, and Show in Finder opens that folder.

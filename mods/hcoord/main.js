@@ -34,6 +34,10 @@ const ACTIVE = ["starting", "working", "needs_you"];
 // While the CLI can't be run, how often to see whether that's changed.
 const SETUP_RETRY_MS = 60000;
 const SETUP_URL = "https://github.com/jonathan-fielding/herdr-project-coordinator";
+// How long a merged cleanup task may wait for hcoord to remove its worktree before that counts as having failed.
+const REMOVAL_GRACE_MS = 60000;
+// Shared state: the pending removals whose end has been announced.
+const ANNOUNCED = "hcoord.removals-announced";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -96,6 +100,24 @@ function occupiedWords({ program, session }) {
     tip: `Something else is running in the coordinator's terminal. Exit it first, then click the worktree to start the coordinator. ${look}`,
   };
 }
+
+/** A pending removal that won't finish by itself. A done task with no mergeError is only on its way to merged. */
+function cleanupStuck(removing, task) {
+  if (removing.state === "done") return !!task?.mergeError;
+  // Merged, and the worktree still here for a while: git refused to remove it.
+  if (removing.state === "merged") return Date.now() - Date.parse(task?.updatedAt ?? removing.since) > REMOVAL_GRACE_MS;
+  return !removing.state || removing.state === "failed" || removing.state === "cancelled";
+}
+
+const removalKey = (project, task) => `${project}:${task}`;
+/** Whether to announce a removal's end: yes once, whichever of the dialog and the sidebar copies gets there first. */
+function claimRemoval(key) {
+  const seen = shared(ANNOUNCED) ?? [];
+  if (seen.includes(key)) return false;
+  setShared(ANNOUNCED, [...seen, key]);
+  return true;
+}
+const releaseRemoval = (key) => setShared(ANNOUNCED, (shared(ANNOUNCED) ?? []).filter((k) => k !== key));
 
 /** hcoord's reasons end in "; hc read t7" or a command to run: the person has clicks for those. */
 const plain = (s) => (s ?? "").replace(/;\s*(hc read \S+|hcoord task retry \S+.*)\s*$/, "");
@@ -213,6 +235,7 @@ export default class Projects extends View {
     this.order = load("order", []); // project slugs in the order the person dragged them to
     this.drag = null; // { from, over }: a project header pressed, and the project it's over
     this.offer = null; // { repo } the last "make it a project?" toast is about
+    this.removals = load("removals", {}); // removalKey -> { project, path, branch } waiting for a cleanup task
     this.refresh(cx);
     cx.timer.every(SIDEBAR_FALLBACK_MS, (cx) => this.refresh(cx));
     // New spaces settle (their first terminal's folder) for a moment before they're asked about.
@@ -252,6 +275,7 @@ export default class Projects extends View {
             if (!r.ok) throw new Error(r.text || "hcoord board failed");
             this.data = JSON.parse(r.stdout);
             this.error = null;
+            this.noticeRemovals();
             if (!this.watching) this.watch(cx);
           }
         } catch (e) {
@@ -262,6 +286,28 @@ export default class Projects extends View {
       } while (this.again);
       this.loading = false;
     });
+  }
+
+  /** hcoord removes a worktree whose cleanup is merged, with nothing here running: once it's off the board, its
+   *  spaces close as a direct delete's do. A removal called off leaves the worktree, and a deleted project its folders. */
+  noticeRemovals() {
+    const now = {};
+    for (const p of this.data.projects) {
+      for (const l of p.lanes) {
+        if (l.removing) now[removalKey(p.slug, l.removing.task)] = { project: p.slug, path: l.path, branch: l.branch ?? base(l.path) };
+      }
+    }
+    const before = this.removals;
+    this.removals = now;
+    if (JSON.stringify(now) !== JSON.stringify(before)) save("removals", now);
+    for (const [key, r] of Object.entries(before)) {
+      if (now[key]) continue;
+      const p = this.data.projects.find((x) => x.slug === r.project);
+      if (!p || p.lanes.some((l) => l.path === r.path) || p.checkouts.some((c) => c.path === r.path)) continue;
+      if (!claimRemoval(key)) continue;
+      for (const s of this.spacesIn([r.path])) run("space.close", { id: s.id, confirmed: true });
+      notify({ title: `Worktree ${r.branch} deleted`, level: "info", timeout: 8000 });
+    }
   }
 
   watch(cx) {
@@ -835,7 +881,17 @@ export default class Projects extends View {
       .child(this.status(t, c, busy));
 
     const rows = [head];
-    // These two show on a folded worktree too: they're what the person has to act on.
+    // A pending removal, a stopped or an occupied coordinator show on a folded worktree too.
+    if (w.lane?.removing) {
+      const stuck = cleanupStuck(w.lane.removing, tasks.find((x) => x.id === w.lane.removing.task));
+      rows.push(h_flex()
+        .id(`removing-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .tooltip(stuck
+          ? "The worktree was kept. Ask its coordinator what went wrong, or right-click: Delete worktree…"
+          : "Its coordinator is running the cleanup prompt. The worktree is removed once that finishes.")
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(stuck ? t.blocked : t.dim).child(stuck ? "Cleanup failed" : "Cleaning up…")));
+    }
     if (stopped) {
       rows.push(h_flex()
         .id(`stopped-${w.path}`)
@@ -1228,7 +1284,7 @@ export default class Projects extends View {
     } });
     if (m.log) items.push({ label: "Coordinator's log", icon: "file-text", go: () => run("pane.split", { direction: "right", mod: "hcoord", props: { log: m.log } }) });
     if (m.main) items.push({ label: "Main checkout: delete the project instead", icon: "folder", disabled: true });
-    else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 300, props: { ask: { ...m, what: "worktree" } } }) });
+    else items.push({ label: "Delete worktree…", icon: "x", danger: true, go: () => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 360, props: { ask: { ...m, what: "worktree" } } }) });
     return items;
   }
 
@@ -1303,33 +1359,51 @@ export default class Projects extends View {
     return spaces().filter((s) => !s.machine && paths.some((p) => within(this.placeOf(s, ps), p)));
   }
 
-  async doDelete(files, cx) {
+  async doDelete(files, cx, { skipCleanup = false } = {}) {
     const a = props().ask;
     const plan = this.plan;
     if (!plan || this.busyAsk) return;
     this.busyAsk = true;
     this.error = null;
     cx.notify();
-    let args, closing = [];
+    let args, closing = [], deferred = false, claimed = null;
     if (a.what === "project") {
       args = ["project", "delete", a.project, ...(files ? ["--files"] : [])];
       // Its folders are about to go: their spaces first, so no shell sits in them.
       if (files) closing = this.spacesIn(plan.checkouts.map((c) => c.path));
     } else {
-      args = ["lane", "remove", plan.path, ...(plan.changed.length ? ["--force"] : [])];
-      closing = this.spacesIn([plan.path]);
+      // A deferred removal needs its coordinator, which lives in those spaces: see noticeRemovals.
+      deferred = !!plan.cleanupPrompt && !skipCleanup;
+      args = ["lane", "remove", plan.path, ...(plan.changed.length ? ["--force"] : []), ...(skipCleanup ? ["--skip-cleanup"] : []), ...(deferred ? ["--json"] : [])];
+      if (!deferred) closing = this.spacesIn([plan.path]);
+      // Ending a pending removal here: the toast below says so, not the sidebar seeing it go.
+      if (plan.removing) {
+        claimed = removalKey(plan.project, plan.removing.task);
+        claimRemoval(claimed);
+      }
     }
     for (const s of closing) run("space.close", { id: s.id, confirmed: true });
     const r = await hcoord(args);
+    const answer = deferred ? parsed(r.stdout) : null;
+    const text = answer?.lines?.join("\n") ?? r.text;
+    const waiting = !!answer?.cleanup;
+    if (claimed && (waiting || !r.ok)) releaseRemoval(claimed);
     this.busyAsk = false;
     if (!r.ok) {
-      this.error = r.text;
+      this.error = text;
       cx.notify();
       return;
     }
+    // Asked to wait, but it's gone: the cleanup had merged already, or the prompt has been cleared since.
+    if (deferred && !waiting) for (const s of this.spacesIn([plan.path])) run("space.close", { id: s.id, confirmed: true });
     closeOverlay(props().overlay);
+    const body = text.split("\n").slice(-3).join("\n");
+    if (waiting) {
+      notify({ title: `Cleanup started for ${a.branch}`, body, level: "info", timeout: 8000 });
+      return;
+    }
     const what = a.what === "project" ? `${a.name} deleted${files ? ", files too" : " from Herdr"}` : `Worktree ${a.branch} deleted`;
-    notify({ title: what, body: r.text.split("\n").slice(-3).join("\n"), level: "info", timeout: 8000 });
+    notify({ title: what, body, level: "info", timeout: 8000 });
   }
 
   askLines(t) {
@@ -1340,6 +1414,12 @@ export default class Projects extends View {
     if (!p) return [line(this.error ? "" : "Looking…", t.dim)];
     if (a.what === "worktree") {
       out.push(line(`${tilde(p.path)} goes, with its Herdr space. The branch ${p.branch ?? "(detached)"} is kept.`));
+      if (p.cleanupPrompt) {
+        out.push(line(p.removing
+          ? `Its cleanup ${p.removing.task} hasn't finished. Delete worktree picks it up again if it stopped; Delete without cleanup removes the worktree now.`
+          : "The coordinator runs the cleanup prompt first, and the worktree is removed once that finishes."));
+        out.push(line(p.cleanupPrompt.split("\n")[0], t.dim));
+      }
       if (p.changed.length) out.push(line(`It has ${p.changed.length} uncommitted file${p.changed.length > 1 ? "s" : ""}: they will be lost (${p.changed.slice(0, 4).join(", ")}${p.changed.length > 4 ? ", …" : ""}).`, t.blocked));
       if (p.coordinator) out.push(line("Its coordinator is stopped."));
       if (p.unfinished.length) out.push(line(`Unfinished tasks are cancelled and their workers stopped: ${p.unfinished.join(", ")}.`, t.blocked));
@@ -1371,6 +1451,7 @@ export default class Projects extends View {
       buttons.push(button("herdr", "Remove from Herdr", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
       buttons.push(button("files", "Delete files too", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(true, cx))));
     } else {
+      if (this.plan?.cleanupPrompt) buttons.push(button("skip", "Delete without cleanup", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx, { skipCleanup: true }))));
       buttons.push(button("yes", "Delete worktree", t.blocked, "#ffffff", (_e, cx) => cx.spawn(async (cx) => this.doDelete(false, cx))));
     }
     return v_flex()
