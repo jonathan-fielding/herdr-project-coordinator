@@ -154,7 +154,9 @@ export default class Projects extends View {
     this.mergedOpen = new Set(); // worktree paths whose Merged group is open
     this.tried = {}; // worktree path -> when its coordinator was last started by itself
     this.busy = new Set(); // worktree paths being opened
+    this.bringing = new Set(); // project slugs whose stopped coordinators are coming back
     this.space = focused()?.space ?? null;
+    this.opened = null; // the space Herdr came up on, if it arrived after this copy did: not one the person went to
     this.pendingSpace = null; // the focused space, when it wasn't a known worktree yet: looked at again after each refresh
     this.seenSpaces = new Set(spaces().map((s) => s.id));
     this.born = {}; // space -> when this copy first saw it
@@ -309,16 +311,23 @@ export default class Projects extends View {
     const c = w.lane?.coordinator;
     const holder = c && ags.find((a) => a.address === c.address);
     if (holder) return spaces().find((s) => s.id === holder.space) ?? null;
+    // A coordinator that's now a shell reports no agent, but its pane is still where it was.
+    const pane = c && ps.find((x) => x.terminal === c.address);
+    const shown = pane && spaces().find((s) => (s.tabs ?? []).some((x) => x.id === pane.tab));
+    if (shown) return shown;
     return spaces().find((s) => !s.machine && this.worktreeAt(this.placeOf(s, ps))?.w.path === w.path) ?? null;
   }
 
   coordinatorOf(w, all, ags) {
     const c = w.lane?.coordinator;
     if (!c) return { live: false };
+    const state = w.lane.coordinatorState ?? null;
     const t = all.find((x) => x.address === c.address && x.name === c.name && x.state === "live");
-    if (!t) return { live: false, session: c.session };
+    // Replaced: the terminal lives on but the coordinator doesn't, even if Herdr reports an agent there
+    // (a Claude started by hand in that shell isn't it).
+    if (!t || state === "shell" || state === "occupied") return { live: false, address: c.address, session: c.session, state };
     const a = ags.find((x) => x.address === t.address);
-    return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session };
+    return { live: true, address: t.address, status: a?.status ?? null, agent: a ?? null, session: c.session, state };
   }
 
   /** A worktree on some branch other than the default one, on disk: it can have a pull request. */
@@ -343,6 +352,7 @@ export default class Projects extends View {
   }
 
   /** Go to a worktree: its coordinator if it runs, else its space and a new (or resumed) coordinator there.
+   *  Something else running in the coordinator's terminal isn't ours to stop: that's only shown.
    *  With `say`, that text is then typed to the coordinator (`hcoord lane say`, which waits for a new one to be up). */
   async go(p, w, cx, { auto = false, space = null, restart = false, say = null } = {}) {
     if (w.virtual) {
@@ -361,6 +371,10 @@ export default class Projects extends View {
     }
     const ags = agents();
     const c = this.coordinatorOf(w, terminals(), ags);
+    if (c.state === "occupied" && !say) {
+      if (!auto) run("terminal.peek", { terminal: c.address });
+      return;
+    }
     if (c.live && c.agent && !restart) {
       if (!auto) run("agent.focus", { terminal: c.address });
       if (!say) return;
@@ -387,10 +401,36 @@ export default class Projects extends View {
     this.refresh(cx);
   }
 
-  /** Switching to a project's worktree space starts its coordinator when it isn't running (once a minute at most). */
+  /** The worktrees of a project whose coordinators a restart stopped, in the order they show. */
+  stoppedIn(p, all, ags) {
+    return this.worktrees(p).filter((w) => !w.gone && this.coordinatorOf(w, all, ags).state === "shell");
+  }
+
+  /** Resumes coordinators one at a time, leaving the focus where it is: hcoord doesn't focus each, and no space is selected. */
+  async bringBack(p, list, cx) {
+    if (this.bringing.has(p.slug)) return;
+    this.bringing.add(p.slug);
+    cx.notify();
+    for (const w of list) {
+      if (this.busy.has(w.path)) continue;
+      this.busy.add(w.path);
+      cx.notify();
+      const s = this.spaceOf(w, panes(), agents());
+      const r = await openLane(p, w, { space: s?.id, fresh: true, noFocus: true });
+      this.busy.delete(w.path);
+      if (!r.ok) notify({ title: `Couldn't bring back ${spaceName(p, w)}`, body: r.text, level: "error", timeout: 12000 });
+      this.refresh(cx);
+    }
+    this.bringing.delete(p.slug);
+    cx.notify();
+  }
+
+  /** Switching to a project's worktree space starts its coordinator when it isn't running (once a minute at most).
+   *  Herdr coming up isn't a switch: each resume uses a Claude turn, so that waits for the person. */
   followSpace(cx) {
     const now = focused()?.space ?? null;
     if (now === this.space) return;
+    this.opened = this.space === null ? now : null;
     this.space = now;
     this.pendingSpace = null;
     this.startFor(now, cx);
@@ -407,7 +447,7 @@ export default class Projects extends View {
     this.startFor(s, cx);
   }
 
-  /** Starts the coordinator of the worktree a space is in, if it isn't running. A space that isn't in a
+  /** Starts or resumes the coordinator of the worktree a space is in, if it isn't running. A space that isn't in a
    *  known worktree (yet) stays pending, and is looked at again after the next refresh. */
   startFor(now, cx) {
     if (!now) return;
@@ -420,7 +460,9 @@ export default class Projects extends View {
     }
     this.pendingSpace = null;
     if (hit.w.gone) return;
-    if (this.coordinatorOf(hit.w, terminals(), agents()).live) return;
+    if (now === this.opened) return;
+    const c = this.coordinatorOf(hit.w, terminals(), agents());
+    if (c.live || c.state === "occupied") return;
     if (Date.now() - (this.tried[hit.w.path] ?? 0) < RETRY_MS) return;
     this.tried[hit.w.path] = Date.now();
     cx.spawn(async (cx) => this.go(hit.p, hit.w, cx, { auto: true, space: now }));
@@ -546,12 +588,14 @@ export default class Projects extends View {
 
   status(t, c, busy) {
     if (busy) return svg(ICON("spinner")).size(12).mx(1).flex_none().text_color(t.dim).spin(900);
+    if (c.state === "shell") return svg(ICON("square")).size(12).mx(1).flex_none().text_color(t.unknown);
+    if (c.state === "occupied") return svg(ICON("terminal")).size(12).mx(1).flex_none().text_color(t.unknown);
     if (!c.live) return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.dim + "80");
     if (c.status === "working") return svg(ICON("spinner")).size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (c.status === "blocked") return this.pill(t, "Needs you", t.blocked);
     if (c.status === "done") return div().size(7).mx(3).flex_none().rounded(4).bg(t.done);
     if (c.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
-    // Running, no agent status: a shell after a restart, or a prompt.
+    // Running, no agent status: at a prompt.
     return this.badge(t, "?", t.unknown);
   }
 
@@ -686,6 +730,10 @@ export default class Projects extends View {
     const isOpen = this.open[key] ?? (here || needs > 0 || working > 0);
     const busy = this.busy.has(w.path);
     const label = w.branch ?? base(w.path);
+    const stopped = c.state === "shell" && !w.gone;
+    const occupied = c.state === "occupied" && !w.gone;
+    const bringBackTip = `Stopped by a restart. Click: bring it back, ${c.session ? "carrying on its conversation" : "as a new conversation"}`;
+    const occupiedTip = "Something else is running in the coordinator's terminal. Exit it first, then click to start the coordinator. Click: look at it";
 
     const head = h_flex()
       .id(`wt-${w.path}`)
@@ -701,7 +749,7 @@ export default class Projects extends View {
       .hover((el) => el.bg(t.hover))
       .tooltip(w.virtual
         ? `The default branch, not checked out anywhere.\nClick: check it out in ${tilde(w.path)} and start its coordinator`
-        : `${tilde(w.path)}\n${c.live ? "Click: show its coordinator" : w.gone ? "This worktree is gone" : "Click: start its coordinator"}`)
+        : `${tilde(w.path)}\n${stopped ? bringBackTip : occupied ? occupiedTip : c.live ? "Click: show its coordinator" : w.gone ? "This worktree is gone" : "Click: start its coordinator"}`)
       .on_click((_e, cx) => {
         if (!w.gone) cx.spawn(async (cx) => this.go(p, w, cx));
       })
@@ -719,18 +767,39 @@ export default class Projects extends View {
       .when(Boolean(c.session), (el) => el.child(this.iconButton(`clog-${w.path}`, t, "file-text", "The coordinator's log", () => this.openLog({ project: p.slug, lane: w.lane.key }))))
       .child(this.status(t, c, busy));
 
-    if (!isOpen) return [head];
     const rows = [head];
-    if (c.live && !c.agent) {
+    // These two show on a folded worktree too: they're what the person has to act on.
+    if (stopped) {
+      rows.push(h_flex()
+        .id(`stopped-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .cursor_pointer()
+        .hover((el) => el.bg(t.hover))
+        .tooltip(bringBackTip)
+        .on_click((_e, cx) => cx.spawn(async (cx) => this.go(p, w, cx)))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child("Stopped by a restart: click to bring back")));
+    }
+    if (occupied) {
+      rows.push(h_flex()
+        .id(`occupied-${w.path}`)
+        .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .cursor_pointer()
+        .hover((el) => el.bg(t.hover))
+        .tooltip(occupiedTip)
+        .on_click(() => run("terminal.peek", { terminal: c.address }))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child("Something else is running in its terminal: exit it first")));
+    }
+    if (!isOpen) return rows;
+    if (c.live && (!c.agent || c.state === "prompt")) {
       rows.push(h_flex()
         .id(`restart-${w.path}`)
         .pl(44).pr(8).py(3).flex_none().rounded(8).gap(6)
         .cursor_pointer()
         .hover((el) => el.bg(t.hover))
-        .tooltip("It reports no status: it's waiting at a prompt (Claude's trust question?), or it's a plain shell after a restart. Click: show it. The button at the end replaces it with a fresh Claude.")
+        .tooltip("It reports no status: it's waiting at a prompt (Claude's trust question?). Click: show it. The button at the end replaces it with a fresh Claude.")
         .on_click(() => run("terminal.peek", { terminal: c.address }))
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.unknown).child("Coordinator reports no status: look at it"))
-        .child(this.iconButton(`restartbtn-${w.path}`, t, "square-pen", "Replace it with a fresh Claude, carrying on its conversation (after a restart)", (cx) => cx.spawn(async (cx) => this.go(p, w, cx, { restart: true })))));
+        .child(this.iconButton(`restartbtn-${w.path}`, t, "square-pen", "Replace it with a fresh Claude, carrying on its conversation", (cx) => cx.spawn(async (cx) => this.go(p, w, cx, { restart: true })))));
     }
     const lost = tasks.filter((x) => x.state === "failed" && /no longer exists/.test(x.summary ?? ""));
     if (lost.length) {
@@ -830,7 +899,8 @@ export default class Projects extends View {
     const hereHit = this.worktreeAt(ctx.herePlace);
     const here = hereHit?.p.slug === p.slug;
     const key = `p:${p.slug}`;
-    const isOpen = this.open[key] ?? (here || needs > 0 || this.data.projects.length === 1);
+    const stopped = this.stoppedIn(p, ctx.all, ctx.ags);
+    const isOpen = this.open[key] ?? (here || needs > 0 || stopped.length > 0 || this.data.projects.length === 1);
     const head = h_flex()
       .id(`proj-${p.slug}`)
       .px(6)
@@ -868,6 +938,18 @@ export default class Projects extends View {
         .tooltip(`Claude hasn't been told to trust ${tilde(p.repo)}, so its agents would stop at that prompt. Click to open Claude there and answer it yourself.`)
         .on_click(() => run("tab.new", { name: `trust ${base(p.repo)}`, folder: p.repo, argv: ["claude"] }))
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked).child(`Claude doesn't trust ${tilde(p.repo)} yet`)));
+    }
+    if (stopped.length > 1) {
+      const bringing = this.bringing.has(p.slug);
+      rows.push(h_flex()
+        .id(`bring-back-${p.slug}`)
+        .pl(22).pr(8).py(3).flex_none().rounded(8).gap(6)
+        .cursor_pointer()
+        .hover((el) => el.bg(t.hover))
+        .tooltip("A restart stopped them. Click to bring each back in turn, carrying on its conversation. You stay where you are.")
+        .on_click((_e, cx) => cx.spawn(async (cx) => this.bringBack(p, stopped, cx)))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.blocked)
+          .child(bringing ? "Bringing coordinators back…" : `${stopped.length} coordinators stopped: bring back`)));
     }
     for (const w of wts) rows.push(...this.worktreeRows(t, p, w, ctx));
     return block(rows);
