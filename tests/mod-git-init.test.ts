@@ -68,7 +68,7 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 mock.module("gpui-kit", () => ({ View: class {}, div: el, svg: el }));
-mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: { new: () => ({}) }, Input: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
+mock.module("gpui-base", () => ({ v_flex: el, h_flex: el, TextView: class {}, InputState: { new: () => ({}) }, Input: { new: () => ({}) }, TextareaState: { new: () => ({}) }, Textarea: { new: () => ({}) }, Scrollbar: { vertical: () => ({}) } }));
 mock.module("herdr", () => ({
   agents: () => [],
   terminals: () => [],
@@ -101,6 +101,7 @@ mock.module("herdr", () => ({
   theme: () => ({}),
   notify: (n: any) => void world.notes.push(n),
   pickFolder: async () => world.picked,
+  writeTextFile: async () => null,
   watchFolder: () => new Promise(() => {}),
   layout: () => null,
   home: () => world.root,

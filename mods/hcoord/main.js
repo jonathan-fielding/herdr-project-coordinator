@@ -6,18 +6,19 @@
 // The same mod with props { log } is a pane showing one agent's log (its transcript); with
 // props { menu } a right-click menu, with props { ask } a dialog asking before a delete, with
 // props { info } a dialog explaining a warning (where hcoord keeps its data), with props { newWorktree }
-// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator), and with
-// props { gitInit } a dialog asking before a plain folder becomes a git repo and a project.
+// the New worktree dialog (a new branch, its checkout, and a space holding only its coordinator), with
+// props { gitInit } a dialog asking before a plain folder becomes a git repo and a project, and with
+// props { settings } a project's settings dialog.
 // Data: `hcoord board --json`, refreshed when ~/.herdr-coordinator/projects changes; workers'
 // terminals changing makes hcoord check them (`hcoord sync`).
 // Needs the hcoord CLI: `hcoord mod install` writes how to run it into hcoord-path.js, and without it
 // this section only says how to set it up. Edit the copy in the hcoord repo, not this one.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextView, InputState, Input, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, TextView, InputState, Input, TextareaState, Textarea, Scrollbar } from "gpui-base";
 import {
   agents, terminals, panes, spaces, focused, run, exec, theme, notify, nextCommand,
-  pickFolder, watchFolder, layout, home, props, openOverlay, closeOverlay, shared, setShared,
+  pickFolder, watchFolder, writeTextFile, layout, home, props, openOverlay, closeOverlay, shared, setShared,
 } from "herdr";
 import { HCOORD } from "./hcoord-path.js";
 
@@ -122,6 +123,26 @@ async function hcoord(args) {
   }
 }
 
+/** hcoord given `text` as a file, since `exec` has no stdin: `args(file)` are its arguments. The file is in a
+ *  private folder of its own and is gone afterwards. Never rejects. */
+async function hcoordWithFile(text, args) {
+  let dir = null;
+  try {
+    const made = await exec("mktemp", ["-d", "-t", "hcoord.XXXXXX"]);
+    dir = made.code === 0 ? made.stdout.trim() : null;
+    if (!dir) return { ok: false, text: `Couldn't make a temporary folder: ${made.stderr.trim()}`, stdout: "" };
+    await writeTextFile(`${dir}/text`, text, null);
+    return await hcoord(args(`${dir}/text`));
+  } catch (e) {
+    return { ok: false, text: String(e?.message ?? e), stdout: "" };
+  } finally {
+    if (dir) {
+      await exec("rm", ["-f", `${dir}/text`]).catch(() => {});
+      await exec("rmdir", [dir]).catch(() => {});
+    }
+  }
+}
+
 /** Makes a checkout with `hcoord lane checkout|new … --json`: { w } the worktree to go to, or { error }. */
 async function makeCheckout(args) {
   const r = await hcoord([...args, "--json"]);
@@ -135,6 +156,9 @@ async function makeCheckout(args) {
 
 /** hcoord's New worktree dialog for a project: { project, name, defaultBranch }. */
 const openNewWorktree = (n) => openOverlay({ mod: "hcoord", kind: "dialog", width: 460, height: 420, props: { newWorktree: n } });
+
+/** hcoord's settings dialog for a project: { project, name }. */
+const openSettings = (s) => openOverlay({ mod: "hcoord", kind: "dialog", width: 520, height: 420, props: { settings: s } });
 
 /** What a worktree's own space is called. */
 const spaceName = (p, w) => (w.main ? p.name : `${p.name} · ${w.branch ?? base(w.path)}`);
@@ -165,6 +189,7 @@ export default class Projects extends View {
     if (props()?.info) return this.initInfo(cx);
     if (props()?.newWorktree) return this.initNew(cx);
     if (props()?.gitInit) return this.initGitInit(cx);
+    if (props()?.settings) return this.initSettings(cx);
     this.data = null; // hcoord board --json
     this.error = null;
     this.notSetUp = !HCOORD; // the CLI can't be run: the section says how to set it up
@@ -967,6 +992,7 @@ export default class Projects extends View {
       .child(this.fold(t, key, isOpen))
       .child(div().flex_1().min_w(0).truncate().font_medium().text_color(here ? t.foreground : t.muted).child(p.name))
       .when(!isOpen && needs > 0, (el) => el.child(this.badge(t, String(needs), t.blocked)))
+      .child(this.iconButton(`settings-${p.slug}`, t, "settings", "Project settings", () => openSettings({ project: p.slug, name: p.name })))
       .child(this.iconButton(`newwt-${p.slug}`, t, "plus", "New worktree (with its own coordinator)", () => this.newWorktree(p)));
     const block = (rows) => this.draggable(v_flex().id(`projblock-${p.slug}`).flex_none(), t, p, list).children(rows);
     if (!isOpen) return block([head]);
@@ -1029,6 +1055,7 @@ export default class Projects extends View {
     if (props()?.info) return this.renderInfo(t);
     if (props()?.newWorktree) return this.renderNew(t);
     if (props()?.gitInit) return this.renderGitInit(t);
+    if (props()?.settings) return this.renderSettings(t);
     const all = terminals();
     const ags = agents();
     const ps = panes();
@@ -1740,5 +1767,105 @@ export default class Projects extends View {
         .when(Boolean(this.busyNew), (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.busyNew)))
         .child(button("cancel", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay)))
         .child(button("create", "Create", t.solid, t.solid_foreground, (_e, cx) => cx.spawn(async (cx) => this.createWorktree(cx)))));
+  }
+
+  // ------------------------------------------------------------- project settings dialog
+
+  initSettings(cx) {
+    this.loaded = null; // null: loading, true: loaded, false: it failed. Only true can be saved.
+    this.saving = false;
+    this.error = null;
+    this.promptFocused = false;
+    this.promptBox = TextareaState.new({ value: "", placeholder: "Nothing runs if this is empty.", rows: 8 });
+    this.promptBox.on("change", (_e, cx) => {
+      this.error = null;
+      cx.notify();
+    });
+    for (const [event, on] of [["focus", true], ["blur", false]]) {
+      this.promptBox.on(event, (_e, cx) => {
+        this.promptFocused = on;
+        cx.notify();
+      });
+    }
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+    cx.timer.after(600, () => this.loaded && !this.promptFocused && this.promptBox.focus());
+    cx.spawn(async (cx) => this.loadSettings(cx));
+  }
+
+  /** The box stays out of reach until this answers, so nothing typed can be lost and nothing empty saved. */
+  async loadSettings(cx) {
+    const r = await hcoord(["settings", "show", props().settings.project, "--json"]);
+    const prompt = r.ok ? parsed(r.stdout)?.cleanupPrompt : undefined;
+    if (typeof prompt === "string") {
+      this.promptBox.set_value(prompt);
+      this.loaded = true;
+      this.promptBox.focus();
+    } else {
+      this.loaded = false;
+      this.error = r.ok ? "hcoord's answer had no cleanup prompt." : (r.text || "hcoord failed").replace(/^hcoord: /, "");
+    }
+    cx.notify();
+  }
+
+  async saveSettings(cx) {
+    if (!this.loaded || this.saving) return;
+    this.saving = true;
+    this.error = null;
+    cx.notify();
+    const { project } = props().settings;
+    const r = await hcoordWithFile(this.promptBox.value(), (file) => ["settings", "set", project, "--cleanup-prompt-file", file]);
+    this.saving = false;
+    if (r.ok) return closeOverlay(props().overlay);
+    this.error = (r.text || "hcoord failed").replace(/^hcoord: /, "");
+    cx.notify();
+  }
+
+  /** One setting: label, control, then what it does. A new setting is one more of these in renderSettings. */
+  settingField(t, label, control, helper) {
+    return v_flex().flex_none().gap(4)
+      .child(div().text_size(11.5).text_color(t.dim).child(label))
+      .child(control)
+      .child(div().text_color(t.muted).child(helper));
+  }
+
+  renderSettings(t) {
+    const { name } = props().settings;
+    const frame = (el) => el.w_full().h(170).px(10).py(8).rounded(6).border(1).bg(t.background).text_color(t.foreground);
+    const box = this.loaded
+      ? frame(Textarea.new(this.promptBox)).border_color(this.promptFocused ? t.accent : t.input)
+      : frame(div()).border_color(t.input).text_color(t.dim).child(this.loaded === null ? "Loading…" : "Couldn't load this setting.");
+    const button = (id, label, bg, fg, ready, onClick) =>
+      h_flex().id(id).h(32).px(14).items_center().rounded(8).border_1().border_color(id === "cancel" ? t.input : bg).bg(bg).text_color(fg)
+        .when(ready, (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click(onClick))
+        .when(!ready, (el) => el.opacity(0.5))
+        .child(label);
+    return v_flex()
+      .id("hc-settings")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key !== "escape") return;
+        cx.stop_propagation();
+        if (!this.saving) closeOverlay(props().overlay);
+      })
+      .size_full()
+      .min_h(0)
+      .p(18)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(13)
+      .child(h_flex().flex_none().items_center()
+        .child(div().flex_1().min_w(0).truncate().text_size(15).font_semibold().text_color(t.foreground).child(`Settings for ${name}`))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      // Scrolls once settings outgrow the dialog. Presses stay here, so selecting text can't drag the dialog.
+      .child(v_flex().id("hc-settings-form").flex_1().min_h(0).gap(12).overflow_y_scrollbar()
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(this.settingField(t, "Cleanup prompt", box,
+          "The worktree's coordinator runs this when a worktree of this project is deleted, before its folder is removed.")))
+      .when(Boolean(this.error), (el) => el.child(div().flex_none().text_color(t.blocked).child(this.error)))
+      .child(h_flex().flex_none().justify_end().gap(8).text_size(12)
+        .when(this.saving, (el) => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child("Saving…")))
+        .child(button("cancel", "Cancel", t.raised, t.foreground, !this.saving, () => closeOverlay(props().overlay)))
+        .child(button("save", "Save", t.solid, t.solid_foreground, Boolean(this.loaded) && !this.saving, (_e, cx) => cx.spawn(async (cx) => this.saveSettings(cx)))));
   }
 }

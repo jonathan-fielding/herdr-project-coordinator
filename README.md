@@ -169,6 +169,7 @@ Running coordinators and workers keep going. A coordinator picks up a changed sk
 
 **Project rows**
 - Click to fold or unfold. `+` asks for a new branch name (and, optionally, where it starts: the default branch unless you say otherwise), makes the branch and its worktree in `~/.herdr/worktrees/<repo>/`, and opens it in a space of its own with its coordinator already in it. Worktrees made elsewhere (Herdr's own New worktree, `git worktree add`) get a coordinator when you open their space.
+- The cog beside `+` opens that project's settings. **Cleanup prompt** takes several lines: when a worktree of the project is deleted, its coordinator runs this prompt before the folder is removed. Every worktree of the project shares it.
 - Right-click for **New worktree** and **Delete project…**.
 - Drag a project's row up or down to reorder projects; the order is kept.
 
