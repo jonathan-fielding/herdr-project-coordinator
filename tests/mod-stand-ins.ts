@@ -1,8 +1,8 @@
 // Stand-ins for the UI elements the mod builds, shared by the tests that load mods/hcoord/main.js.
 
-/** A stand-in element: any builder call chains; children, ids, clicks and key handlers are kept for the test to read. */
+/** A stand-in element: any builder call chains; children, ids, clicks, key handlers and tooltips are kept for the test to read. */
 export function el(...args: any[]) {
-  const node: any = { args, kids: [] as any[], elementId: null, click: null, keyDown: null };
+  const node: any = { args, kids: [] as any[], elementId: null, click: null, keyDown: null, tip: null };
   const self: any = new Proxy(node, {
     get(n, k) {
       if (k in n) return n[k];
@@ -12,6 +12,7 @@ export function el(...args: any[]) {
       if (k === "id") return (id: string) => ((n.elementId = id), self);
       if (k === "on_click") return (f: any) => ((n.click = f), self);
       if (k === "on_key_down") return (f: any) => ((n.keyDown = f), self);
+      if (k === "tooltip") return (tip: string) => ((n.tip = tip), self);
       return () => self;
     },
   });
